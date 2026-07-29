@@ -182,34 +182,63 @@
                 <tr>
                   <td style="padding-top:16px;">
                     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"
-                      style="border-collapse:collapse;background-color:#f5f8fb;border:1px solid #dde3ea;border-radius:8px;min-width:100%;">
+                      style="border-collapse:collapse;background-color:#f5f8fb;border:1px solid #dde3ea;border-radius:10px;min-width:100%;">
                       <tr>
-                        <td style="padding:16px 18px;" width="52" valign="middle">
-                          <table role="presentation" cellpadding="0" cellspacing="0" border="0"
+                        <td style="padding:14px 12px 14px 16px;" width="56" valign="middle">
+                          <!-- PDF file icon -->
+                          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="44"
                             style="border-collapse:collapse;">
                             <tr>
-                              <td width="42" height="50" align="center" valign="middle"
-                                style="background-color:#e2483b;border-radius:5px;">
-                                <span
-                                  style="font-family:Arial,Helvetica,sans-serif;font-size:11px;font-weight:700;color:#ffffff;letter-spacing:0.5px;display:inline-block;line-height:1;">PDF</span>
+                              <td width="44" height="52" align="center" valign="middle"
+                                style="background-color:#dc2626;border-radius:6px;">
+                                <table role="presentation" cellpadding="0" cellspacing="0" border="0"
+                                  style="border-collapse:collapse;">
+                                  <tr>
+                                    <td align="center"
+                                      style="font-family:Georgia,'Times New Roman',serif;font-size:18px;line-height:1;color:#ffffff;font-weight:700;padding-bottom:2px;">
+                                      &#10064;
+                                    </td>
+                                  </tr>
+                                  <tr>
+                                    <td align="center"
+                                      style="font-family:Arial,Helvetica,sans-serif;font-size:10px;font-weight:700;color:#ffffff;letter-spacing:0.8px;line-height:1;">
+                                      PDF
+                                    </td>
+                                  </tr>
+                                </table>
                               </td>
                             </tr>
                           </table>
                         </td>
-                        <td style="padding:16px 8px 16px 4px;" valign="middle" width="100%">
-                          <p style="margin:0 0 2px;font-family:'Inter Tight','Inter',Arial,Helvetica,sans-serif;font-size:14px;font-weight:600;letter-spacing:-0.01em;color:#1e293b;">
+                        <td style="padding:14px 8px 14px 4px;" valign="middle" width="100%">
+                          <p style="margin:0 0 3px;font-family:'Inter Tight','Inter',Arial,Helvetica,sans-serif;font-size:14px;font-weight:600;letter-spacing:-0.01em;color:#1e293b;">
                             ULACAB_VC_IN-SG_Mobile_Numbers.pdf
                           </p>
                           <p style="margin:0;font-family:'Inter',Arial,Helvetica,sans-serif;font-size:12px;color:#64748b;">
-                            PDF document &middot; 740 KB
+                            Brochure &middot; PDF &middot; 740 KB
                           </p>
                         </td>
-                        <td align="right" valign="middle" style="padding:16px 18px;white-space:nowrap;">
-                          <a href="{{PDF_DOWNLOAD_HREF}}"
-                            download="ULACAB_VC_IN-SG_Mobile_Numbers.pdf"
-                            style="display:inline-block;padding:10px 20px;font-family:'Inter Tight','Inter',Arial,Helvetica,sans-serif;font-size:13px;font-weight:600;letter-spacing:-0.01em;color:#ffffff;text-decoration:none;border-radius:6px;background-color:#0891b2;">
-                            Download
-                          </a>
+                        <td align="right" valign="middle" style="padding:14px 14px 14px 8px;white-space:nowrap;">
+                          <table role="presentation" cellpadding="0" cellspacing="0" border="0"
+                            style="border-collapse:collapse;margin-left:auto;">
+                            <tr>
+                              <td style="padding-right:8px;">
+                                <a href="{{PDF_DOWNLOAD_HREF}}" target="_blank"
+                                  title="View PDF"
+                                  style="display:inline-block;padding:9px 12px;font-family:'Inter Tight','Inter',Arial,Helvetica,sans-serif;font-size:12px;font-weight:600;letter-spacing:-0.01em;color:#0e7490;text-decoration:none;border-radius:6px;background-color:#ffffff;border:1px solid #cce7ef;">
+                                  &#128065;&nbsp;View
+                                </a>
+                              </td>
+                              <td>
+                                <a href="{{PDF_DOWNLOAD_HREF}}"
+                                  download="ULACAB_VC_IN-SG_Mobile_Numbers.pdf"
+                                  title="Download PDF"
+                                  style="display:inline-block;padding:9px 14px;font-family:'Inter Tight','Inter',Arial,Helvetica,sans-serif;font-size:12px;font-weight:600;letter-spacing:-0.01em;color:#ffffff;text-decoration:none;border-radius:6px;background-color:#0891b2;">
+                                  &#11015;&nbsp;Download
+                                </a>
+                              </td>
+                            </tr>
+                          </table>
                         </td>
                       </tr>
                     </table>
@@ -224,11 +253,15 @@
                       style="border-collapse:collapse;background-color:#0f172a;border:1px solid #dde3ea;border-radius:12px;overflow:hidden;">
                       <tr>
                         <td align="center" style="padding:0;line-height:0;font-size:0;">
+                          <!--
+                            Chrome/Gmail strip <video>, so a looping GIF is used for autoplay.
+                            Click opens the full MP4.
+                          -->
                           <a href="https://api.namecardscan.com/assets/Promo.mp4" target="_blank"
                             style="display:block;text-decoration:none;line-height:0;font-size:0;">
                             <img
-                              src="https://api.namecardscan.com/assets/Promo-preview.gif"
-                              alt="Name Card Scan promo video — click to watch full video"
+                              src="https://api.namecardscan.com/assets/Promo-preview.gif?v=2"
+                              alt="Name Card Scan promo — playing"
                               width="528"
                               height="297"
                               border="0"
@@ -236,18 +269,9 @@
                           </a>
                         </td>
                       </tr>
-                      <tr>
-                        <td align="center"
-                          style="padding:14px 16px;background-color:#0f172a;border-top:1px solid rgba(255,255,255,0.08);">
-                          <a href="https://api.namecardscan.com/assets/Promo.mp4" target="_blank"
-                            style="display:inline-block;padding:10px 22px;font-family:'Inter Tight','Inter',Arial,Helvetica,sans-serif;font-size:13px;font-weight:600;letter-spacing:-0.01em;color:#ffffff;text-decoration:none;border-radius:6px;background-color:#0891b2;">
-                            ▶&nbsp; Play full video
-                          </a>
-                        </td>
-                      </tr>
                     </table>
                     <p style="margin:10px 0 0;font-family:'Inter',Arial,Helvetica,sans-serif;font-size:12px;line-height:1.5;color:#64748b;text-align:center;">
-                      Preview loops automatically &middot; tap play for the full MP4
+                      Autoplays on loop &middot; click for full HD video
                     </p>
                   </td>
                 </tr>
