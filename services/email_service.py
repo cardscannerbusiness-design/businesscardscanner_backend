@@ -46,27 +46,17 @@ def _normalize_env(value: str | None) -> str:
     return value.strip().strip('"').strip("'")
 
 
-def _public_api_base() -> str | None:
-    from config.urls import try_backend_base_url
-
-    return try_backend_base_url()
+# Email clients cannot reach localhost; always use the public production assets host.
+_EMAIL_ASSETS_BASE = "https://api.namecardscan.com/assets"
 
 
 def _assets_base() -> str:
-    """Public /assets base URL for thank-you HTML (icons, PDF, promo)."""
-    base = _public_api_base()
-    if base:
-        return f"{base}/assets"
-    # Absolute URLs are required in email clients; match promo asset host.
-    return "https://api.namecardscan.com/assets"
+    """Public /assets base URL for thank-you email (PDF, promo, icons)."""
+    return _EMAIL_ASSETS_BASE
 
 
 def _pdf_download_href() -> str:
     """Public PDF link for thank-you HTML (served from /assets)."""
-    if not _public_api_base():
-        logger.warning(
-            "BACKEND_BASE_URL unset — thank-you PDF link falls back to api.namecardscan.com/assets."
-        )
     return f"{_assets_base()}/ULACAB_VC_IN-SG_Mobile_Numbers.pdf"
 
 
