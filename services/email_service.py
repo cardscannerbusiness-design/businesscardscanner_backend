@@ -46,24 +46,28 @@ def _normalize_env(value: str | None) -> str:
     return value.strip().strip('"').strip("'")
 
 
-_PDF_STATIC_PATH = "/static/pdfs/ULACAB_VC_IN-SG_Mobile_Numbers.pdf"
-
-
 def _public_api_base() -> str | None:
     from config.urls import try_backend_base_url
 
     return try_backend_base_url()
 
 
-def _pdf_download_href() -> str:
-    """Public PDF link for thank-you HTML. Empty when BACKEND_BASE_URL is unset."""
+def _assets_base() -> str:
+    """Public /assets base URL for thank-you HTML (icons, PDF, promo)."""
     base = _public_api_base()
-    if not base:
+    if base:
+        return f"{base}/assets"
+    # Absolute URLs are required in email clients; match promo asset host.
+    return "https://api.namecardscan.com/assets"
+
+
+def _pdf_download_href() -> str:
+    """Public PDF link for thank-you HTML (served from /assets)."""
+    if not _public_api_base():
         logger.warning(
-            "BACKEND_BASE_URL unset — thank-you email will omit the PDF download link."
+            "BACKEND_BASE_URL unset — thank-you PDF link falls back to api.namecardscan.com/assets."
         )
-        return ""
-    return f"{base}{_PDF_STATIC_PATH}"
+    return f"{_assets_base()}/ULACAB_VC_IN-SG_Mobile_Numbers.pdf"
 
 
 def _normalize_gmail_app_password(value: str | None) -> str:
@@ -468,6 +472,7 @@ def build_thank_you_email_html(recipient_name: str | None = None) -> str:
         brand_surface=_BRAND_SURFACE,
         brand_border=_BRAND_BORDER,
         pdf_download_href=_pdf_download_href(),
+        assets_base=_assets_base(),
         event_name=BUSINESS_EVENT_NAME,
     )
     return render_thank_you_email_html(context)

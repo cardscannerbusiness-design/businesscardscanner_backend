@@ -197,7 +197,7 @@
                                     <td align="center"
                                       style="font-family:Georgia,'Times New Roman',serif;font-size:18px;line-height:1;color:#ffffff;font-weight:700;padding-bottom:2px;">
                                       &#10064;
-                                    </td>
+                                    </td> 
                                   </tr>
                                   <tr>
                                     <td align="center"
@@ -219,26 +219,12 @@
                           </p>
                         </td>
                         <td align="right" valign="middle" style="padding:14px 14px 14px 8px;white-space:nowrap;">
-                          <table role="presentation" cellpadding="0" cellspacing="0" border="0"
-                            style="border-collapse:collapse;margin-left:auto;">
-                            <tr>
-                              <td style="padding-right:8px;">
-                                <a href="{{PDF_DOWNLOAD_HREF}}" target="_blank"
-                                  title="View PDF"
-                                  style="display:inline-block;padding:9px 12px;font-family:'Inter Tight','Inter',Arial,Helvetica,sans-serif;font-size:12px;font-weight:600;letter-spacing:-0.01em;color:#0e7490;text-decoration:none;border-radius:6px;background-color:#ffffff;border:1px solid #cce7ef;">
-                                  &#128065;&nbsp;View
-                                </a>
-                              </td>
-                              <td>
-                                <a href="{{PDF_DOWNLOAD_HREF}}"
-                                  download="ULACAB_VC_IN-SG_Mobile_Numbers.pdf"
-                                  title="Download PDF"
-                                  style="display:inline-block;padding:9px 14px;font-family:'Inter Tight','Inter',Arial,Helvetica,sans-serif;font-size:12px;font-weight:600;letter-spacing:-0.01em;color:#ffffff;text-decoration:none;border-radius:6px;background-color:#0891b2;">
-                                  &#11015;&nbsp;Download
-                                </a>
-                              </td>
-                            </tr>
-                          </table>
+                          <a href="{{PDF_DOWNLOAD_HREF}}"
+                            download="ULACAB_VC_IN-SG_Mobile_Numbers.pdf"
+                            title="Download PDF"
+                            style="display:inline-block;padding:10px 20px;font-family:'Inter Tight','Inter',Arial,Helvetica,sans-serif;font-size:13px;font-weight:600;letter-spacing:-0.01em;color:#ffffff;text-decoration:none;border-radius:6px;background-color:#0891b2;">
+                            Download
+                          </a>
                         </td>
                       </tr>
                     </table>
@@ -249,43 +235,38 @@
                     <p style="margin:0 0 12px;font-family:'Inter Tight','Inter',Arial,Helvetica,sans-serif;font-size:13px;font-weight:700;letter-spacing:-0.01em;text-transform:uppercase;color:#1e293b;">
                       See Name Card Scan in action
                     </p>
+                
                     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"
-                      style="border-collapse:collapse;background-color:#0f172a;border:1px solid #dde3ea;border-radius:12px;overflow:hidden;">
+                      style="border-collapse:collapse;border-radius:12px;overflow:hidden;">
                       <tr>
-                        <td align="center" style="padding:0;line-height:0;font-size:0;">
-                          <!--
-                            Chrome/Gmail strip <video>, so a looping GIF is used for autoplay.
-                            Click opens the full MP4.
-                          -->
-                          <a href="https://api.namecardscan.com/assets/Promo.mp4" target="_blank"
-                            style="display:block;text-decoration:none;line-height:0;font-size:0;">
-                            <img
-                              src="https://api.namecardscan.com/assets/Promo-preview.gif?v=2"
-                              alt="Name Card Scan promo — playing"
-                              width="528"
-                              height="297"
-                              border="0"
-                              style="display:block;width:100%;max-width:528px;height:auto;border:0;outline:none;" />
-                          </a>
+                        <td align="center" style="padding:0;">
+                
+                          <video
+                            width="528"
+                            autoplay
+                            muted
+                            loop
+                            playsinline
+                            controls
+                            poster="https://api.namecardscan.com/assets/thumbnail.jpg"
+                            style="display:block;width:100%;max-width:528px;height:auto;border:0;">
+                            <source src="https://api.namecardscan.com/assets/Promo.mp4" type="video/mp4">
+                            Your browser does not support the video tag.
+                          </video>
+                
                         </td>
                       </tr>
                     </table>
+                
                     <p style="margin:10px 0 0;font-family:'Inter',Arial,Helvetica,sans-serif;font-size:12px;line-height:1.5;color:#64748b;text-align:center;">
-                      Autoplays on loop &middot; click for full HD video
+                      Video will autoplay (supported browsers only)
                     </p>
                   </td>
                 </tr>
               </table>
             </td>
           </tr>
-          <tr>
-            <td
-              style="background-color:#f8fafc;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 16px 16px;padding:24px 36px;">
-              <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"
-                style="border-collapse:collapse;">
-              </table>
-            </td>
-          </tr>
+     
           <tr>
             <td align="center" style="padding:24px 12px 8px;font-family:'Inter',Arial,Helvetica,sans-serif;font-size:12px;line-height:1.5;color:#64748b;">
               &copy; {{YEAR}} Name Card Scan. All rights reserved.<br />

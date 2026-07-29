@@ -79,6 +79,7 @@ def thank_you_email_context(
     brand_surface: str,
     brand_border: str,
     pdf_download_href: str = "",
+    assets_base: str = "",
     event_name: str = "",
 ) -> dict[str, str]:
     """Build escaped placeholder map for the thank-you template."""
@@ -98,4 +99,5 @@ def thank_you_email_context(
         "BRAND_SURFACE": brand_surface,
         "BRAND_BORDER": brand_border,
         "PDF_DOWNLOAD_HREF": html.escape(pdf_download_href, quote=True),
+        "ASSETS_BASE": html.escape(assets_base, quote=True),
     }
