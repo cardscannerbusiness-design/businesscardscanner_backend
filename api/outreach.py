@@ -41,11 +41,15 @@ def body_to_outreach_contact(body: LocalContactBody) -> dict[str, Any]:
         "emailAddress": body.email,
         "emails": emails,
         "phone": body.phone,
+        "countryCode": body.countryCode,
+        "countryName": body.countryName,
         "phones": phones,
         "website": body.website,
         "secondaryWebsite": body.secondaryWebsite,
         "address": body.address,
         "secondaryAddress": body.secondaryAddress,
+        "eventName": body.eventName,
+        "eventDay": body.eventDay,
     }
 
 
@@ -198,11 +202,15 @@ def payload_to_outreach_contact(data: dict[str, Any]) -> dict[str, Any]:
         "emailAddress": email,
         "emails": [e for e in (email, str(data.get("secondaryEmail") or "").strip()) if e],
         "phone": phone,
+        "countryCode": str(data.get("countryCode") or "").strip(),
+        "countryName": str(data.get("countryName") or "").strip(),
         "phones": [p for p in (phone, str(data.get("secondaryPhone") or "").strip()) if p],
         "website": website or secondary_website,
         "secondaryWebsite": secondary_website,
         "address": address or secondary_address,
         "secondaryAddress": secondary_address,
+        "eventName": str(data.get("eventName") or "").strip(),
+        "eventDay": str(data.get("eventDay") or "Day 1").strip() or "Day 1",
     }
 
 

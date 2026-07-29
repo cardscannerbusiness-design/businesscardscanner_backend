@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 class InviteRequest(BaseModel):
     email: EmailStr
-    role: str = Field(..., description="ADMIN (SuperAdmin only) or USER (Admin only)")
+    role: str = Field(..., description="ADMIN or USER (SuperAdmin); USER only (Admin)")
     company_id: str | None = None
     company_name: str = ""
     company_code: str = ""
@@ -45,6 +45,8 @@ class AcceptInviteRequest(BaseModel):
     confirm_password: str = Field(..., min_length=8)
     phone: str = ""
     username: str = ""
+    designation: str = Field(default="", max_length=255, description="Job title / designation")
+    department: str = Field(default="", max_length=255, description="Department (optional)")
     company_name: str = ""
     company_code: str = ""
     company_address: str = ""
@@ -74,7 +76,7 @@ def _raise(exc: InvitationError) -> None:
 @router.post(
     "",
     summary="Send invitation",
-    description="SuperAdmin invites Admins; Admin invites Users. Password is never set by the inviter.",
+    description="SuperAdmin invites Admins or Users; Admin invites Users. Password is never set by the inviter.",
     dependencies=[Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN))],
 )
 def invite_user(body: InviteRequest, request: Request):
@@ -177,6 +179,8 @@ def accept(body: AcceptInviteRequest, request: Request):
             password=body.password,
             phone=body.phone,
             username=body.username or None,
+            designation=body.designation,
+            department=body.department,
             company_name=body.company_name,
             company_code=body.company_code,
             company_address=body.company_address,

@@ -1,22 +1,35 @@
-"""Google Sheets secondary sync — mirrors saved contacts into a spreadsheet.
+"""Google Sheets secondary sync — mirrors saved contacts into spreadsheets.
 
 PostgreSQL remains the single source of truth. After a contact row is
 committed, the same record is upserted (update-by-Contact-ID, else append)
-into a configured Google Sheet for reporting/sharing.
+into Google Sheets for reporting/sharing.
+
+Storage layout:
+    Workbook (spreadsheet title) = Event Name
+    Worksheet (tab title)        = Event Day
+
+If a workbook for the event already exists it is reused. If a worksheet for
+the event day already exists rows are appended (or updated by Contact ID).
+Missing worksheets are created automatically. Existing contact rows are never
+wiped.
 
 Configuration (environment variables only — nothing hardcoded):
-    GOOGLE_SHEET_ID              Spreadsheet ID (from the sheet URL).
-    GOOGLE_SHEET_NAME            Tab name (default: "Contacts").
+    GOOGLE_SHEET_ID              Optional fallback spreadsheet when event name
+                                 is empty (legacy single-sheet mode).
+    GOOGLE_SHEET_NAME            Fallback tab when event day is empty
+                                 (default: "Day 1").
+    GOOGLE_DRIVE_FOLDER_ID       Optional Drive folder for newly created
+                                 event workbooks (share this folder with the
+                                 service account).
     GOOGLE_SERVICE_ACCOUNT_JSON  Service-account credentials: either the raw
                                  JSON string or a path to the JSON key file.
 
 Behaviour:
     * Runs fire-and-forget in a worker thread — never blocks or fails a save.
     * Update-by-ID is preferred; append only when the Contact ID is not found,
-      so no duplicate rows are created for edits or re-syncs.
+      so edits do not create duplicate rows.
     * Failures are logged and queued in-process; the next successful sync
-      drains the retry queue. A restart clears pending retries (PostgreSQL
-      still has the data — re-saving/editing the contact re-syncs it).
+      drains the retry queue.
 """
 
 from __future__ import annotations
@@ -25,10 +38,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import jwt
 import requests
@@ -39,8 +54,14 @@ _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 logger = logging.getLogger(__name__)
 
 _SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets"
+_DRIVE_API = "https://www.googleapis.com/drive/v3"
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
-_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+_SCOPE = " ".join(
+    [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+)
 
 # Column layout — order defines the sheet. Keep header text stable.
 HEADERS: list[str] = [
@@ -49,6 +70,8 @@ HEADERS: list[str] = [
     "Full Name",
     "Company",
     "Designation",
+    "Country Code",
+    "Country Name",
     "Primary Phone",
     "Secondary Phone",
     "Primary Email",
@@ -59,6 +82,7 @@ HEADERS: list[str] = [
     "Notes",
     # Business information
     "Event Name",
+    "Event Day",
     "Company ID",
     "Company Name",
     "Created By",
@@ -90,6 +114,10 @@ _pending_retry: dict[str, dict[str, Any]] = {}
 _token_lock = threading.Lock()
 _cached_token: dict[str, Any] = {"token": None, "expires_at": 0.0}
 
+# event name (lower) → spreadsheet id
+_workbook_cache_lock = threading.Lock()
+_workbook_cache: dict[str, str] = {}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -100,7 +128,11 @@ def _sheet_id() -> str:
 
 
 def _sheet_name() -> str:
-    return os.getenv("GOOGLE_SHEET_NAME", "").strip() or "Contacts"
+    return os.getenv("GOOGLE_SHEET_NAME", "").strip() or "Day 1"
+
+
+def _drive_folder_id() -> str:
+    return os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
 
 
 def _resolve_service_account_path(raw: str) -> Path | None:
@@ -153,8 +185,13 @@ def _load_service_account() -> dict[str, Any] | None:
 
 
 def is_sheets_configured() -> bool:
+    """Configured when a service account is available.
+
+    GOOGLE_SHEET_ID is optional — used as a fallback workbook when the contact
+    has no event name. New event workbooks are created via Drive/Sheets APIs.
+    """
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if not _sheet_id() or not raw:
+    if not raw:
         return False
     if raw.startswith("{"):
         return True
@@ -229,9 +266,12 @@ _LAST_COL = _column_letter(len(HEADERS))
 def _card_image_url(contact: dict[str, Any]) -> str:
     if not contact.get("cardImageBase64"):
         return ""
-    from config.urls import try_backend_base_url
+    try:
+        from config.urls import try_backend_base_url
 
-    base = try_backend_base_url()
+        base = try_backend_base_url()
+    except Exception:
+        return ""
     if not base:
         return ""
     return f"{base}/api/contacts/{contact.get('id')}/card-image"
@@ -243,6 +283,15 @@ def _image_file_name(contact: dict[str, Any]) -> str:
         return ""
     ext = "png" if "image/png" in data_url[:40] else "jpg"
     return f"card-{contact.get('id')}.{ext}"
+
+
+def _sanitize_sheet_title(title: str, *, fallback: str = "Day 1") -> str:
+    """Google Sheets tab titles: max 100 chars; no \\ / ? * [ ]."""
+    cleaned = re.sub(r"[\\/?*\[\]]+", " ", (title or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        cleaned = fallback
+    return cleaned[:100]
 
 
 def contact_to_row(contact: dict[str, Any], extras: dict[str, Any] | None = None) -> list[str]:
@@ -258,6 +307,8 @@ def contact_to_row(contact: dict[str, Any], extras: dict[str, Any] | None = None
         str(contact.get("fullName") or contact.get("name") or ""),
         str(contact.get("company") or ""),
         str(contact.get("designation") or ""),
+        str(contact.get("countryCode") or ""),
+        str(contact.get("countryName") or ""),
         str(contact.get("phone") or ""),
         str(contact.get("secondaryPhone") or ""),
         str(contact.get("email") or ""),
@@ -267,6 +318,7 @@ def contact_to_row(contact: dict[str, Any], extras: dict[str, Any] | None = None
         str(contact.get("secondaryAddress") or ""),
         str(contact.get("notes") or ""),
         str(contact.get("eventName") or ""),
+        str(contact.get("eventDay") or "Day 1"),
         str(contact.get("owner_company_id") or contact.get("company_id") or ""),
         str(contact.get("owner_company_name") or contact.get("company") or ""),
         str(contact.get("user_name") or ""),
@@ -286,45 +338,225 @@ def contact_to_row(contact: dict[str, Any], extras: dict[str, Any] | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sheets API helpers
+# Sheets / Drive API helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _values_get(headers: dict[str, str], range_: str) -> list[list[str]]:
-    url = f"{_SHEETS_API}/{_sheet_id()}/values/{range_}"
+def _values_get(headers: dict[str, str], spreadsheet_id: str, range_: str) -> list[list[str]]:
+    url = f"{_SHEETS_API}/{spreadsheet_id}/values/{quote(range_, safe='!:')}"
     response = requests.get(url, headers=headers, timeout=20)
     response.raise_for_status()
     return response.json().get("values", [])
 
 
-def _values_update(headers: dict[str, str], range_: str, values: list[list[str]]) -> None:
-    url = f"{_SHEETS_API}/{_sheet_id()}/values/{range_}?valueInputOption=RAW"
+def _values_update(
+    headers: dict[str, str],
+    spreadsheet_id: str,
+    range_: str,
+    values: list[list[str]],
+) -> None:
+    url = (
+        f"{_SHEETS_API}/{spreadsheet_id}/values/{quote(range_, safe='!:')}"
+        "?valueInputOption=RAW"
+    )
     response = requests.put(url, headers=headers, json={"values": values}, timeout=20)
     response.raise_for_status()
 
 
-def _values_append(headers: dict[str, str], range_: str, values: list[list[str]]) -> None:
+def _values_append(
+    headers: dict[str, str],
+    spreadsheet_id: str,
+    range_: str,
+    values: list[list[str]],
+) -> None:
     url = (
-        f"{_SHEETS_API}/{_sheet_id()}/values/{range_}:append"
+        f"{_SHEETS_API}/{spreadsheet_id}/values/{quote(range_, safe='!:')}:append"
         "?valueInputOption=RAW&insertDataOption=INSERT_ROWS"
     )
     response = requests.post(url, headers=headers, json={"values": values}, timeout=20)
     response.raise_for_status()
 
 
-def _ensure_header_row(headers: dict[str, str]) -> None:
-    sheet = _sheet_name()
-    existing = _values_get(headers, f"{sheet}!A1:{_LAST_COL}1")
+def _spreadsheet_meta(headers: dict[str, str], spreadsheet_id: str) -> dict[str, Any]:
+    url = f"{_SHEETS_API}/{spreadsheet_id}?fields=sheets.properties"
+    response = requests.get(url, headers=headers, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+def _list_sheet_titles(headers: dict[str, str], spreadsheet_id: str) -> list[str]:
+    meta = _spreadsheet_meta(headers, spreadsheet_id)
+    titles: list[str] = []
+    for sheet in meta.get("sheets") or []:
+        props = sheet.get("properties") or {}
+        title = str(props.get("title") or "").strip()
+        if title:
+            titles.append(title)
+    return titles
+
+
+def _create_worksheet(headers: dict[str, str], spreadsheet_id: str, title: str) -> None:
+    url = f"{_SHEETS_API}/{spreadsheet_id}:batchUpdate"
+    response = requests.post(
+        url,
+        headers=headers,
+        json={"requests": [{"addSheet": {"properties": {"title": title}}}]},
+        timeout=20,
+    )
+    response.raise_for_status()
+
+
+def _ensure_worksheet(
+    headers: dict[str, str],
+    spreadsheet_id: str,
+    worksheet: str,
+) -> str:
+    """Ensure *worksheet* exists in the spreadsheet; return the canonical title."""
+    title = _sanitize_sheet_title(worksheet)
+    existing = _list_sheet_titles(headers, spreadsheet_id)
+    for name in existing:
+        if name.casefold() == title.casefold():
+            return name
+    _create_worksheet(headers, spreadsheet_id, title)
+    logger.info("Google Sheets: created worksheet %r in spreadsheet %s.", title, spreadsheet_id)
+    return title
+
+
+def _ensure_header_row(headers: dict[str, str], spreadsheet_id: str, worksheet: str) -> None:
+    existing = _values_get(headers, spreadsheet_id, f"'{worksheet}'!A1:{_LAST_COL}1")
     if not existing or not existing[0] or existing[0][0] != HEADERS[0]:
-        _values_update(headers, f"{sheet}!A1:{_LAST_COL}1", [HEADERS])
+        _values_update(headers, spreadsheet_id, f"'{worksheet}'!A1:{_LAST_COL}1", [HEADERS])
 
 
-def _find_row_by_contact_id(headers: dict[str, str], contact_id: str) -> int | None:
+def _find_row_by_contact_id(
+    headers: dict[str, str],
+    spreadsheet_id: str,
+    worksheet: str,
+    contact_id: str,
+) -> int | None:
     """Return the 1-based sheet row holding this Contact ID, or None."""
-    id_column = _values_get(headers, f"{_sheet_name()}!A:A")
+    id_column = _values_get(headers, spreadsheet_id, f"'{worksheet}'!A:A")
     for index, row in enumerate(id_column, start=1):
-        if row and row[0].strip() == contact_id:
+        if row and str(row[0]).strip() == contact_id:
             return index
     return None
+
+
+def _drive_find_spreadsheet(headers: dict[str, str], title: str) -> str | None:
+    folder = _drive_folder_id()
+    escaped = title.replace("\\", "\\\\").replace("'", "\\'")
+    query_parts = [
+        "mimeType='application/vnd.google-apps.spreadsheet'",
+        "trashed=false",
+        f"name='{escaped}'",
+    ]
+    if folder:
+        query_parts.append(f"'{folder}' in parents")
+    query = " and ".join(query_parts)
+    response = requests.get(
+        f"{_DRIVE_API}/files",
+        headers=headers,
+        params={
+            "q": query,
+            "spaces": "drive",
+            "fields": "files(id,name)",
+            "pageSize": 10,
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    files = response.json().get("files") or []
+    if not files:
+        return None
+    return str(files[0].get("id") or "") or None
+
+
+def _create_spreadsheet(headers: dict[str, str], title: str, first_sheet: str) -> str:
+    """Create a new workbook titled *title* with an initial worksheet."""
+    sheet_title = _sanitize_sheet_title(first_sheet)
+    response = requests.post(
+        _SHEETS_API,
+        headers=headers,
+        json={
+            "properties": {"title": title},
+            "sheets": [{"properties": {"title": sheet_title}}],
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    spreadsheet_id = str(response.json().get("spreadsheetId") or "")
+    if not spreadsheet_id:
+        raise RuntimeError("Sheets API did not return a spreadsheetId.")
+
+    folder = _drive_folder_id()
+    if folder:
+        try:
+            # Move into the shared folder (remove root parent when present).
+            meta = requests.get(
+                f"{_DRIVE_API}/files/{spreadsheet_id}",
+                headers=headers,
+                params={"fields": "parents", "supportsAllDrives": "true"},
+                timeout=15,
+            )
+            meta.raise_for_status()
+            parents = meta.json().get("parents") or []
+            params = {
+                "addParents": folder,
+                "supportsAllDrives": "true",
+            }
+            if parents:
+                params["removeParents"] = ",".join(parents)
+            move = requests.patch(
+                f"{_DRIVE_API}/files/{spreadsheet_id}",
+                headers=headers,
+                params=params,
+                timeout=20,
+            )
+            move.raise_for_status()
+        except Exception as exc:
+            logger.warning(
+                "Created spreadsheet %s but could not move it into folder %s: %s",
+                spreadsheet_id,
+                folder,
+                exc,
+            )
+
+    logger.info("Google Sheets: created workbook %r (%s).", title, spreadsheet_id)
+    return spreadsheet_id
+
+
+def _resolve_workbook_id(
+    headers: dict[str, str],
+    event_name: str,
+    event_day: str,
+) -> str:
+    """Resolve (and cache) the spreadsheet id for an event workbook."""
+    name = (event_name or "").strip()
+    if not name:
+        fallback = _sheet_id()
+        if not fallback:
+            raise RuntimeError(
+                "No event name on contact and GOOGLE_SHEET_ID is not configured."
+            )
+        return fallback
+
+    cache_key = name.casefold()
+    with _workbook_cache_lock:
+        cached = _workbook_cache.get(cache_key)
+    if cached:
+        return cached
+
+    found = _drive_find_spreadsheet(headers, name)
+    if found:
+        with _workbook_cache_lock:
+            _workbook_cache[cache_key] = found
+        return found
+
+    created = _create_spreadsheet(headers, name, event_day or "Day 1")
+    with _workbook_cache_lock:
+        _workbook_cache[cache_key] = created
+    return created
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -336,18 +568,41 @@ def _upsert_row(contact: dict[str, Any], extras: dict[str, Any] | None) -> None:
     if not auth:
         raise RuntimeError("Google Sheets auth failed (no access token).")
 
-    sheet = _sheet_name()
-    _ensure_header_row(auth)
+    event_name = str(contact.get("eventName") or "").strip()
+    event_day = _sanitize_sheet_title(
+        str(contact.get("eventDay") or "").strip() or _sheet_name(),
+        fallback=_sheet_name(),
+    )
+
+    spreadsheet_id = _resolve_workbook_id(auth, event_name, event_day)
+    worksheet = _ensure_worksheet(auth, spreadsheet_id, event_day)
+    _ensure_header_row(auth, spreadsheet_id, worksheet)
 
     contact_id = str(contact.get("id") or "")
     row = contact_to_row(contact, extras)
-    existing_row = _find_row_by_contact_id(auth, contact_id)
+    existing_row = _find_row_by_contact_id(auth, spreadsheet_id, worksheet, contact_id)
     if existing_row:
-        _values_update(auth, f"{sheet}!A{existing_row}:{_LAST_COL}{existing_row}", [row])
-        logger.info("Google Sheets: updated row %s for contact %s.", existing_row, contact_id)
+        _values_update(
+            auth,
+            spreadsheet_id,
+            f"'{worksheet}'!A{existing_row}:{_LAST_COL}{existing_row}",
+            [row],
+        )
+        logger.info(
+            "Google Sheets: updated row %s for contact %s in %r / %r.",
+            existing_row,
+            contact_id,
+            event_name or spreadsheet_id,
+            worksheet,
+        )
     else:
-        _values_append(auth, f"{sheet}!A:{_LAST_COL}", [row])
-        logger.info("Google Sheets: appended row for contact %s.", contact_id)
+        _values_append(auth, spreadsheet_id, f"'{worksheet}'!A:{_LAST_COL}", [row])
+        logger.info(
+            "Google Sheets: appended row for contact %s in %r / %r.",
+            contact_id,
+            event_name or spreadsheet_id,
+            worksheet,
+        )
 
 
 def sync_contact_to_sheet(

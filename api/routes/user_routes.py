@@ -74,7 +74,11 @@ def list_users(
                    u.is_active, u.is_verified, u.company_id, u.admin_id,
                    u.last_login, u.created_at, u.updated_at, r.name AS role,
                    COALESCE(comp.company_name, '') AS company_name,
-                   COALESCE(NULLIF(TRIM(admin_u.first_name || ' ' || admin_u.last_name), ''), '') AS admin_name,
+                   COALESCE(
+                       NULLIF(TRIM(admin_u.first_name || ' ' || admin_u.last_name), ''),
+                       NULLIF(TRIM(admin_u.email), ''),
+                       ''
+                   ) AS admin_name,
                    COALESCE(admin_u.email, '') AS admin_email,
                    CASE
                      WHEN r.name = 'ADMIN' THEN (

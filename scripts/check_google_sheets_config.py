@@ -34,8 +34,9 @@ def main() -> int:
     sheet_name = _sheet_name()
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
-    print("GOOGLE_SHEET_ID:", sheet_id or "(missing)")
-    print("GOOGLE_SHEET_NAME:", sheet_name)
+    print("GOOGLE_SHEET_ID:", sheet_id or "(optional fallback workbook)")
+    print("GOOGLE_SHEET_NAME:", sheet_name, "(fallback tab / default Day 1)")
+    print("GOOGLE_DRIVE_FOLDER_ID:", os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip() or "(optional)")
     print("GOOGLE_SERVICE_ACCOUNT_JSON:", raw[:80] + ("…" if len(raw) > 80 else "") or "(missing)")
 
     if raw and not raw.startswith("{"):
@@ -53,7 +54,8 @@ def main() -> int:
     if creds:
         print("client_email:", creds.get("client_email"))
         print()
-        print("OK — share the Google Sheet with that client_email as Editor.")
+        print("OK — share your Drive folder (or fallback sheet) with that client_email as Editor.")
+        print("Workbooks are created per Event Name; worksheets per Event Day.")
         return 0
 
     print()
@@ -62,10 +64,11 @@ def main() -> int:
     print("  1. mkdir -p secrets")
     print("  2. scp/upload the service-account JSON into secrets/")
     print("  3. In .env set (Linux path, not Windows):")
-    print("       GOOGLE_SERVICE_ACCOUNT_JSON=secrets/card-scanner-sheets-edd3dc76b6c1.json")
-    print("       GOOGLE_SHEET_ID=<your spreadsheet id>")
-    print("       GOOGLE_SHEET_NAME=Contacts")
-    print("  4. Share the sheet with the service account email as Editor")
+    print("       GOOGLE_SERVICE_ACCOUNT_JSON=secrets/<filename>.json")
+    print("       GOOGLE_DRIVE_FOLDER_ID=<shared folder id>   # recommended")
+    print("       GOOGLE_SHEET_ID=<optional fallback sheet id>")
+    print("       GOOGLE_SHEET_NAME=Day 1")
+    print("  4. Share the Drive folder with the service account email as Editor")
     print("  5. sudo systemctl restart business-card")
     return 1
 

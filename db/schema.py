@@ -68,6 +68,8 @@ SCHEMA_STATEMENTS: list[str] = [
         username               VARCHAR(128) NOT NULL UNIQUE,
         password_hash          VARCHAR(255) NOT NULL,
         phone                  VARCHAR(64)  NOT NULL DEFAULT '',
+        designation            VARCHAR(255) NOT NULL DEFAULT '',
+        department             VARCHAR(255) NOT NULL DEFAULT '',
         role_id                INTEGER      NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
         company_id             UUID         REFERENCES companies(id) ON DELETE SET NULL,
         admin_id               UUID,        -- the Admin who created this user (nullable for SuperAdmin)
@@ -85,6 +87,9 @@ SCHEMA_STATEMENTS: list[str] = [
         deleted_at             TIMESTAMPTZ
     );
     """,
+    # Profile fields for invited admins/users (idempotent for existing DBs)
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS designation VARCHAR(255) NOT NULL DEFAULT '';",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(255) NOT NULL DEFAULT '';",
     # ── Offline queue registry ─────────────────────────────────────────────
     # IndexedDB remains the source of truth for synchronization. This table is
     # a best-effort online mirror so SuperAdmin can inspect queues platform-wide.
@@ -208,6 +213,8 @@ SCHEMA_STATEMENTS: list[str] = [
         company             TEXT NOT NULL DEFAULT '',
         phone               TEXT NOT NULL DEFAULT '',
         "secondaryPhone"    TEXT NOT NULL DEFAULT '',
+        "countryCode"       TEXT NOT NULL DEFAULT '',
+        "countryName"       TEXT NOT NULL DEFAULT '',
         email               TEXT NOT NULL DEFAULT '',
         "secondaryEmail"    TEXT NOT NULL DEFAULT '',
         website             TEXT NOT NULL DEFAULT '',
@@ -218,6 +225,7 @@ SCHEMA_STATEMENTS: list[str] = [
         "gstNumber"         TEXT NOT NULL DEFAULT '',
         notes               TEXT NOT NULL DEFAULT '',
         "eventName"         TEXT NOT NULL DEFAULT '',
+        "eventDay"          TEXT NOT NULL DEFAULT 'Day 1',
         "eventId"           TEXT,
         "cardImageBase64"   TEXT,
         "syncStatus"        TEXT NOT NULL DEFAULT 'synced',
@@ -321,6 +329,11 @@ SCHEMA_STATEMENTS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_contacts_owner_company ON contacts(owner_company_id);",
     "CREATE INDEX IF NOT EXISTS idx_contacts_created_at ON contacts(\"createdAt\");",
     'CREATE INDEX IF NOT EXISTS idx_contacts_event_name ON contacts("eventName");',
+    # ── Contacts: country + event day (idempotent) ─────────────────────────
+    'ALTER TABLE contacts ADD COLUMN IF NOT EXISTS "countryCode" TEXT NOT NULL DEFAULT \'\';',
+    'ALTER TABLE contacts ADD COLUMN IF NOT EXISTS "countryName" TEXT NOT NULL DEFAULT \'\';',
+    'ALTER TABLE contacts ADD COLUMN IF NOT EXISTS "eventDay" TEXT NOT NULL DEFAULT \'Day 1\';',
+    'CREATE INDEX IF NOT EXISTS idx_contacts_event_day ON contacts("eventDay");',
     # ── Invitations (secure invite-based onboarding) ───────────────────────
     """
     CREATE TABLE IF NOT EXISTS invitations (
