@@ -121,6 +121,7 @@ cors_regex = CORS_ORIGIN_REGEX or None
 # Auth runs inside CORS so 401/403 responses still include Access-Control-Allow-Origin.
 app.add_middleware(RBACMiddleware)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/assets", StaticFiles(directory="assets"), name="assets")
 
 app.add_middleware(
     CORSMiddleware,
