@@ -1,1 +1,0 @@
-# Test image to check if the image is being processed correctly
