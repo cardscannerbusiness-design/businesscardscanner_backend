@@ -58,10 +58,23 @@ def _normalize_phone(phone: str) -> str:
     return "".join(c for c in str(phone or "") if c.isdigit())
 
 
+def _full_phone_digits(contact_data: dict) -> str:
+    """Combine country dial code + local phone for duplicate matching."""
+    local = _normalize_phone(
+        contact_data.get("phone") or contact_data.get("phoneNumber") or ""
+    )
+    if not local:
+        return ""
+    cc = _normalize_phone(contact_data.get("countryCode") or "")
+    if cc and not local.startswith(cc):
+        return f"{cc}{local}"
+    return local
+
+
 def find_duplicate_contacts(contact_data: dict, user: dict | None = None) -> list:
     """Find duplicates within the caller's visible contact set (RBAC-scoped)."""
     email = str(contact_data.get("email") or contact_data.get("emailAddress") or "").strip().lower()
-    phone = _normalize_phone(contact_data.get("phone") or contact_data.get("phoneNumber") or "")
+    phone = _full_phone_digits(contact_data)
     name = str(contact_data.get("fullName") or contact_data.get("name") or "").strip().lower()
     company = str(contact_data.get("company") or contact_data.get("companyName") or "").strip().lower()
 
@@ -75,7 +88,7 @@ def find_duplicate_contacts(contact_data: dict, user: dict | None = None) -> lis
 
         matched_by = []
         c_email = str(contact.get("email") or "").strip().lower()
-        c_phone = _normalize_phone(contact.get("phone") or "")
+        c_phone = _full_phone_digits(contact)
         c_name = str(contact.get("fullName") or contact.get("name") or "").strip().lower()
         c_company = str(contact.get("company") or "").strip().lower()
 

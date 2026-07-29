@@ -108,7 +108,11 @@ def get_logs(
             f"""
             SELECT al.id, al.user_id, al.action, al.ip, al.browser, al.user_agent,
                    al.old_value, al.new_value, al.created_at,
-                   TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS actor_name,
+                   COALESCE(
+                       NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), ''),
+                       NULLIF(TRIM(u.email), ''),
+                       ''
+                   ) AS actor_name,
                    u.username AS actor_username,
                    u.email AS actor_email,
                    r.name AS actor_role

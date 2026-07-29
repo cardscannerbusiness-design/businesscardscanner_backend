@@ -1,4 +1,4 @@
-"""Invitation-based user onboarding — SuperAdmin invites Admins, Admins invite Users."""
+"""Invitation-based user onboarding — SuperAdmin invites Admins/Users, Admins invite Users."""
 
 from __future__ import annotations
 
@@ -123,8 +123,18 @@ def create_invitation(
         raise InvitationError("INVALID_EMAIL", "A valid email address is required.", 422)
 
     if inviter_role == ROLE_SUPER_ADMIN:
-        if role != ROLE_ADMIN:
-            raise InvitationError("FORBIDDEN", "SuperAdmin can only invite Admins.", 403)
+        if role not in (ROLE_ADMIN, ROLE_USER):
+            raise InvitationError(
+                "FORBIDDEN",
+                "SuperAdmin can invite Admins or Users.",
+                403,
+            )
+        if role == ROLE_USER and not company_id:
+            raise InvitationError(
+                "NO_COMPANY",
+                "Select a company when inviting a User.",
+                400,
+            )
     elif inviter_role == ROLE_ADMIN:
         if role != ROLE_USER:
             raise InvitationError("FORBIDDEN", "Admins can only invite Users.", 403)
@@ -162,10 +172,36 @@ def create_invitation(
                 409,
             )
 
-        if role == ROLE_ADMIN and company_id:
-            cur.execute("SELECT id FROM companies WHERE id = %s", (company_id,))
-            if not cur.fetchone():
+        resolved_company_name = (company_name or "").strip()
+        resolved_company_code = (company_code or "").strip()
+        resolved_company_address = (company_address or "").strip()
+        resolved_company_phone = (company_phone or "").strip()
+        resolved_company_email = (company_email or "").strip()
+        resolved_company_website = (company_website or "").strip()
+
+        if role in (ROLE_ADMIN, ROLE_USER) and company_id:
+            cur.execute(
+                """
+                SELECT id, admin_id, company_name, company_code, address, phone, email, website
+                FROM companies WHERE id = %s
+                """,
+                (company_id,),
+            )
+            company_row = cur.fetchone()
+            if not company_row:
                 raise InvitationError("NOT_FOUND", "Company not found.", 404)
+            if role == ROLE_USER and not company_row.get("admin_id"):
+                raise InvitationError(
+                    "NO_ADMIN",
+                    "This company has no Admin yet. Invite an Admin first.",
+                    400,
+                )
+            resolved_company_name = resolved_company_name or str(company_row.get("company_name") or "")
+            resolved_company_code = resolved_company_code or str(company_row.get("company_code") or "")
+            resolved_company_address = resolved_company_address or str(company_row.get("address") or "")
+            resolved_company_phone = resolved_company_phone or str(company_row.get("phone") or "")
+            resolved_company_email = resolved_company_email or str(company_row.get("email") or "")
+            resolved_company_website = resolved_company_website or str(company_row.get("website") or "")
 
         # Prefer company contact email from invite payload; fall back later to invitee email
         raw_token = _generate_token()
@@ -186,12 +222,12 @@ def create_invitation(
                 email,
                 role,
                 company_id,
-                (company_name or "").strip(),
-                (company_code or "").strip(),
-                (company_address or "").strip(),
-                (company_phone or "").strip(),
-                (company_email or "").strip(),
-                (company_website or "").strip(),
+                resolved_company_name,
+                resolved_company_code,
+                resolved_company_address,
+                resolved_company_phone,
+                resolved_company_email,
+                resolved_company_website,
                 inviter_id,
                 token_hash,
                 STATUS_PENDING,
@@ -485,6 +521,8 @@ def accept_invitation(
     last_name: str = "",
     phone: str = "",
     username: str | None = None,
+    designation: str = "",
+    department: str = "",
     company_name: str = "",
     company_code: str = "",
     company_address: str = "",
@@ -506,6 +544,8 @@ def accept_invitation(
         first_name = name_parts[0]
         last_name = name_parts[1] if len(name_parts) > 1 else ""
     phone = (phone or "").strip()
+    designation = (designation or "").strip()[:255]
+    department = (department or "").strip()[:255]
     if not first_name:
         raise InvitationError("INVALID_NAME", "Full name is required.", 422)
 
@@ -601,7 +641,18 @@ def accept_invitation(
             )
         elif role == ROLE_USER:
             company_id = str(row["company_id"]) if row.get("company_id") else None
-            admin_id = str(row["invited_by"])
+            # Prefer the company's Admin; fall back to inviter when an Admin invited.
+            admin_id = None
+            if company_id:
+                cur.execute(
+                    "SELECT admin_id FROM companies WHERE id = %s",
+                    (company_id,),
+                )
+                company_row = cur.fetchone()
+                if company_row and company_row.get("admin_id"):
+                    admin_id = str(company_row["admin_id"])
+            if not admin_id:
+                admin_id = str(row["invited_by"])
 
         cur.execute("SELECT id FROM roles WHERE name = %s", (role,))
         role_row = cur.fetchone()
@@ -613,9 +664,10 @@ def accept_invitation(
             """
             INSERT INTO users (
                 id, first_name, last_name, email, username, password_hash, phone,
+                designation, department,
                 role_id, company_id, admin_id, is_active, is_verified,
                 created_by, created_at, updated_at, last_password_change
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,TRUE,%s,%s,%s,%s)
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,TRUE,%s,%s,%s,%s)
             """,
             (
                 user_id,
@@ -625,6 +677,8 @@ def accept_invitation(
                 username,
                 hash_password(password),
                 phone,
+                designation,
+                department,
                 role_row["id"],
                 company_id,
                 admin_id,
@@ -677,6 +731,8 @@ def accept_invitation(
             "last_name": last_name,
             "phone": phone,
             "username": username,
+            "designation": designation,
+            "department": department,
             "role": role,
             "company_id": company_id,
             "company_name": final_company_name if role == ROLE_ADMIN else (row.get("company_name") or ""),

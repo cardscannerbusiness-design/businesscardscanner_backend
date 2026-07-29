@@ -75,6 +75,7 @@ class DuplicateCheckRequest(BaseModel):
     fullName: str = ""
     company: str = ""
     phone: str = ""
+    countryCode: str = ""
     email: str = ""
 
 
@@ -92,10 +93,13 @@ class LocalContactBody(BaseModel):
                     "lastName": "Saliganti",
                     "designation": "Developer",
                     "company": "CardSync Demo",
-                    "phone": "+919884993074",
+                    "phone": "9884993074",
+                    "countryCode": "+91",
+                    "countryName": "India",
                     "email": "saligantisandeepzzz6@gmail.com",
                     "website": "https://cardsync.ai",
                     "eventName": "Mall Opening",
+                    "eventDay": "Day 1",
                     "notes": "Met at booth — follow up next week.",
                     "connectionMode": "online",
                     "skipWhatsApp": True,
@@ -110,6 +114,8 @@ class LocalContactBody(BaseModel):
     lastName: str = ""
     designation: str = ""
     company: str = ""
+    countryCode: str = Field(default="", description="Dial code only, e.g. +91.")
+    countryName: str = Field(default="", description="Country display name, e.g. India.")
     phone: str = ""
     secondaryPhone: str = ""
     email: str = ""
@@ -128,6 +134,10 @@ class LocalContactBody(BaseModel):
     eventName: str = Field(
         default="",
         description="Event where the card was collected.",
+    )
+    eventDay: str = Field(
+        default="Day 1",
+        description="Exhibition/event day label used for Google Sheets worksheets.",
     )
     eventId: str | None = None
     cardImageBase64: str | None = None

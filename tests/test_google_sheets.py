@@ -12,8 +12,10 @@ CONTACT = {
     "fullName": "Balaji Narayanan",
     "company": "Acme Corp",
     "designation": "CTO",
-    "phone": "+919884993074",
+    "phone": "9884993074",
     "secondaryPhone": "",
+    "countryCode": "+91",
+    "countryName": "India",
     "email": "balaji@acme.com",
     "secondaryEmail": "",
     "website": "https://acme.com",
@@ -21,6 +23,7 @@ CONTACT = {
     "secondaryAddress": "",
     "notes": "Met at booth.",
     "eventName": "Mall Opening",
+    "eventDay": "Day 1",
     "owner_company_id": "22222222-2222-2222-2222-222222222222",
     "admin_name": "Acme Corp",
     "user_name": "Admin User",
@@ -46,6 +49,10 @@ class TestRowMapping(unittest.TestCase):
         self.assertEqual(as_dict["Contact ID"], CONTACT["id"])
         self.assertEqual(as_dict["Full Name"], "Balaji Narayanan")
         self.assertEqual(as_dict["Event Name"], "Mall Opening")
+        self.assertEqual(as_dict["Event Day"], "Day 1")
+        self.assertEqual(as_dict["Country Code"], "+91")
+        self.assertEqual(as_dict["Country Name"], "India")
+        self.assertEqual(as_dict["Primary Phone"], "9884993074")
         self.assertEqual(as_dict["Company ID"], CONTACT["owner_company_id"])
         self.assertEqual(as_dict["Created By"], "Admin User")
         self.assertEqual(as_dict["Created By Role"], "ADMIN")
@@ -79,14 +86,26 @@ class TestUpsert(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         sheets._pending_retry.clear()
+        sheets._workbook_cache.clear()
 
     def test_appends_when_contact_id_not_found(self) -> None:
         calls: dict[str, int] = {"append": 0, "update": 0}
         with (
             patch.object(sheets, "_auth_headers", return_value={"Authorization": "Bearer x"}),
-            patch.object(sheets, "_values_get", return_value=[["Contact ID"]]),
-            patch.object(sheets, "_values_update", side_effect=lambda *a, **k: calls.__setitem__("update", calls["update"] + 1)),
-            patch.object(sheets, "_values_append", side_effect=lambda *a, **k: calls.__setitem__("append", calls["append"] + 1)),
+            patch.object(sheets, "_resolve_workbook_id", return_value="sheet123"),
+            patch.object(sheets, "_ensure_worksheet", return_value="Day 1"),
+            patch.object(sheets, "_ensure_header_row", return_value=None),
+            patch.object(sheets, "_find_row_by_contact_id", return_value=None),
+            patch.object(
+                sheets,
+                "_values_update",
+                side_effect=lambda *a, **k: calls.__setitem__("update", calls["update"] + 1),
+            ),
+            patch.object(
+                sheets,
+                "_values_append",
+                side_effect=lambda *a, **k: calls.__setitem__("append", calls["append"] + 1),
+            ),
         ):
             self.assertTrue(sheets.sync_contact_to_sheet(CONTACT, EXTRAS))
         self.assertEqual(calls["append"], 1)
@@ -94,12 +113,22 @@ class TestUpsert(unittest.TestCase):
 
     def test_updates_existing_row_no_duplicate(self) -> None:
         calls: dict[str, list] = {"append": [], "update": []}
-        id_column = [["Contact ID"], [CONTACT["id"]]]
         with (
             patch.object(sheets, "_auth_headers", return_value={"Authorization": "Bearer x"}),
-            patch.object(sheets, "_values_get", side_effect=[[sheets.HEADERS], id_column]),
-            patch.object(sheets, "_values_update", side_effect=lambda h, r, v: calls["update"].append(r)),
-            patch.object(sheets, "_values_append", side_effect=lambda h, r, v: calls["append"].append(r)),
+            patch.object(sheets, "_resolve_workbook_id", return_value="sheet123"),
+            patch.object(sheets, "_ensure_worksheet", return_value="Day 1"),
+            patch.object(sheets, "_ensure_header_row", return_value=None),
+            patch.object(sheets, "_find_row_by_contact_id", return_value=2),
+            patch.object(
+                sheets,
+                "_values_update",
+                side_effect=lambda h, sid, r, v: calls["update"].append(r),
+            ),
+            patch.object(
+                sheets,
+                "_values_append",
+                side_effect=lambda h, sid, r, v: calls["append"].append(r),
+            ),
         ):
             self.assertTrue(sheets.sync_contact_to_sheet(CONTACT, EXTRAS))
         self.assertEqual(len(calls["append"]), 0)

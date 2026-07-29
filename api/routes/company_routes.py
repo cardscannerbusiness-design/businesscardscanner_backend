@@ -36,9 +36,15 @@ def list_companies(page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le=2
             """
             SELECT c.id, c.company_name, c.company_code, c.admin_id, c.address, c.phone, c.email,
                    c.website, c.status, c.created_at, c.updated_at,
-                   COALESCE(NULLIF(TRIM(a.first_name || ' ' || a.last_name), ''), '') AS admin_name,
+                   COALESCE(
+                       NULLIF(TRIM(a.first_name || ' ' || a.last_name), ''),
+                       NULLIF(TRIM(a.email), ''),
+                       ''
+                   ) AS admin_name,
                    COALESCE(a.email, '') AS admin_email,
                    COALESCE(a.username, '') AS admin_username,
+                   COALESCE(NULLIF(TRIM(a.designation), ''), '') AS admin_designation,
+                   COALESCE(NULLIF(TRIM(a.department), ''), '') AS admin_department,
                    (
                      SELECT COUNT(*)::int
                      FROM users u

@@ -1,4 +1,4 @@
-# CardSync AI — Backend API
+# NameCardScan — Backend API
 
 Standalone **Python-only** FastAPI service. All integrations (Zoho CRM, OCR, WhatsApp, email, PostgreSQL) run here — there is no Node/Express backend.
 

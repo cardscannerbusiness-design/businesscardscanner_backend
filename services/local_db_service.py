@@ -181,6 +181,8 @@ def _row_to_contact(row: dict[str, Any]) -> dict[str, Any]:
         "company": row.get("company") or "",
         "phone": row.get("phone") or "",
         "secondaryPhone": row.get("secondaryPhone") or "",
+        "countryCode": row.get("countryCode") or "",
+        "countryName": row.get("countryName") or "",
         "email": row.get("email") or "",
         "secondaryEmail": row.get("secondaryEmail") or "",
         "website": row.get("website") or "",
@@ -191,6 +193,7 @@ def _row_to_contact(row: dict[str, Any]) -> dict[str, Any]:
         "gstNumber": row.get("gstNumber") or "",
         "notes": row.get("notes") or "",
         "eventName": row.get("eventName") or "",
+        "eventDay": row.get("eventDay") or "Day 1",
         "eventId": row.get("eventId"),
         "cardImageBase64": row.get("cardImageBase64"),
         "syncStatus": sync_status,
@@ -265,6 +268,8 @@ def _payload_to_local_body(
         "company": str(contact_data.get("company") or "").strip(),
         "phone": str(contact_data.get("phone") or contact_data.get("phoneNumber") or "").strip(),
         "secondaryPhone": str(contact_data.get("secondaryPhone") or "").strip(),
+        "countryCode": str(contact_data.get("countryCode") or "").strip(),
+        "countryName": str(contact_data.get("countryName") or "").strip(),
         "email": str(
             contact_data.get("email") or contact_data.get("emailAddress") or ""
         ).strip(),
@@ -277,6 +282,7 @@ def _payload_to_local_body(
         "gstNumber": str(contact_data.get("gstNumber") or "").strip(),
         "notes": str(contact_data.get("notes") or "").strip(),
         "eventName": str(contact_data.get("eventName") or "").strip(),
+        "eventDay": str(contact_data.get("eventDay") or "Day 1").strip() or "Day 1",
         "eventId": (str(contact_data.get("eventId")).strip() if contact_data.get("eventId") else None),
         "cardImageBase64": card_image_base64 or contact_data.get("cardImageBase64"),
         "syncStatus": sync_status,
@@ -358,13 +364,22 @@ def _contacts_list_sql(
 ) -> tuple[str, list[Any]]:
     base_query = """
         SELECT c.*,
-               COALESCE(u.first_name || ' ' || u.last_name, '') AS user_name,
+               COALESCE(
+                   NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''),
+                   NULLIF(TRIM(u.email), ''),
+                   ''
+               ) AS user_name,
                COALESCE(u.username, '') AS user_username,
                COALESCE(
                    NULLIF(TRIM(admin_u.first_name || ' ' || admin_u.last_name), ''),
+                   NULLIF(TRIM(admin_u.email), ''),
                    CASE
                        WHEN c.created_by_role = 'ADMIN'
-                       THEN NULLIF(TRIM(u.first_name || ' ' || u.last_name), '')
+                       THEN COALESCE(
+                           NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''),
+                           NULLIF(TRIM(u.email), ''),
+                           ''
+                       )
                        ELSE ''
                    END,
                    ''
@@ -427,13 +442,22 @@ def get_contact(contact_id: str, user: dict[str, Any] | None = None) -> dict[str
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 query = """
                     SELECT c.*,
-                           COALESCE(u.first_name || ' ' || u.last_name, '') AS user_name,
+                           COALESCE(
+                               NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''),
+                               NULLIF(TRIM(u.email), ''),
+                               ''
+                           ) AS user_name,
                            COALESCE(u.username, '') AS user_username,
                            COALESCE(
                                NULLIF(TRIM(admin_u.first_name || ' ' || admin_u.last_name), ''),
+                               NULLIF(TRIM(admin_u.email), ''),
                                CASE
                                    WHEN c.created_by_role = 'ADMIN'
-                                   THEN NULLIF(TRIM(u.first_name || ' ' || u.last_name), '')
+                                   THEN COALESCE(
+                                       NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''),
+                                       NULLIF(TRIM(u.email), ''),
+                                       ''
+                                   )
                                    ELSE ''
                                END,
                                ''
@@ -524,14 +548,15 @@ def create_contact(
                     """
                     INSERT INTO contacts (
                         id, "fullName", "firstName", "lastName", designation, company,
-                        phone, "secondaryPhone", email, "secondaryEmail", website,
+                        phone, "secondaryPhone", "countryCode", "countryName",
+                        email, "secondaryEmail", website,
                         "secondaryWebsite", address, "secondaryAddress", "socialLinks",
-                        "gstNumber", notes, "eventName", "eventId", "cardImageBase64",
+                        "gstNumber", notes, "eventName", "eventDay", "eventId", "cardImageBase64",
                         "syncStatus", "createdAt", "updatedAt", created_by_user_id,
                         owner_company_id, created_by_role
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
                     """,
                     (
@@ -543,6 +568,8 @@ def create_contact(
                         body["company"],
                         body["phone"],
                         body["secondaryPhone"],
+                        body["countryCode"],
+                        body["countryName"],
                         body["email"],
                         body["secondaryEmail"],
                         body["website"],
@@ -553,6 +580,7 @@ def create_contact(
                         body["gstNumber"],
                         body["notes"],
                         body["eventName"],
+                        body["eventDay"],
                         body.get("eventId"),
                         body["cardImageBase64"],
                         body["syncStatus"],
@@ -598,9 +626,11 @@ def update_contact(contact_id: str, contact_data: dict[str, Any]) -> dict[str, A
                     UPDATE contacts SET
                         "fullName" = %s, "firstName" = %s, "lastName" = %s,
                         designation = %s, company = %s, phone = %s, "secondaryPhone" = %s,
+                        "countryCode" = %s, "countryName" = %s,
                         email = %s, "secondaryEmail" = %s, website = %s, "secondaryWebsite" = %s,
                         address = %s, "secondaryAddress" = %s, "socialLinks" = %s,
-                        "gstNumber" = %s, notes = %s, "eventName" = %s, "eventId" = COALESCE(%s, "eventId"),
+                        "gstNumber" = %s, notes = %s, "eventName" = %s, "eventDay" = %s,
+                        "eventId" = COALESCE(%s, "eventId"),
                         "cardImageBase64" = COALESCE(%s, "cardImageBase64"),
                         "syncStatus" = %s, "updatedAt" = %s
                     WHERE id = %s
@@ -613,6 +643,8 @@ def update_contact(contact_id: str, contact_data: dict[str, Any]) -> dict[str, A
                         body["company"],
                         body["phone"],
                         body["secondaryPhone"],
+                        body["countryCode"],
+                        body["countryName"],
                         body["email"],
                         body["secondaryEmail"],
                         body["website"],
@@ -623,6 +655,7 @@ def update_contact(contact_id: str, contact_data: dict[str, Any]) -> dict[str, A
                         body["gstNumber"],
                         body["notes"],
                         body["eventName"],
+                        body["eventDay"],
                         body.get("eventId"),
                         body["cardImageBase64"],
                         body["syncStatus"],

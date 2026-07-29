@@ -844,19 +844,41 @@ def send_scan_thank_you_to_contact(contact: dict[str, Any]) -> dict[str, Any]:
 
 
 def extract_primary_phone(contact: dict[str, Any]) -> str:
+    phone = ""
     for key in ("phone", "phoneNumber", "primaryPhone"):
         value = str(contact.get(key) or "").strip()
         if value:
-            return value
+            phone = value
+            break
 
-    for key in ("phones", "mobileNumbers", "telephoneNumbers"):
-        values = contact.get(key) or []
-        if isinstance(values, list):
-            for value in values:
-                text = str(value or "").strip()
-                if text:
-                    return text
-    return ""
+    if not phone:
+        for key in ("phones", "mobileNumbers", "telephoneNumbers"):
+            values = contact.get(key) or []
+            if isinstance(values, list):
+                for value in values:
+                    text = str(value or "").strip()
+                    if text:
+                        phone = text
+                        break
+            if phone:
+                break
+
+    if not phone:
+        return ""
+
+    country = str(contact.get("countryCode") or "").strip()
+    if not country:
+        return phone
+
+    local_digits = re.sub(r"\D", "", phone)
+    cc_digits = re.sub(r"\D", "", country)
+    if not local_digits:
+        return ""
+    if cc_digits and local_digits.startswith(cc_digits):
+        return f"+{local_digits}"
+    if cc_digits:
+        return f"+{cc_digits}{local_digits}"
+    return phone
 
 
 def _should_send_to_phone(phone: str) -> bool:
