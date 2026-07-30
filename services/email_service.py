@@ -46,24 +46,18 @@ def _normalize_env(value: str | None) -> str:
     return value.strip().strip('"').strip("'")
 
 
-_PDF_STATIC_PATH = "/static/pdfs/ULACAB_VC_IN-SG_Mobile_Numbers.pdf"
+# Email clients cannot reach localhost; always use the public production assets host.
+_EMAIL_ASSETS_BASE = "https://api.namecardscan.com/assets"
 
 
-def _public_api_base() -> str | None:
-    from config.urls import try_backend_base_url
-
-    return try_backend_base_url()
+def _assets_base() -> str:
+    """Public /assets base URL for thank-you email (PDF, promo, icons)."""
+    return _EMAIL_ASSETS_BASE
 
 
 def _pdf_download_href() -> str:
-    """Public PDF link for thank-you HTML. Empty when BACKEND_BASE_URL is unset."""
-    base = _public_api_base()
-    if not base:
-        logger.warning(
-            "BACKEND_BASE_URL unset — thank-you email will omit the PDF download link."
-        )
-        return ""
-    return f"{base}{_PDF_STATIC_PATH}"
+    """Public PDF link for thank-you HTML (served from /assets)."""
+    return f"{_assets_base()}/ULACAB_VC_IN-SG_Mobile_Numbers.pdf"
 
 
 def _normalize_gmail_app_password(value: str | None) -> str:
@@ -86,6 +80,9 @@ BUSINESS_COMPANY_NAME = _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "N
 BUSINESS_PHONE = _normalize_env(os.getenv("BUSINESS_PHONE")) or ""
 BUSINESS_WEBSITE = _normalize_env(os.getenv("BUSINESS_WEBSITE")) or ""
 BUSINESS_EMAIL = _normalize_env(os.getenv("BUSINESS_EMAIL")) or SMTP_USER
+BUSINESS_EVENT_NAME = (
+    _normalize_env(os.getenv("BUSINESS_EVENT_NAME")) or "the exhibition"
+)
 EMAIL_TEST_RECIPIENT = _normalize_env(os.getenv("EMAIL_TEST_RECIPIENT"))
 _RENDER_SMTP_HINT = (
     "Some hosts block outbound SMTP on port 587. "
@@ -380,29 +377,33 @@ def _greeting_name(recipient_name: str | None) -> str:
 def build_thank_you_email_plain(recipient_name: str | None = None) -> str:
     """Build the plain-text fallback for the business thank-you email."""
     greeting = _greeting_name(recipient_name)
-    contact_lines = [
-        BUSINESS_COMPANY_NAME,
-        "Business Development Team",
-    ]
-    if BUSINESS_PHONE:
-        contact_lines.append(BUSINESS_PHONE)
-    if BUSINESS_WEBSITE:
-        contact_lines.append(BUSINESS_WEBSITE)
-    if BUSINESS_EMAIL:
-        contact_lines.append(BUSINESS_EMAIL)
-
-    signature = "\n".join(contact_lines)
+    event_name = BUSINESS_EVENT_NAME
     return (
-        f"Dear {greeting},\n\n"
-        "Thank you for connecting with us.\n\n"
-        "We appreciate your interest in our services and would be happy to assist you "
-        "with any questions or requirements you may have.\n\n"
-        "Our team is committed to providing professional support and delivering the "
-        "best possible experience for our clients.\n\n"
-        "Please feel free to reply to this email if you need additional information "
-        "or would like to schedule a discussion.\n\n"
-        "Best regards,\n\n"
-        f"{signature}\n"
+        f"Hi {greeting},\n\n"
+        f"Dhana here. It was great meeting you at {event_name}.\n\n"
+        "Quick question: After collecting business cards, how many prospects actually "
+        "become customers?\n\n"
+        "Most businesses at exhibitions and events struggle with:\n"
+        "• Delayed follow-ups\n"
+        "• Poor brand recall\n"
+        "• Manual business card data entry\n"
+        "• No clear Return on Exhibition Spend (ROES)\n\n"
+        "That’s why we built Name Card Scan (NCS).\n\n"
+        "With NCS, you can:\n"
+        "• Scan or upload business cards\n"
+        "• Instantly capture contact details\n"
+        "• Automatically send your WhatsApp & Email introduction, digital business "
+        "card, brochures (PDF) and videos\n"
+        "• Store all data in Google Drive\n"
+        "• Push leads directly to Zoho CRM via API\n\n"
+        "NCS helps you engage prospects while your brand is still fresh in their minds.\n\n"
+        "ROES = Prospect → Qualified Lead → Sale → Customer\n\n"
+        "Reply YES and let my team help you get started with NCS to improve your ROES.\n\n"
+        "Regards,\n"
+        "Dhana\n"
+        "Founder, Name Card Scan\n"
+        "dhana@ulavitech.com\n"
+        "+91 8838747273 | +65 97310793\n"
     )
 
 
@@ -461,6 +462,8 @@ def build_thank_you_email_html(recipient_name: str | None = None) -> str:
         brand_surface=_BRAND_SURFACE,
         brand_border=_BRAND_BORDER,
         pdf_download_href=_pdf_download_href(),
+        assets_base=_assets_base(),
+        event_name=BUSINESS_EVENT_NAME,
     )
     return render_thank_you_email_html(context)
 

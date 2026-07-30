@@ -63,6 +63,7 @@ PUBLIC_PATHS: set[str] = {
     "/redoc",
     "/openapi.json",
     "/static",
+    "/assets",
     "/api/auth/login",
     "/api/auth/refresh",
     "/api/auth/logout",
@@ -78,6 +79,7 @@ PUBLIC_PATHS: set[str] = {
 # Prefixes that are also public (e.g. /static/anything)
 PUBLIC_PREFIXES: tuple[str, ...] = (
     "/static",
+    "/assets",
     "/docs",
     "/redoc",
 )
