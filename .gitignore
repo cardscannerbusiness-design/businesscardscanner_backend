@@ -29,3 +29,6 @@ uploads/
 data/
 
 dist/
+
+#Googlesheet
+config/google-service-account.json

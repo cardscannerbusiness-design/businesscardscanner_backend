@@ -28,7 +28,11 @@ class WhatsAppCardReceivedRequest(BaseModel):
     )
     full_name: str = Field(
         default="Yogesh VR",
-        description="Full name to substitute into the card_final_ula template variable {{1}}.",
+        description="Name for card_final_ula {{1}} (Hi {{1}}). First word is used.",
+    )
+    event_name: str = Field(
+        default="TTF Kolkata 2026",
+        description="Event/place for card_final_ula {{2}} (meeting you at {{2}}).",
     )
 
 
