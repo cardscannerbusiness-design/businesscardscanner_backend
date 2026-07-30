@@ -1024,8 +1024,11 @@ async def schedule_whatsapp_for_contact(
 
         existing = storage.get_contact(contact_id)
         if existing and storage.has_whatsapp_sent(existing):
-            skipped["error"] = "WhatsApp template was already sent for this contact."
-            _log_whatsapp_line("SKIP", phone or "?", context=log_context, error=skipped["error"])
+            skipped["attempted"] = True
+            skipped["sent"] = True
+            skipped["error"] = None
+            skipped["recipient_phone"] = phone or extract_primary_phone(existing) or None
+            _log_whatsapp_line("SKIP", phone or "?", context=log_context, error="already sent")
             return skipped
 
     if not phone:
@@ -1057,15 +1060,17 @@ async def schedule_whatsapp_for_contact(
         result = delivery["result"]
         message_id = (result.get("messages") or [{}])[0].get("id")
         has_whatsapp = bool(delivery.get("recipient_has_whatsapp", False))
-        if contact_id and has_whatsapp:
+        # Meta message id means the API accepted the send; wa_id is optional confirmation.
+        accepted = bool(message_id) or has_whatsapp
+        if contact_id and accepted:
             from services import contact_storage as storage
 
             await asyncio.to_thread(storage.mark_whatsapp_sent, contact_id)
         ok = {
             "attempted": True,
-            "sent": has_whatsapp,
+            "sent": accepted,
             "queued": False,
-            "error": None if has_whatsapp else "Meta accepted send but recipient wa_id missing.",
+            "error": None if accepted else "Meta accepted send but recipient wa_id missing.",
             "message_id": message_id,
             "recipient_phone": delivery["phone"],
             "recipient_name": delivery["recipient_name"],
@@ -1076,18 +1081,18 @@ async def schedule_whatsapp_for_contact(
             "wa_id": delivery.get("wa_id"),
         }
         ok["template_category"] = "UTILITY"
-        ok["really_sent_to_meta"] = has_whatsapp
-        ok["silent_api_failure"] = not has_whatsapp
-        ok["phone_delivery_status"] = "pending_webhook" if has_whatsapp else "not_sent"
+        ok["really_sent_to_meta"] = accepted
+        ok["silent_api_failure"] = not accepted
+        ok["phone_delivery_status"] = "pending_webhook" if accepted else "not_sent"
         _log_whatsapp_line(
-            "SENT" if has_whatsapp else "FAIL",
+            "SENT" if accepted else "FAIL",
             phone,
             context=log_context,
             template=delivery["send_mode"],
             wa_id=delivery.get("wa_id"),
             message_id=message_id,
             chat_verified=recipient_check["contact_chat_verified"],
-            error=None if has_whatsapp else ok["error"],
+            error=None if accepted else ok["error"],
         )
         return ok
     except Exception as exc:

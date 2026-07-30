@@ -67,8 +67,9 @@ async def lifespan(app: FastAPI):
     from db.schema import ensure_schema
     from db.seed import run_seed
 
+    # Pool must be ready before any request; do not swallow init failures.
+    init_pool()
     try:
-        init_pool()
         ensure_schema()
         run_seed()
     except Exception as exc:

@@ -818,7 +818,10 @@ async def schedule_email_for_contact(
         existing = storage.get_contact(contact_id)
         if existing and storage.has_email_sent(existing):
             logger.info("Email auto-send skipped: already sent for contact %s.", contact_id)
-            skipped["error"] = "Thank-you email was already sent for this contact."
+            skipped["attempted"] = True
+            skipped["sent"] = True
+            skipped["error"] = None
+            skipped["extracted_email"] = extract_primary_email(existing) or None
             return skipped
 
     extracted = extract_primary_email(contact)

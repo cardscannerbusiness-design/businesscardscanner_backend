@@ -235,6 +235,8 @@ async def create_contact_json(
                 )
                 response.update(whatsapp_response(whatsapp_result))
                 response.update(email_response(email_result))
+                # Return the contact row after delivery statuses are persisted.
+                response["contact"] = storage.get_contact(contact_id, user=user)
             except Exception as exc:
                 logger.error("Outreach after save failed for %s: %s", contact_id, exc, exc_info=True)
                 response["outreachError"] = str(exc)

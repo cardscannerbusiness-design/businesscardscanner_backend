@@ -13,13 +13,29 @@ logger = logging.getLogger(__name__)
 
 
 def _delivery_state(result: dict[str, Any]) -> str:
+    """Canonical DB values shown on Contacts: Sent | Failed | Pending."""
     if result.get("sent") is True:
-        return "success"
+        return "Sent"
     if result.get("attempted") is True:
-        return "failure"
-    if result.get("error"):
-        return "not_sent"
-    return "pending"
+        return "Failed"
+    return "Pending"
+
+
+async def _persist_delivery(
+    contact_id: str | None,
+    email_result: dict[str, Any],
+    whatsapp_result: dict[str, Any],
+) -> None:
+    if not contact_id:
+        return
+    await asyncio.to_thread(
+        storage.update_outreach_delivery,
+        contact_id,
+        email_status=_delivery_state(email_result),
+        email_error=email_result.get("error"),
+        whatsapp_status=_delivery_state(whatsapp_result),
+        whatsapp_error=whatsapp_result.get("error"),
+    )
 
 
 def is_online_mode(value: str | None) -> bool:
@@ -160,14 +176,7 @@ async def schedule_outreach_for_contact(
                 email_result = result
 
     if contact_id:
-        await asyncio.to_thread(
-            storage.update_outreach_delivery,
-            contact_id,
-            email_status=_delivery_state(email_result),
-            email_error=email_result.get("error"),
-            whatsapp_status=_delivery_state(whatsapp_result),
-            whatsapp_error=whatsapp_result.get("error"),
-        )
+        await _persist_delivery(contact_id, email_result, whatsapp_result)
 
     return whatsapp_result, email_result
 
@@ -261,7 +270,8 @@ async def run_post_save_outreach(
             )
     except Exception as exc:
         logger.error("Outreach failed: %s", exc, exc_info=True)
-        err = {"sent": False, "error": str(exc)}
+        err = {"sent": False, "attempted": True, "error": str(exc)}
+        await _persist_delivery(contact_id, err, err)
         return err, err
 
     return skipped_whatsapp, skipped_email
