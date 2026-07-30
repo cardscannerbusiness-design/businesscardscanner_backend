@@ -448,6 +448,14 @@ def extract_website(contact: dict[str, Any]) -> str:
     return ""
 
 
+def extract_event_name(contact: dict[str, Any]) -> str:
+    for key in ("eventName", "event", "event_name", "meetingAt", "meeting_at"):
+        value = contact.get(key)
+        if value and str(value).strip():
+            return str(value).strip()
+    return _normalize_env(os.getenv("WHATSAPP_TEMPLATE_EVENT_NAME")) or "the exhibition"
+
+
 def extract_address(contact: dict[str, Any]) -> str:
     for key in ("address", "secondaryAddress", "street", "location"):
         value = str(contact.get(key) or "").strip()
@@ -556,8 +564,22 @@ def _save_media_cache(cache: dict[str, Any]) -> None:
         logger.warning("Could not persist WhatsApp media cache: %s", exc)
 
 
+def _mime_for_media_file(file_path: Path) -> str:
+    suffix = file_path.suffix.lower()
+    return {
+        ".pdf": "application/pdf",
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".3gp": "video/3gpp",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+    }.get(suffix, "application/octet-stream")
+
+
 def _get_or_upload_header_media(file_path: Path) -> str | None:
-    """Upload a local document to Meta once and reuse the returned media id."""
+    """Upload a local media file to Meta once and reuse the returned media id."""
     cache = _load_media_cache()
     entry = cache.get(file_path.name) or {}
     media_id = str(entry.get("media_id") or "")
@@ -567,15 +589,16 @@ def _get_or_upload_header_media(file_path: Path) -> str | None:
 
     if not is_whatsapp_configured():
         return None
+    mime = _mime_for_media_file(file_path)
     try:
         url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/media"
         with file_path.open("rb") as f:
             response = requests.post(
                 url,
                 headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
-                data={"messaging_product": "whatsapp", "type": "application/pdf"},
-                files={"file": (file_path.name, f, "application/pdf")},
-                timeout=60,
+                data={"messaging_product": "whatsapp", "type": mime},
+                files={"file": (file_path.name, f, mime)},
+                timeout=120,
             )
         data = response.json()
         if response.status_code >= 400:
@@ -586,7 +609,7 @@ def _get_or_upload_header_media(file_path: Path) -> str | None:
             cache[file_path.name] = {"media_id": media_id, "uploaded_at": time.time()}
             _save_media_cache(cache)
             logger.info(
-                "[WhatsApp] Uploaded header document %s as media id %s",
+                "[WhatsApp] Uploaded header media %s as media id %s",
                 file_path.name,
                 media_id,
             )
@@ -594,6 +617,26 @@ def _get_or_upload_header_media(file_path: Path) -> str | None:
     except Exception as exc:
         logger.warning("WhatsApp media upload error for %s: %s", file_path, exc)
         return None
+
+
+def _header_media_component(
+    media_type: str,
+    *,
+    media_id: str | None = None,
+    link: str | None = None,
+    filename: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if media_id:
+        payload["id"] = media_id
+    if link:
+        payload["link"] = link
+    if filename and media_type == "document":
+        payload["filename"] = filename
+    return {
+        "type": "header",
+        "parameters": [{"type": media_type, media_type: payload}],
+    }
 
 
 def _build_header_component(template_def: dict[str, Any]) -> dict[str, Any] | None:
@@ -615,36 +658,44 @@ def _build_header_component(template_def: dict[str, Any]) -> dict[str, Any] | No
                 local_path = _local_path_for_static_url(doc_url)
                 media_id = _get_or_upload_header_media(local_path) if local_path else None
                 if media_id:
-                    return {
-                        "type": "header",
-                        "parameters": [
-                            {
-                                "type": "document",
-                                "document": {
-                                    "id": media_id,
-                                    "filename": filename,
-                                },
-                            }
-                        ],
-                    }
+                    return _header_media_component(
+                        "document", media_id=media_id, filename=filename
+                    )
                 logger.warning(
                     "WhatsApp header document %s is not publicly reachable and media "
                     "upload failed — sending template without guaranteed delivery.",
                     doc_url,
                 )
 
-            return {
-                "type": "header",
-                "parameters": [
-                    {
-                        "type": "document",
-                        "document": {
-                            "link": doc_url,
-                            "filename": filename,
-                        },
-                    }
-                ],
-            }
+            return _header_media_component("document", link=doc_url, filename=filename)
+        if fmt == "VIDEO":
+            video_url = _resolve_public_asset_url(
+                template_def.get("header_video_url")
+                or comp.get("video_url")
+                or template_def.get("header_handle")
+                or (comp.get("example") or {}).get("header_handle", [None])[0]
+            )
+            if not video_url:
+                return None
+
+            if not _is_publicly_reachable_url(video_url):
+                local_path = _local_path_for_static_url(video_url)
+                media_id = _get_or_upload_header_media(local_path) if local_path else None
+                if media_id:
+                    return _header_media_component("video", media_id=media_id)
+                logger.warning(
+                    "WhatsApp header video %s is not publicly reachable and media "
+                    "upload failed — sending template without video header.",
+                    video_url,
+                )
+                return None
+
+            # Prefer uploading a local copy when available; otherwise pass the public link.
+            local_path = _local_path_for_static_url(video_url)
+            media_id = _get_or_upload_header_media(local_path) if local_path else None
+            if media_id:
+                return _header_media_component("video", media_id=media_id)
+            return _header_media_component("video", link=video_url)
         if fmt == "TEXT":
             text = comp.get("text")
             if text is None:
@@ -660,12 +711,19 @@ def build_card_received_template_components(contact: dict[str, Any]) -> list[dic
     """Map scanned card fields to the approved card-received template variables."""
     contact_name = extract_contact_name(contact)
     first_name = (contact_name or "there").strip().split()[0]
+    event_name = extract_event_name(contact)
 
     positions = _extract_variable_positions(_CARD_RECEIVED_TEMPLATE_DEF) or [1]
     if len(positions) == 1:
-        # Single-variable templates (e.g. Ulacab greeting) expect the full name.
+        # Single-variable templates expect the full name.
         field_by_position: dict[int, str] = {
             1: _template_param(contact_name, "there"),
+        }
+    elif positions == [1, 2]:
+        # card_final_ula: Hi {{1}} … meeting you at {{2}}.
+        field_by_position = {
+            1: _template_param(first_name, "there"),
+            2: _template_param(event_name, "the exhibition"),
         }
     else:
         field_by_position = {

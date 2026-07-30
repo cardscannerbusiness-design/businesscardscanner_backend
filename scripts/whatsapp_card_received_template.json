@@ -1,23 +1,34 @@
 {
   "name": "card_final_ula",
-  "category": "UTILITY",
+  "category": "MARKETING",
   "language": "en",
-  "header_document_url": "__BACKEND_BASE_URL__/static/pdfs/ULACAB_VC_IN-SG_Mobile_Numbers.pdf",
+  "header_video_url": "__BACKEND_BASE_URL__/static/videos/ncs_intro.mp4",
   "components": [
     {
       "type": "HEADER",
-      "format": "DOCUMENT"
+      "format": "VIDEO"
     },
     {
       "type": "BODY",
-      "text": "Dear {{1}},\n\nThis is Dhana from Ulacab.com. We had the pleasure of meeting you at TTF Kolkata 2026.\n\nUlacab.com is a B2B transport provider helping Indian Travel Agents and OTAs directly book Airport Transfers and Ground Transportation across Singapore, Malaysia, Indonesia, Thailand, Vietnam, Hong Kong & Macau, South Korea, and Japan.\n\nDirect contracting with us helps you increase your profit margins. We look forward to receiving your enquiries for Airport Transfers and Ground Transportation.\n\nYou can reach us at:\n\n- +65 8605 1421\n- +91 95513 27334 (Call or WhatsApp)\n- support@ulavitech.com\n\nBest regards,\n\nDhana\nFounder/Director",
+      "text": "Hi {{1}},\n\nDhana here. It was great meeting you at {{2}}.\n\nQuick question: After collecting business cards, how many prospects actually become customers?\n\nMost businesses at exhibitions and events struggle with:\n• Delayed follow-ups\n• Poor brand recall\n• Manual business card data entry\n• No clear Return on Exhibition Spend (ROES)\n\nThat’s why we built Name Card Scan (NCS).\n\nWith NCS, you can:\n• Scan or upload business cards\n• Instantly capture contact details\n• Automatically send your WhatsApp & Email introduction, digital business card, brochures (PDF) and videos\n• Store all data in Google Drive\n• Push leads directly to Zoho CRM via API\n\nNCS helps you engage prospects while your brand is still fresh in their minds.\n\nROES = Prospect → Qualified Lead → Sale → Customer\n\nReply YES and let my team help you get started with NCS to improve your ROES.\n\nRegards,\nDhana\nFounder, Name Card Scan\ndhana@ulavitech.com\n+91 8838747273 | +65 97310793",
       "example": {
         "body_text": [
           [
-            "Yogesh VR"
+            "yogesh",
+            "Eventname"
           ]
         ]
       }
+    },
+    {
+      "type": "BUTTONS",
+      "buttons": [
+        {
+          "type": "URL",
+          "text": "Brochure",
+          "url": "https://drive.google.com/file/d/1KAcHsMzambv8nJccEItG1kdV_E30xpaX/view?usp=drive_link"
+        }
+      ]
     }
   ]
 }

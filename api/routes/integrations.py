@@ -165,7 +165,7 @@ async def test_whatsapp_message(request: WhatsAppTestRequest):
     "/integrations/whatsapp/card-received",
     summary="Send the approved card_final_ula WhatsApp template",
     description=(
-        "Sends the card_final_ula template with the PDF header and the recipient's full name "
+        "Sends the card_final_ula NCS template with {{1}}=name and {{2}}=event "
         "to the provided phone number. Useful for Swagger testing."
     ),
 )
@@ -176,7 +176,7 @@ async def send_card_received_template(request: WhatsAppCardReceivedRequest):
             detail="WhatsApp is not configured. Set WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID in .env.",
         )
 
-    contact = {"fullName": request.full_name}
+    contact = {"fullName": request.full_name, "eventName": request.event_name}
     try:
         result = await asyncio.to_thread(
             send_whatsapp_template,
