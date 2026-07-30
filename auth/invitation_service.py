@@ -721,6 +721,20 @@ def accept_invitation(
         new_value={"invitation_id": str(row["id"]), "email": email, "role": role},
     )
 
+    # Secondary: create/share company Google Sheet (never blocks accept).
+    # ADMIN → create sheet + Editor shares; USER → refresh Viewer share for company Users.
+    if company_id and role in (ROLE_ADMIN, ROLE_USER):
+        try:
+            from services.google_sheets_service import fire_ensure_company_sheet
+
+            fire_ensure_company_sheet(str(company_id))
+        except Exception as exc:
+            logger.warning(
+                "Could not schedule company Google Sheet for %s: %s",
+                company_id,
+                exc,
+            )
+
     return {
         "success": True,
         "detail": "Registration complete. Please sign in.",

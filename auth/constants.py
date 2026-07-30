@@ -74,6 +74,7 @@ PUBLIC_PATHS: set[str] = {
     "/api/auth/password-reset/confirm",
     "/api/invitations/validate",
     "/api/invitations/accept",
+    "/api/google/oauth/callback",
 }
 
 # Prefixes that are also public (e.g. /static/anything)

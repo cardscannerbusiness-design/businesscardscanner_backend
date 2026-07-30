@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from services import google_sheets_service as sheets
 
@@ -134,6 +134,175 @@ class TestUpsert(unittest.TestCase):
         self.assertEqual(len(calls["append"]), 0)
         self.assertEqual(len(calls["update"]), 1)
         self.assertIn("!A2:", calls["update"][0])  # row 2 = existing contact row
+
+
+class TestRoleBasedRouting(unittest.TestCase):
+    def setUp(self) -> None:
+        self.env = patch.dict(
+            "os.environ",
+            {
+                "GOOGLE_SHEET_ID": "fallback-sheet",
+                "GOOGLE_SERVICE_ACCOUNT_JSON": "{}",
+                "SUPERADMIN_EMAIL": "super@example.com",
+            },
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        sheets._workbook_cache.clear()
+
+    def test_admin_or_user_routes_to_company_sheet(self) -> None:
+        contact = {**CONTACT, "created_by_role": "USER"}
+        with (
+            patch.object(sheets, "_auth_headers", return_value={"Authorization": "Bearer x"}),
+            patch.object(sheets, "ensure_company_sheet", return_value="company-sheet") as ensure_co,
+            patch.object(sheets, "ensure_superadmin_sheet") as ensure_sa,
+        ):
+            sid = sheets._resolve_workbook_id({"Authorization": "Bearer x"}, contact, "Day 1")
+        self.assertEqual(sid, "company-sheet")
+        ensure_co.assert_called_once_with(CONTACT["owner_company_id"], first_sheet="Day 1")
+        ensure_sa.assert_not_called()
+
+    def test_super_admin_routes_to_superadmin_sheet(self) -> None:
+        contact = {
+            **CONTACT,
+            "created_by_role": "SUPER_ADMIN",
+            "owner_company_id": "",
+            "company_id": "",
+        }
+        with (
+            patch.object(sheets, "ensure_superadmin_sheet", return_value="sa-sheet") as ensure_sa,
+            patch.object(sheets, "ensure_company_sheet") as ensure_co,
+        ):
+            sid = sheets._resolve_workbook_id({"Authorization": "Bearer x"}, contact, "Day 1")
+        self.assertEqual(sid, "sa-sheet")
+        ensure_sa.assert_called_once_with(first_sheet="Day 1")
+        ensure_co.assert_not_called()
+
+
+class TestEnsureCompanySheet(unittest.TestCase):
+    def setUp(self) -> None:
+        self.env = patch.dict(
+            "os.environ",
+            {
+                "GOOGLE_SERVICE_ACCOUNT_JSON": "{}",
+                "SUPERADMIN_EMAIL": "super@example.com",
+            },
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        sheets._workbook_cache.clear()
+
+    def test_creates_via_oauth_persists_and_shares(self) -> None:
+        company_id = CONTACT["owner_company_id"]
+        writers: list[str] = []
+        viewers: list[str] = []
+        with (
+            patch.object(sheets, "_auth_headers", return_value={"Authorization": "Bearer sa"}),
+            patch.object(
+                sheets,
+                "_load_company_sheet_meta",
+                return_value={
+                    "company_name": "Acme Corp",
+                    "google_sheet_id": None,
+                    "admin_email": "admin@acme.com",
+                    "user_emails": ["user1@acme.com", "user2@acme.com"],
+                },
+            ),
+            patch(
+                "services.google_oauth_service.load_company_admin_oauth",
+                return_value={
+                    "admin_id": "a1",
+                    "refresh_token": "rtoken",
+                    "admin_email": "admin@acme.com",
+                },
+            ),
+            patch(
+                "services.google_oauth_service.refresh_access_token",
+                return_value="user-access",
+            ),
+            patch(
+                "services.google_oauth_service.create_spreadsheet_with_oauth",
+                return_value="new-sheet-id",
+            ) as create,
+            patch(
+                "services.google_oauth_service.service_account_client_email",
+                return_value="sa@project.iam.gserviceaccount.com",
+            ),
+            patch.object(sheets, "_persist_company_sheet_id") as persist,
+            patch.object(
+                sheets,
+                "_drive_share_writer",
+                side_effect=lambda h, fid, email: writers.append(email),
+            ),
+            patch.object(
+                sheets,
+                "_drive_share_viewer",
+                side_effect=lambda h, fid, email: viewers.append(email),
+            ),
+        ):
+            sid = sheets.ensure_company_sheet(company_id, first_sheet="Day 1")
+        self.assertEqual(sid, "new-sheet-id")
+        create.assert_called_once()
+        persist.assert_called_once_with(company_id, "new-sheet-id")
+        self.assertIn("sa@project.iam.gserviceaccount.com", writers)
+        self.assertIn("super@example.com", writers)
+        self.assertEqual(viewers, ["user1@acme.com", "user2@acme.com"])
+
+    def test_reuses_existing_sheet_and_still_shares(self) -> None:
+        company_id = CONTACT["owner_company_id"]
+        writers: list[str] = []
+        viewers: list[str] = []
+        with (
+            patch.object(sheets, "_auth_headers", return_value={"Authorization": "Bearer x"}),
+            patch.object(
+                sheets,
+                "_load_company_sheet_meta",
+                return_value={
+                    "company_name": "Acme Corp",
+                    "google_sheet_id": "existing-sheet",
+                    "admin_email": "admin@acme.com",
+                    "user_emails": ["user1@acme.com"],
+                },
+            ),
+            patch.object(sheets, "_spreadsheet_reachable", return_value=True),
+            patch(
+                "services.google_oauth_service.load_company_admin_oauth",
+                return_value=None,
+            ),
+            patch.object(sheets, "_create_spreadsheet") as create,
+            patch.object(sheets, "_persist_company_sheet_id") as persist,
+            patch.object(
+                sheets,
+                "_drive_share_writer",
+                side_effect=lambda h, fid, email: writers.append(email),
+            ),
+            patch.object(
+                sheets,
+                "_drive_share_viewer",
+                side_effect=lambda h, fid, email: viewers.append(email),
+            ),
+        ):
+            sid = sheets.ensure_company_sheet(company_id)
+        self.assertEqual(sid, "existing-sheet")
+        create.assert_not_called()
+        persist.assert_not_called()
+        # Admin already owns the sheet — only Super Admin gets an Editor share.
+        self.assertEqual(writers, ["super@example.com"])
+        self.assertEqual(viewers, ["user1@acme.com"])
+
+
+class TestDriveShareIdempotent(unittest.TestCase):
+    def test_already_shared_does_not_raise(self) -> None:
+        response = MagicMock()
+        response.status_code = 400
+        response.text = "Permission already exists for this user"
+        response.json.return_value = {
+            "error": {"message": "Permission already exists", "errors": [{"reason": "alreadyExists"}]}
+        }
+        with patch.object(sheets.requests, "post", return_value=response):
+            sheets._drive_share_writer(
+                {"Authorization": "Bearer x"}, "file123", "admin@acme.com"
+            )
 
 
 class TestFailureScenario(unittest.TestCase):

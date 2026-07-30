@@ -4,25 +4,30 @@ PostgreSQL remains the single source of truth. After a contact row is
 committed, the same record is upserted (update-by-Contact-ID, else append)
 into Google Sheets for reporting/sharing.
 
-Storage layout:
-    Workbook (spreadsheet title) = Event Name
-    Worksheet (tab title)        = Event Day
+Storage layout (role-based):
+    Workbook = one spreadsheet per Admin/company (all Users under that Admin
+               share it). Super Admin saves go to a dedicated Super Admin sheet.
+    Worksheet (tab title) = Event Day
 
-If a workbook for the event already exists it is reused. If a worksheet for
-the event day already exists rows are appended (or updated by Contact ID).
-Missing worksheets are created automatically. Existing contact rows are never
-wiped.
+New workbooks are created in the Admin's own Google Drive via OAuth (free),
+then shared with the service account for sync writes. Missing worksheets are
+created automatically. Existing contact rows are never wiped.
+
+Drive access: Admin owns the sheet; Super Admin gets Editor; company Users get
+Viewer (read-only) so the sheet appears in their Drive / Sheets apps.
 
 Configuration (environment variables only — nothing hardcoded):
-    GOOGLE_SHEET_ID              Optional fallback spreadsheet when event name
-                                 is empty (legacy single-sheet mode).
+    GOOGLE_SHEET_ID              Optional fallback spreadsheet when company /
+                                 Super Admin sheet cannot be resolved.
     GOOGLE_SHEET_NAME            Fallback tab when event day is empty
                                  (default: "Day 1").
     GOOGLE_DRIVE_FOLDER_ID       Optional Drive folder for newly created
-                                 event workbooks (share this folder with the
+                                 workbooks (share this folder with the
                                  service account).
     GOOGLE_SERVICE_ACCOUNT_JSON  Service-account credentials: either the raw
                                  JSON string or a path to the JSON key file.
+    SUPERADMIN_EMAIL             Used when sharing company sheets with the
+                                 platform Super Admin.
 
 Behaviour:
     * Runs fire-and-forget in a worker thread — never blocks or fails a save.
@@ -114,7 +119,7 @@ _pending_retry: dict[str, dict[str, Any]] = {}
 _token_lock = threading.Lock()
 _cached_token: dict[str, Any] = {"token": None, "expires_at": 0.0}
 
-# event name (lower) → spreadsheet id
+# cache key ("company:<uuid>" | "superadmin") → spreadsheet id
 _workbook_cache_lock = threading.Lock()
 _workbook_cache: dict[str, str] = {}
 
@@ -187,8 +192,8 @@ def _load_service_account() -> dict[str, Any] | None:
 def is_sheets_configured() -> bool:
     """Configured when a service account is available.
 
-    GOOGLE_SHEET_ID is optional — used as a fallback workbook when the contact
-    has no event name. New event workbooks are created via Drive/Sheets APIs.
+    GOOGLE_SHEET_ID is optional — used only as a last-resort fallback when a
+    company / Super Admin workbook cannot be resolved.
     """
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if not raw:
@@ -196,6 +201,12 @@ def is_sheets_configured() -> bool:
     if raw.startswith("{"):
         return True
     return _resolve_service_account_path(raw) is not None
+
+
+def _superadmin_share_email() -> str | None:
+    """Email used for Drive Editor share on Admin company sheets."""
+    email = (os.getenv("SUPERADMIN_EMAIL") or "").strip().lower()
+    return email or None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -526,37 +537,426 @@ def _create_spreadsheet(headers: dict[str, str], title: str, first_sheet: str) -
     return spreadsheet_id
 
 
-def _resolve_workbook_id(
+def _drive_share(
     headers: dict[str, str],
-    event_name: str,
-    event_day: str,
-) -> str:
-    """Resolve (and cache) the spreadsheet id for an event workbook."""
-    name = (event_name or "").strip()
-    if not name:
-        fallback = _sheet_id()
-        if not fallback:
-            raise RuntimeError(
-                "No event name on contact and GOOGLE_SHEET_ID is not configured."
-            )
-        return fallback
+    file_id: str,
+    email: str,
+    *,
+    role: str = "writer",
+) -> None:
+    """Grant Drive access to *email*. Idempotent — ignores already-shared.
 
-    cache_key = name.casefold()
+    role: "writer" (Editor) or "reader" (Viewer).
+    """
+    address = (email or "").strip().lower()
+    drive_role = (role or "writer").strip().lower()
+    if drive_role not in ("writer", "reader"):
+        drive_role = "writer"
+    if not address or not file_id:
+        return
+    response = requests.post(
+        f"{_DRIVE_API}/files/{file_id}/permissions",
+        headers=headers,
+        params={
+            "supportsAllDrives": "true",
+            "sendNotificationEmail": "false",
+        },
+        json={
+            "type": "user",
+            "role": drive_role,
+            "emailAddress": address,
+        },
+        timeout=20,
+    )
+    if response.status_code in (200, 201):
+        logger.info(
+            "Google Drive: shared %s as %s with %s.",
+            file_id,
+            drive_role,
+            address,
+        )
+        return
+    # alreadyExists / duplicate permission
+    body = ""
+    try:
+        body = response.text or ""
+    except Exception:
+        body = ""
+    if response.status_code == 400 and "already" in body.lower():
+        return
+    if response.status_code == 403 and "already" in body.lower():
+        return
+    try:
+        err = response.json()
+        reason = str((err.get("error") or {}).get("errors") or "")
+        message = str((err.get("error") or {}).get("message") or "")
+        if "alreadyExists" in reason or "already" in message.lower():
+            return
+    except Exception:
+        pass
+    response.raise_for_status()
+
+
+def _drive_share_writer(headers: dict[str, str], file_id: str, email: str) -> None:
+    """Grant Editor access to *email*. Idempotent — ignores already-shared."""
+    _drive_share(headers, file_id, email, role="writer")
+
+
+def _drive_share_viewer(headers: dict[str, str], file_id: str, email: str) -> None:
+    """Grant Viewer (read-only) access to *email*. Idempotent."""
+    _drive_share(headers, file_id, email, role="reader")
+
+
+def _cache_get(key: str) -> str | None:
     with _workbook_cache_lock:
-        cached = _workbook_cache.get(cache_key)
+        return _workbook_cache.get(key)
+
+
+def _cache_set(key: str, spreadsheet_id: str) -> None:
+    with _workbook_cache_lock:
+        _workbook_cache[key] = spreadsheet_id
+
+
+def _load_company_sheet_meta(company_id: str) -> dict[str, Any] | None:
+    """Return company_name, google_sheet_id, admin_email, user_emails for a company."""
+    from db.pool import db_cursor
+
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT c.company_name,
+                   c.google_sheet_id,
+                   a.email AS admin_email
+            FROM companies c
+            LEFT JOIN users a ON a.id = c.admin_id AND a.deleted_at IS NULL
+            WHERE c.id = %s
+            """,
+            (company_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+
+        cur.execute(
+            """
+            SELECT u.email
+            FROM users u
+            JOIN roles r ON r.id = u.role_id
+            WHERE u.company_id = %s
+              AND r.name = 'USER'
+              AND u.deleted_at IS NULL
+              AND u.is_active = TRUE
+            """,
+            (company_id,),
+        )
+        user_rows = cur.fetchall() or []
+
+    user_emails: list[str] = []
+    for urec in user_rows:
+        email = str(urec.get("email") or "").strip().lower()
+        if email and email not in user_emails:
+            user_emails.append(email)
+
+    return {
+        "company_name": str(row.get("company_name") or "").strip() or "Company",
+        "google_sheet_id": str(row.get("google_sheet_id") or "").strip() or None,
+        "admin_email": str(row.get("admin_email") or "").strip().lower() or None,
+        "user_emails": user_emails,
+    }
+
+
+def _persist_company_sheet_id(company_id: str, spreadsheet_id: str) -> None:
+    from db.pool import db_cursor
+
+    with db_cursor(commit=True) as cur:
+        cur.execute(
+            """
+            UPDATE companies
+            SET google_sheet_id = %s, updated_at = NOW()
+            WHERE id = %s
+            """,
+            (spreadsheet_id, company_id),
+        )
+
+
+def _load_superadmin_sheet_meta() -> dict[str, Any] | None:
+    """Return id, email, google_sheet_id for the platform Super Admin user."""
+    from db.pool import db_cursor
+
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT u.id, u.email, u.google_sheet_id
+            FROM users u
+            JOIN roles r ON r.id = u.role_id
+            WHERE r.name = 'SUPER_ADMIN'
+              AND u.deleted_at IS NULL
+            ORDER BY u.created_at ASC
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": str(row.get("id") or ""),
+        "email": str(row.get("email") or "").strip().lower() or None,
+        "google_sheet_id": str(row.get("google_sheet_id") or "").strip() or None,
+    }
+
+
+def _persist_user_sheet_id(user_id: str, spreadsheet_id: str) -> None:
+    from db.pool import db_cursor
+
+    with db_cursor(commit=True) as cur:
+        cur.execute(
+            """
+            UPDATE users
+            SET google_sheet_id = %s, updated_at = NOW()
+            WHERE id = %s
+            """,
+            (spreadsheet_id, user_id),
+        )
+
+
+def _spreadsheet_reachable(headers: dict[str, str], spreadsheet_id: str) -> bool:
+    try:
+        _spreadsheet_meta(headers, spreadsheet_id)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Google Sheets: stored spreadsheet %s is not reachable: %s",
+            spreadsheet_id,
+            exc,
+        )
+        return False
+
+
+def ensure_company_sheet(company_id: str, *, first_sheet: str | None = None) -> str:
+    """Ensure the Admin/company workbook exists, is shared, and return its id.
+
+    Creates the spreadsheet in the Admin's Google Drive via OAuth when missing
+    (free — uses Admin storage). Then shares:
+      - service account = Editor (so sync can write)
+      - Super Admin = Editor
+      - company Users = Viewer
+    Admin already owns the file.
+    """
+    company_id = (company_id or "").strip()
+    if not company_id:
+        raise RuntimeError("ensure_company_sheet requires a company_id.")
+
+    cache_key = f"company:{company_id}"
+    cached = _cache_get(cache_key)
     if cached:
         return cached
 
-    found = _drive_find_spreadsheet(headers, name)
-    if found:
-        with _workbook_cache_lock:
-            _workbook_cache[cache_key] = found
-        return found
+    sa_auth = _auth_headers()
+    if not sa_auth:
+        raise RuntimeError("Google Sheets auth failed (no service-account access token).")
 
-    created = _create_spreadsheet(headers, name, event_day or "Day 1")
-    with _workbook_cache_lock:
-        _workbook_cache[cache_key] = created
-    return created
+    meta = _load_company_sheet_meta(company_id)
+    if not meta:
+        raise RuntimeError(f"Company {company_id} not found.")
+
+    spreadsheet_id = meta.get("google_sheet_id")
+    if spreadsheet_id and _spreadsheet_reachable(sa_auth, str(spreadsheet_id)):
+        spreadsheet_id = str(spreadsheet_id)
+    else:
+        # Create in Admin's Drive via OAuth (avoids SA storageQuotaExceeded).
+        from services import google_oauth_service as oauth
+
+        admin_oauth = oauth.load_company_admin_oauth(company_id)
+        if not admin_oauth or not admin_oauth.get("refresh_token"):
+            raise RuntimeError(
+                "Admin has not connected Google Drive. "
+                "Ask the Admin to open Settings → Connect Google Drive."
+            )
+        access = oauth.refresh_access_token(str(admin_oauth["refresh_token"]))
+        title = f"{meta['company_name']} — Contacts"
+        spreadsheet_id = oauth.create_spreadsheet_with_oauth(
+            access, title, first_sheet or _sheet_name()
+        )
+        _persist_company_sheet_id(company_id, spreadsheet_id)
+
+        # Share service account so background sync can write.
+        sa_email = oauth.service_account_client_email()
+        if sa_email:
+            try:
+                _drive_share_writer(
+                    oauth.oauth_auth_headers(access), spreadsheet_id, sa_email
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not share new sheet %s with service account %s: %s",
+                    spreadsheet_id,
+                    sa_email,
+                    exc,
+                )
+
+    # Share: Super Admin = Editor; company Users = Viewer (Admin already owns).
+    editor_emails: list[str] = []
+    sa_email_env = _superadmin_share_email()
+    if sa_email_env:
+        editor_emails.append(sa_email_env)
+    # Prefer Admin OAuth token for sharing when available; else SA token.
+    share_headers = sa_auth
+    try:
+        from services import google_oauth_service as oauth
+
+        admin_oauth = oauth.load_company_admin_oauth(company_id)
+        if admin_oauth and admin_oauth.get("refresh_token"):
+            access = oauth.refresh_access_token(str(admin_oauth["refresh_token"]))
+            share_headers = oauth.oauth_auth_headers(access)
+    except Exception as exc:
+        logger.warning("Using service-account token for shares: %s", exc)
+
+    for email in editor_emails:
+        # Don't need to share Admin with themselves (owner).
+        if meta.get("admin_email") and email == meta.get("admin_email"):
+            continue
+        try:
+            _drive_share_writer(share_headers, spreadsheet_id, email)
+        except Exception as exc:
+            logger.warning(
+                "Google Drive: could not share company sheet %s with editor %s: %s",
+                spreadsheet_id,
+                email,
+                exc,
+            )
+
+    viewer_emails = [
+        e for e in (meta.get("user_emails") or [])
+        if e and e not in editor_emails and e != meta.get("admin_email")
+    ]
+    for email in viewer_emails:
+        try:
+            _drive_share_viewer(share_headers, spreadsheet_id, email)
+        except Exception as exc:
+            logger.warning(
+                "Google Drive: could not share company sheet %s with viewer %s: %s",
+                spreadsheet_id,
+                email,
+                exc,
+            )
+
+    _cache_set(cache_key, spreadsheet_id)
+    return spreadsheet_id
+
+
+def ensure_superadmin_sheet(*, first_sheet: str | None = None) -> str:
+    """Ensure the Super Admin workbook exists (created via Super Admin OAuth)."""
+    cache_key = "superadmin"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
+    sa_auth = _auth_headers()
+    if not sa_auth:
+        raise RuntimeError("Google Sheets auth failed (no service-account access token).")
+
+    meta = _load_superadmin_sheet_meta()
+    spreadsheet_id = meta.get("google_sheet_id") if meta else None
+    if spreadsheet_id and _spreadsheet_reachable(sa_auth, str(spreadsheet_id)):
+        spreadsheet_id = str(spreadsheet_id)
+    else:
+        from services import google_oauth_service as oauth
+
+        user_id = str((meta or {}).get("id") or "")
+        refresh = oauth.load_user_refresh_token(user_id) if user_id else None
+        if not refresh:
+            raise RuntimeError(
+                "Super Admin has not connected Google Drive. "
+                "Open Settings → Connect Google Drive."
+            )
+        access = oauth.refresh_access_token(refresh)
+        spreadsheet_id = oauth.create_spreadsheet_with_oauth(
+            access, "Super Admin — Contacts", first_sheet or _sheet_name()
+        )
+        if user_id:
+            _persist_user_sheet_id(user_id, spreadsheet_id)
+        sa_email = oauth.service_account_client_email()
+        if sa_email:
+            try:
+                _drive_share_writer(
+                    oauth.oauth_auth_headers(access), spreadsheet_id, sa_email
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not share Super Admin sheet with service account: %s",
+                    exc,
+                )
+
+    _cache_set(cache_key, spreadsheet_id)
+    return spreadsheet_id
+
+
+def fire_ensure_company_sheet(company_id: str) -> None:
+    """Fire-and-forget company sheet create/share (Admin or User invite accept)."""
+    if not is_sheets_configured() or not company_id:
+        return
+
+    def _run() -> None:
+        try:
+            # Clear cache so newly accepted Users are included in viewer shares.
+            with _workbook_cache_lock:
+                _workbook_cache.pop(f"company:{company_id}", None)
+            ensure_company_sheet(company_id)
+        except Exception as exc:
+            logger.warning(
+                "Google Sheets: ensure_company_sheet failed for %s: %s",
+                company_id,
+                exc,
+            )
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _resolve_workbook_id(
+    headers: dict[str, str],
+    contact: dict[str, Any],
+    event_day: str,
+) -> str:
+    """Resolve the role-based workbook for this contact (company or Super Admin)."""
+    role = str(contact.get("created_by_role") or "").strip().upper()
+    company_id = str(
+        contact.get("owner_company_id") or contact.get("company_id") or ""
+    ).strip()
+
+    if role == "SUPER_ADMIN" or (not company_id and role not in ("ADMIN", "USER")):
+        try:
+            return ensure_superadmin_sheet(first_sheet=event_day)
+        except Exception as exc:
+            fallback = _sheet_id()
+            if fallback:
+                logger.warning(
+                    "Super Admin sheet ensure failed (%s); using GOOGLE_SHEET_ID.",
+                    exc,
+                )
+                return fallback
+            raise
+
+    if company_id:
+        try:
+            return ensure_company_sheet(company_id, first_sheet=event_day)
+        except Exception as exc:
+            fallback = _sheet_id()
+            if fallback:
+                logger.warning(
+                    "Company sheet ensure failed for %s (%s); using GOOGLE_SHEET_ID.",
+                    company_id,
+                    exc,
+                )
+                return fallback
+            raise
+
+    fallback = _sheet_id()
+    if fallback:
+        return fallback
+    raise RuntimeError(
+        "Cannot resolve Google Sheet: contact has no company and "
+        "GOOGLE_SHEET_ID is not configured."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -568,17 +968,19 @@ def _upsert_row(contact: dict[str, Any], extras: dict[str, Any] | None) -> None:
     if not auth:
         raise RuntimeError("Google Sheets auth failed (no access token).")
 
-    event_name = str(contact.get("eventName") or "").strip()
     event_day = _sanitize_sheet_title(
         str(contact.get("eventDay") or "").strip() or _sheet_name(),
         fallback=_sheet_name(),
     )
 
-    spreadsheet_id = _resolve_workbook_id(auth, event_name, event_day)
+    spreadsheet_id = _resolve_workbook_id(auth, contact, event_day)
     worksheet = _ensure_worksheet(auth, spreadsheet_id, event_day)
     _ensure_header_row(auth, spreadsheet_id, worksheet)
 
     contact_id = str(contact.get("id") or "")
+    company_label = str(
+        contact.get("owner_company_id") or contact.get("company_id") or spreadsheet_id
+    )
     row = contact_to_row(contact, extras)
     existing_row = _find_row_by_contact_id(auth, spreadsheet_id, worksheet, contact_id)
     if existing_row:
@@ -592,7 +994,7 @@ def _upsert_row(contact: dict[str, Any], extras: dict[str, Any] | None) -> None:
             "Google Sheets: updated row %s for contact %s in %r / %r.",
             existing_row,
             contact_id,
-            event_name or spreadsheet_id,
+            company_label,
             worksheet,
         )
     else:
@@ -600,7 +1002,7 @@ def _upsert_row(contact: dict[str, Any], extras: dict[str, Any] | None) -> None:
         logger.info(
             "Google Sheets: appended row for contact %s in %r / %r.",
             contact_id,
-            event_name or spreadsheet_id,
+            company_label,
             worksheet,
         )
 

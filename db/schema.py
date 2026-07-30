@@ -90,9 +90,16 @@ SCHEMA_STATEMENTS: list[str] = [
     # Profile fields for invited admins/users (idempotent for existing DBs)
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS designation VARCHAR(255) NOT NULL DEFAULT '';",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(255) NOT NULL DEFAULT '';",
+    # Role-based Google Sheets: one workbook per company (Admin); Super Admin sheet on users
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
+    # Admin / Super Admin Google OAuth (create sheets in their own Drive — free)
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_refresh_token TEXT;",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_connected_email VARCHAR(255);",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_connected_at TIMESTAMPTZ;",
     # ── Offline queue registry ─────────────────────────────────────────────
     # IndexedDB remains the source of truth for synchronization. This table is
-    # a best-effort online mirror so SuperAdmin can inspect queues platform-wide.
+    # a best-effort online mirror so SuperAdmin can inspect queues platform-wide.   
     """
     CREATE TABLE IF NOT EXISTS offline_queue_records (
         id                  BIGSERIAL PRIMARY KEY,
