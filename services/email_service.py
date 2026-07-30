@@ -57,7 +57,7 @@ def _assets_base() -> str:
 
 def _pdf_download_href() -> str:
     """Public PDF link for thank-you HTML (served from /assets)."""
-    return f"{_assets_base()}/ULACAB_VC_IN-SG_Mobile_Numbers.pdf"
+    return f"{_assets_base()}/NCS-Corporate-Deck-V1.pdf"
 
 
 def _normalize_gmail_app_password(value: str | None) -> str:
