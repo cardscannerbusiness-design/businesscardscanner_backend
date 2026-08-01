@@ -25,6 +25,9 @@ class TestOAuthConfig(unittest.TestCase):
         ):
             oauth._oauth_client_cache = None
             self.assertFalse(oauth.is_oauth_configured())
+            self.assertIsNone(
+                oauth.build_authorize_url(user_id="u1", role="ADMIN")
+            )
 
     def test_build_authorize_url(self) -> None:
         with patch.dict(

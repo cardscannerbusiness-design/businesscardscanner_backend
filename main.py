@@ -79,6 +79,12 @@ async def lifespan(app: FastAPI):
     await whatsapp_queue.start()
     await email_queue.start()
     try:
+        from services.google_oauth_service import warn_if_oauth_not_configured
+
+        warn_if_oauth_not_configured()
+    except Exception as exc:
+        logger.warning("Google OAuth startup check skipped: %s", exc)
+    try:
         sub = await asyncio.to_thread(ensure_waba_webhook_subscription)
         if not sub.get("subscribed"):
             logger.warning("WhatsApp WABA webhook subscription: %s", sub)
