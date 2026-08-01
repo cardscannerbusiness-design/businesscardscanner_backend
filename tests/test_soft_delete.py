@@ -13,6 +13,10 @@ class TestSoftDeleteContact(unittest.TestCase):
     def test_soft_delete_updates_flags(self, connect: MagicMock) -> None:
         conn = MagicMock()
         cur = MagicMock()
+        cur.fetchone.return_value = {
+            "image_size_bytes": 0,
+            "owner_company_id": None,
+        }
         cur.rowcount = 1
         conn.cursor.return_value.__enter__.return_value = cur
         connect.return_value.__enter__.return_value = conn
@@ -26,6 +30,7 @@ class TestSoftDeleteContact(unittest.TestCase):
     def test_soft_delete_missing_contact(self, connect: MagicMock) -> None:
         conn = MagicMock()
         cur = MagicMock()
+        cur.fetchone.return_value = None
         cur.rowcount = 0
         conn.cursor.return_value.__enter__.return_value = cur
         connect.return_value.__enter__.return_value = conn

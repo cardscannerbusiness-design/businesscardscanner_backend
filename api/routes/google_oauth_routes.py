@@ -44,7 +44,18 @@ def oauth_start(request: Request):
         )
     except oauth.GoogleOAuthError as exc:
         raise HTTPException(status_code=exc.status, detail={"code": exc.code, "message": exc.message})
-    return {"authorize_url": url}
+    if not url:
+        # Soft degradation — never crash; UI disables Connect when oauth_configured is false.
+        return {
+            "oauth_configured": False,
+            "authorize_url": None,
+            "message": (
+                "Google OAuth is not configured on the server. "
+                "Set GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / "
+                "GOOGLE_OAUTH_REDIRECT_URI or place secrets/client_secret.json."
+            ),
+        }
+    return {"oauth_configured": True, "authorize_url": url}
 
 
 @router.get("/oauth/callback", summary="Google OAuth callback (public)")

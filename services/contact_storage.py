@@ -32,6 +32,20 @@ def check_storage() -> dict[str, Any]:
     return result
 
 
+def get_storage_usage(user: dict[str, Any] | None = None) -> dict[str, Any]:
+    if is_client_side_storage():
+        return {
+            "cards_scanned": 0,
+            "contacts": 0,
+            "images_stored": 0,
+            "image_bytes": 0,
+            "database_bytes": None,
+        }
+    from services import local_db_service as local_db
+
+    return local_db.get_storage_usage(user=user)
+
+
 def list_contacts(user: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     if is_client_side_storage():
         return []

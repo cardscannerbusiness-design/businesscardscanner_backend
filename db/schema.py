@@ -92,6 +92,10 @@ SCHEMA_STATEMENTS: list[str] = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(255) NOT NULL DEFAULT '';",
     # Role-based Google Sheets: one workbook per company (Admin); Super Admin sheet on users
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
+    # Company storage quota (Freemium default = 20 MB)
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS plan_name VARCHAR(64) NOT NULL DEFAULT 'FREEMIUM';",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS storage_limit_bytes BIGINT NOT NULL DEFAULT 20971520;",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS used_storage_bytes BIGINT NOT NULL DEFAULT 0;",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
     # Admin / Super Admin Google OAuth (create sheets in their own Drive — free)
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_refresh_token TEXT;",
@@ -331,6 +335,7 @@ SCHEMA_STATEMENTS: list[str] = [
     "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS whatsapp_delivery_status VARCHAR(32);",
     "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS whatsapp_delivery_error TEXT;",
     'ALTER TABLE contacts ADD COLUMN IF NOT EXISTS "cardImageBase64" TEXT;',
+    "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS image_size_bytes BIGINT NOT NULL DEFAULT 0;",
     "CREATE INDEX IF NOT EXISTS idx_contacts_is_deleted ON contacts(is_deleted);",
     "CREATE INDEX IF NOT EXISTS idx_contacts_created_by ON contacts(created_by_user_id);",
     "CREATE INDEX IF NOT EXISTS idx_contacts_owner_company ON contacts(owner_company_id);",

@@ -351,6 +351,75 @@ def list_contacts_page(
         return {"items": [], "total": 0, "page": page, "limit": limit}
 
 
+def get_storage_usage(user: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Aggregate contact/image storage stats for the signed-in user's RBAC scope."""
+    empty = {
+        "cards_scanned": 0,
+        "contacts": 0,
+        "images_stored": 0,
+        "image_bytes": 0,
+        "database_bytes": None,
+    }
+    try:
+        with _connect() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Bound expensive aggregates so Settings / storage config cannot
+                # hold a pooled connection (and block the app) indefinitely.
+                cur.execute("SET LOCAL statement_timeout = 10000")
+                base_query, params = _contacts_list_sql(user)
+                # Prefer image_size_bytes (indexed numeric) over OCTET_LENGTH on
+                # huge base64 TEXT — OCTET_LENGTH was holding connections too long
+                # after Storage Management landed and starved OCR auth lookups.
+                agg_query = f"""
+                    SELECT
+                        COUNT(*)::bigint AS contacts,
+                        COUNT(*) FILTER (
+                            WHERE "cardImageBase64" IS NOT NULL
+                              AND LENGTH(TRIM(COALESCE("cardImageBase64", ''))) > 32
+                        )::bigint AS images_stored,
+                        COALESCE(
+                            SUM(
+                                CASE
+                                    WHEN COALESCE(image_size_bytes, 0) > 0
+                                    THEN image_size_bytes
+                                    WHEN "cardImageBase64" IS NOT NULL
+                                     AND LENGTH(TRIM(COALESCE("cardImageBase64", ''))) > 32
+                                    THEN OCTET_LENGTH("cardImageBase64")
+                                    ELSE 0
+                                END
+                            ),
+                            0
+                        )::bigint AS image_bytes
+                    FROM ({base_query}) AS scoped
+                """
+                cur.execute(agg_query, params)
+                row = cur.fetchone() or {}
+                contacts = int(row.get("contacts") or 0)
+                images_stored = int(row.get("images_stored") or 0)
+                image_bytes = int(row.get("image_bytes") or 0)
+
+                database_bytes = None
+                try:
+                    cur.execute("SELECT pg_total_relation_size('contacts')::bigint AS bytes")
+                    size_row = cur.fetchone() or {}
+                    database_bytes = int(size_row.get("bytes") or 0)
+                except Exception:
+                    database_bytes = None
+
+                return {
+                    "cards_scanned": contacts,
+                    "contacts": contacts,
+                    "images_stored": images_stored,
+                    "image_bytes": image_bytes,
+                    "database_bytes": database_bytes,
+                }
+    except LocalDbError:
+        raise
+    except Exception as exc:
+        logger.error("PostgreSQL storage usage failed: %s", exc, exc_info=True)
+        return empty
+
+
 def _escape_like(value: str) -> str:
     """Escape LIKE wildcards so user input is matched literally."""
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -530,6 +599,13 @@ def create_contact(
     contact_data: dict[str, Any],
     image_path: str | None = None,
 ) -> dict[str, Any]:
+    import time
+
+    from services import storage_service
+
+    upload_started = time.perf_counter()
+    logger.info("[UPLOAD] Request Received")
+
     body = _payload_to_local_body(
         contact_data,
         image_path_to_base64(image_path),
@@ -541,9 +617,29 @@ def create_contact(
         str(created_by_user_id) if created_by_user_id else None
     )
 
+    size_started = time.perf_counter()
+    logger.info("[UPLOAD] Image Size Calculation Started")
+    image_size_bytes = storage_service.calculate_image_size_bytes(body.get("cardImageBase64"))
+    logger.info(
+        "[UPLOAD] Image Size Calculated duration_ms=%.1f size_bytes=%s company_id=%s",
+        (time.perf_counter() - size_started) * 1000,
+        image_size_bytes,
+        owner_company_id,
+    )
+
     try:
         with _connect() as conn:
-            with conn.cursor() as cur:
+            # RealDictCursor required: storage_service._lock_company / _row_as_dict
+            # and callers expect mapping rows (plain cursor tuples broke quota checks).
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Atomic quota check + insert + used_storage increment
+                if owner_company_id:
+                    storage_service.assert_can_upload_locked(
+                        cur, owner_company_id, image_size_bytes
+                    )
+
+                save_started = time.perf_counter()
+                logger.info("[CONTACT] Saving Contact contact_id=%s", contact_id)
                 cur.execute(
                     """
                     INSERT INTO contacts (
@@ -552,11 +648,12 @@ def create_contact(
                         email, "secondaryEmail", website,
                         "secondaryWebsite", address, "secondaryAddress", "socialLinks",
                         "gstNumber", notes, "eventName", "eventDay", "eventId", "cardImageBase64",
+                        image_size_bytes,
                         "syncStatus", "createdAt", "updatedAt", created_by_user_id,
                         owner_company_id, created_by_role
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
                     """,
                     (
@@ -583,6 +680,7 @@ def create_contact(
                         body["eventDay"],
                         body.get("eventId"),
                         body["cardImageBase64"],
+                        image_size_bytes,
                         body["syncStatus"],
                         now,
                         now,
@@ -591,24 +689,70 @@ def create_contact(
                         created_by_role,
                     ),
                 )
+                logger.info(
+                    "[CONTACT] Contact Inserted duration_ms=%.1f contact_id=%s",
+                    (time.perf_counter() - save_started) * 1000,
+                    contact_id,
+                )
+                if owner_company_id and image_size_bytes > 0:
+                    storage_service.update_storage_after_upload(
+                        owner_company_id,
+                        image_size_bytes,
+                        cur=cur,
+                    )
+            commit_started = time.perf_counter()
+            logger.info("[DATABASE] Commit Transaction contact_id=%s", contact_id)
             conn.commit()
+            logger.info(
+                "[DATABASE] Commit Transaction Completed duration_ms=%.1f",
+                (time.perf_counter() - commit_started) * 1000,
+            )
+    except storage_service.StorageLimitExceededError:
+        logger.warning(
+            "[STORAGE] Upload rejected (limit) company_id=%s size=%s",
+            owner_company_id,
+            image_size_bytes,
+        )
+        raise
+    except TimeoutError as exc:
+        logger.exception("[STORAGE] Storage lock timeout company_id=%s", owner_company_id)
+        raise LocalDbError(str(exc), status_code=503) from exc
     except LocalDbError:
         raise
     except Exception as exc:
+        logger.exception("[UPLOAD] Contact create failed contact_id=%s", contact_id)
         raise LocalDbError(f"Failed to save contact: {exc}") from exc
 
+    logger.info(
+        "[API] Returning Success Response duration_ms=%.1f contact_id=%s",
+        (time.perf_counter() - upload_started) * 1000,
+        contact_id,
+    )
     return {"success": True, "id": contact_id, "database": "postgresql"}
 
 
 def update_contact(contact_id: str, contact_data: dict[str, Any]) -> dict[str, Any]:
+    from services import storage_service
+
     body = _payload_to_local_body(contact_data)
     try:
         with _connect() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 # Preserve system delivery markers that live in notes so edits
                 # cannot wipe WhatsApp/email sent history.
-                cur.execute('SELECT notes FROM contacts WHERE id = %s', (contact_id,))
+                cur.execute(
+                    """
+                    SELECT notes, "cardImageBase64", image_size_bytes, owner_company_id
+                    FROM contacts
+                    WHERE id = %s AND (is_deleted = FALSE OR is_deleted IS NULL)
+                    FOR UPDATE
+                    """,
+                    (contact_id,),
+                )
                 existing = cur.fetchone()
+                if not existing:
+                    return {"success": False, "error": "Contact not found"}
+
                 existing_notes = str((existing or {}).get("notes") or "")
                 markers = [
                     marker
@@ -621,6 +765,24 @@ def update_contact(contact_id: str, contact_data: dict[str, Any]) -> dict[str, A
                         notes = f"{notes}\n{marker}".strip() if notes else marker
                 body["notes"] = notes
 
+                old_size = int(existing.get("image_size_bytes") or 0)
+                company_id = (
+                    str(existing["owner_company_id"])
+                    if existing.get("owner_company_id")
+                    else None
+                )
+                new_image = body.get("cardImageBase64")
+                # COALESCE semantics: null/empty keeps existing image
+                if new_image:
+                    new_size = storage_service.calculate_image_size_bytes(new_image)
+                else:
+                    new_size = old_size
+                    new_image = None
+
+                delta = new_size - old_size
+                if company_id and delta > 0:
+                    storage_service.assert_can_upload_locked(cur, company_id, delta)
+
                 cur.execute(
                     """
                     UPDATE contacts SET
@@ -632,6 +794,7 @@ def update_contact(contact_id: str, contact_data: dict[str, Any]) -> dict[str, A
                         "gstNumber" = %s, notes = %s, "eventName" = %s, "eventDay" = %s,
                         "eventId" = COALESCE(%s, "eventId"),
                         "cardImageBase64" = COALESCE(%s, "cardImageBase64"),
+                        image_size_bytes = %s,
                         "syncStatus" = %s, "updatedAt" = %s
                     WHERE id = %s
                     """,
@@ -657,7 +820,8 @@ def update_contact(contact_id: str, contact_data: dict[str, Any]) -> dict[str, A
                         body["eventName"],
                         body["eventDay"],
                         body.get("eventId"),
-                        body["cardImageBase64"],
+                        new_image,
+                        new_size,
                         body["syncStatus"],
                         datetime.utcnow(),
                         contact_id,
@@ -665,20 +829,53 @@ def update_contact(contact_id: str, contact_data: dict[str, Any]) -> dict[str, A
                 )
                 if cur.rowcount == 0:
                     return {"success": False, "error": "Contact not found"}
+
+                if company_id and delta > 0:
+                    storage_service.update_storage_after_upload(company_id, delta, cur=cur)
+                elif company_id and delta < 0:
+                    storage_service.release_storage_after_delete(
+                        company_id, abs(delta), cur=cur
+                    )
             conn.commit()
+    except storage_service.StorageLimitExceededError:
+        raise
+    except TimeoutError as exc:
+        logger.exception("[STORAGE] Storage lock timeout on update contact_id=%s", contact_id)
+        raise LocalDbError(str(exc), status_code=503) from exc
     except LocalDbError:
         raise
     except Exception as exc:
+        logger.exception("[CONTACT] update_contact failed contact_id=%s", contact_id)
         raise LocalDbError(str(exc)) from exc
     return {"success": True, "id": contact_id}
 
 
 def soft_delete_contact(contact_id: str) -> dict[str, Any]:
     """Soft-delete: set is_deleted=TRUE and deleted_at=NOW(). Never permanently removes the row."""
+    from services import storage_service
+
     now = datetime.utcnow()
     try:
         with _connect() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT image_size_bytes, owner_company_id
+                    FROM contacts
+                    WHERE id = %s AND (is_deleted = FALSE OR is_deleted IS NULL)
+                    FOR UPDATE
+                    """,
+                    (contact_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {"success": False, "message": "Contact not found or already deleted"}
+
+                image_size = int(row.get("image_size_bytes") or 0)
+                company_id = (
+                    str(row["owner_company_id"]) if row.get("owner_company_id") else None
+                )
+
                 cur.execute(
                     """
                     UPDATE contacts
@@ -689,6 +886,11 @@ def soft_delete_contact(contact_id: str) -> dict[str, Any]:
                 )
                 if cur.rowcount == 0:
                     return {"success": False, "message": "Contact not found or already deleted"}
+
+                if company_id and image_size > 0:
+                    storage_service.release_storage_after_delete(
+                        company_id, image_size, cur=cur
+                    )
             conn.commit()
     except LocalDbError:
         raise

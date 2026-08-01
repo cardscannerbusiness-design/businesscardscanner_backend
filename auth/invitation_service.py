@@ -624,8 +624,9 @@ def accept_invitation(
                 """
                 INSERT INTO companies (
                     id, company_name, company_code, address, phone, email, website,
-                    status, created_at, updated_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,'active',%s,%s)
+                    status, plan_name, storage_limit_bytes, used_storage_bytes,
+                    created_at, updated_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,'active','FREEMIUM',20971520,0,%s,%s)
                 """,
                 (
                     company_id,

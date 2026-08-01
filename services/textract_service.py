@@ -5,12 +5,17 @@ Calls DetectDocumentText (LINES) and optionally enriches via AnalyzeDocument (FO
 """
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+
+# Bound network waits so extract_text cannot block a worker forever.
+_TEXTRACT_CONNECT_TIMEOUT = int(os.getenv("TEXTRACT_CONNECT_TIMEOUT_SEC", "10"))
+_TEXTRACT_READ_TIMEOUT = int(os.getenv("TEXTRACT_READ_TIMEOUT_SEC", "60"))
 
 _textract_client = None
 
@@ -25,11 +30,18 @@ def _get_textract_client():
                 "AWS_SECRET_ACCESS_KEY in .env."
             )
         import boto3
+        from botocore.config import Config
+
         _textract_client = boto3.client(
             "textract",
             region_name=AWS_REGION,
             aws_access_key_id=AWS_ACCESS_KEY_ID,
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            config=Config(
+                connect_timeout=_TEXTRACT_CONNECT_TIMEOUT,
+                read_timeout=_TEXTRACT_READ_TIMEOUT,
+                retries={"max_attempts": 2, "mode": "standard"},
+            ),
         )
     return _textract_client
 
@@ -46,12 +58,18 @@ def extract_text(image_bytes: bytes) -> str:
     rate-limit, or network failures with typed error messages.
     """
     client = _get_textract_client()
+    started = time.perf_counter()
+    logger.info("[OCR] Textract DetectDocumentText Started bytes=%s", len(image_bytes or b""))
 
     try:
         response = client.detect_document_text(
             Document={"Bytes": image_bytes}
         )
     except Exception as exc:
+        logger.exception(
+            "[OCR] Textract DetectDocumentText Failed duration_ms=%.1f",
+            (time.perf_counter() - started) * 1000,
+        )
         _handle_textract_error(exc)
         # _handle_textract_error always raises, but keep linter happy
         raise
@@ -63,10 +81,16 @@ def extract_text(image_bytes: bytes) -> str:
         if block.get("BlockType") == "LINE"
     ]
     raw_text = "\n".join(lines)
-    logger.info("Textract extracted %d lines, %d chars.", len(lines), len(raw_text))
+    logger.info(
+        "[OCR] Textract DetectDocumentText Completed duration_ms=%.1f lines=%d chars=%d",
+        (time.perf_counter() - started) * 1000,
+        len(lines),
+        len(raw_text),
+    )
 
     # Optional enrichment: key-value pairs from FORMS analysis
     try:
+        forms_started = time.perf_counter()
         analyze_response = client.analyze_document(
             Document={"Bytes": image_bytes},
             FeatureTypes=["FORMS"],
@@ -78,7 +102,11 @@ def extract_text(image_bytes: bytes) -> str:
                 if text:
                     kv_lines.append(text)
         if kv_lines:
-            logger.info("Textract FORMS enrichment: %d key-value blocks.", len(kv_lines))
+            logger.info(
+                "[OCR] Textract FORMS enrichment duration_ms=%.1f kv=%d",
+                (time.perf_counter() - forms_started) * 1000,
+                len(kv_lines),
+            )
     except Exception as exc:
         logger.warning("Textract FORMS enrichment failed (non-fatal): %s", exc)
 
@@ -108,6 +136,6 @@ def _handle_textract_error(exc: Exception) -> None:
         logger.error("Textract invalid input: %s", exc)
         raise RuntimeError(f"AWS Textract invalid input: {exc}") from exc
 
-    # Network / unknown
+    # Network / unknown (includes ReadTimeoutError / ConnectTimeoutError)
     logger.error("Textract unexpected error: %s", exc)
     raise RuntimeError(f"Unexpected Textract error: {exc}") from exc

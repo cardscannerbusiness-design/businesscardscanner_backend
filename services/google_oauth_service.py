@@ -75,8 +75,31 @@ def _find_downloaded_client_secret() -> Path | None:
     secrets_dir = _BACKEND_ROOT / "secrets"
     if not secrets_dir.is_dir():
         return None
+    # Prefer Google Cloud Console downloads (client_secret_*.json), then exact name.
     matches = sorted(secrets_dir.glob("client_secret_*.json"))
-    return matches[0] if matches else None
+    if matches:
+        return matches[0]
+    exact = secrets_dir / "client_secret.json"
+    try:
+        if exact.is_file():
+            return exact
+    except OSError:
+        return None
+    return None
+
+
+def warn_if_oauth_not_configured() -> None:
+    """Log a one-time warning when Google OAuth credentials are missing (never crash)."""
+    try:
+        if not is_oauth_configured():
+            logger.warning(
+                "Google OAuth is not configured. Set GOOGLE_OAUTH_CLIENT_ID / "
+                "GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REDIRECT_URI, or place "
+                "secrets/client_secret.json (or secrets/client_secret_*.json). "
+                "Google Drive connect will stay disabled until configured."
+            )
+    except Exception as exc:
+        logger.warning("Google OAuth config check failed: %s", exc)
 
 
 def _load_oauth_client() -> dict[str, str]:
@@ -158,14 +181,14 @@ def _state_secret() -> str:
     return (os.getenv("JWT_SECRET_KEY") or "oauth-state").strip()
 
 
-def build_authorize_url(*, user_id: str, role: str) -> str:
+def build_authorize_url(*, user_id: str, role: str) -> str | None:
+    """Build Google authorize URL, or return None when OAuth is not configured."""
     if not is_oauth_configured():
-        raise GoogleOAuthError(
-            "OAUTH_NOT_CONFIGURED",
-            "Google OAuth is not configured. Place secrets/client_secret_*.json "
-            "or set GOOGLE_OAUTH_CLIENT_ID / SECRET / REDIRECT_URI.",
-            503,
+        logger.warning(
+            "Google OAuth start requested but OAuth is not configured "
+            "(env vars or secrets/client_secret*.json missing)."
         )
+        return None
     state = jwt.encode(
         {
             "uid": user_id,
