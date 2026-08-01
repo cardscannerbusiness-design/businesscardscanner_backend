@@ -100,6 +100,9 @@ class TestAssertCanUploadLocked(unittest.TestCase):
         body = ctx.exception.to_response()
         self.assertFalse(body["success"])
         self.assertEqual(body["error"], "STORAGE_LIMIT_EXCEEDED")
+        self.assertEqual(body["used_storage_bytes"], 20971520)
+        self.assertEqual(body["storage_limit_bytes"], 20971520)
+        self.assertEqual(body["image_size_bytes"], 1)
 
     def test_no_company_skips_check(self) -> None:
         cur = MagicMock()
@@ -155,6 +158,39 @@ class TestGetStorageUsageShape(unittest.TestCase):
         self.assertIn("limit_mb", usage)
         self.assertIn("remaining_mb", usage)
         self.assertAlmostEqual(usage["used_percentage"], 40.3, places=1)
+        self.assertTrue(usage["can_upload"])
+        self.assertEqual(usage["warning_level"], "NORMAL")
+
+    @patch("db.pool.db_cursor")
+    def test_usage_warning_critical_blocked(self, db_cursor: MagicMock) -> None:
+        cur = MagicMock()
+        db_cursor.return_value.__enter__.return_value = cur
+
+        cur.fetchone.return_value = {
+            "id": "c1",
+            "plan_name": "FREEMIUM",
+            "storage_limit_bytes": 1000,
+            "used_storage_bytes": 800,
+        }
+        self.assertEqual(svc.get_storage_usage("c1")["warning_level"], "WARNING")
+
+        cur.fetchone.return_value = {
+            "id": "c1",
+            "plan_name": "FREEMIUM",
+            "storage_limit_bytes": 1000,
+            "used_storage_bytes": 950,
+        }
+        self.assertEqual(svc.get_storage_usage("c1")["warning_level"], "CRITICAL")
+
+        cur.fetchone.return_value = {
+            "id": "c1",
+            "plan_name": "FREEMIUM",
+            "storage_limit_bytes": 1000,
+            "used_storage_bytes": 1000,
+        }
+        blocked = svc.get_storage_usage("c1")
+        self.assertEqual(blocked["warning_level"], "BLOCKED")
+        self.assertFalse(blocked["can_upload"])
 
 
 class TestSoftDeleteReleasesStorage(unittest.TestCase):

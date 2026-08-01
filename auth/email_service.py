@@ -40,12 +40,12 @@ def _smtp_config() -> dict[str, str]:
     password = _normalize_smtp_password(os.getenv("SMTP_PASSWORD")) or _normalize_smtp_password(
         os.getenv("GMAIL_APP_PASSWORD")
     )
-    # From must match the authenticated mailbox for Gmail/most providers.
-    from_addr = (
-        _normalize_env(os.getenv("SMTP_FROM"))
-        or _normalize_env(os.getenv("BUSINESS_EMAIL"))
-        or user
-        or "noreply@cardsync.ai"
+    # From MUST match the authenticated mailbox (Gmail blocks spoofed BUSINESS_EMAIL From).
+    from_addr = user or _normalize_env(os.getenv("SMTP_FROM")) or "noreply@cardsync.ai"
+    reply_to = (
+        _normalize_env(os.getenv("BUSINESS_EMAIL"))
+        or _normalize_env(os.getenv("SMTP_FROM"))
+        or from_addr
     )
     return {
         "host": _normalize_env(os.getenv("SMTP_HOST"))
@@ -57,6 +57,7 @@ def _smtp_config() -> dict[str, str]:
         "user": user,
         "password": password,
         "from": from_addr,
+        "reply_to": reply_to,
     }
 
 
@@ -70,6 +71,8 @@ def _send_email(to: str, subject: str, html_body: str) -> dict:
     msg["Subject"] = subject
     msg["From"] = cfg["from"]
     msg["To"] = to
+    if cfg.get("reply_to") and cfg["reply_to"].lower() != cfg["from"].lower():
+        msg["Reply-To"] = cfg["reply_to"]
     msg.set_content(html_body, subtype="html")
 
     try:
@@ -78,7 +81,7 @@ def _send_email(to: str, subject: str, html_body: str) -> dict:
             server.starttls()
             server.ehlo()
             server.login(cfg["user"], cfg["password"])
-            server.send_message(msg)
+            server.send_message(msg, from_addr=cfg["from"], to_addrs=[to])
         logger.info("Auth email sent to %s (%s)", to, subject)
         return {"sent": True}
     except smtplib.SMTPAuthenticationError as exc:
