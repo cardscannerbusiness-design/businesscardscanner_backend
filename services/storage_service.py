@@ -13,13 +13,17 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Default Freemium plan: 20 MB
+# Seed / migration defaults only. Runtime quota math always uses the company's
+# stored storage_limit_bytes / used_storage_bytes columns.
 DEFAULT_PLAN_NAME = "FREEMIUM"
-DEFAULT_STORAGE_LIMIT_BYTES = 20 * 1024 * 1024  # 20_971_520
+DEFAULT_STORAGE_LIMIT_BYTES = 20 * 1024 * 1024  # 20 MiB
 
 # Prevent SELECT … FOR UPDATE from waiting forever under contention.
 _LOCK_TIMEOUT_MS = 5_000
 _STATEMENT_TIMEOUT_MS = 15_000
+
+_WARNING_THRESHOLD_PCT = 75.0
+_CRITICAL_THRESHOLD_PCT = 90.0
 
 _COMPANY_LOCK_COLUMNS = ("id", "plan_name", "storage_limit_bytes", "used_storage_bytes")
 
@@ -42,7 +46,6 @@ def _row_as_dict(row: Any) -> dict[str, Any]:
         raise LookupError("Company row is empty")
     if isinstance(row, dict):
         return dict(row)
-    # Plain cursor returns a tuple in SELECT column order.
     if isinstance(row, (tuple, list)) and len(row) >= len(_COMPANY_LOCK_COLUMNS):
         return dict(zip(_COMPANY_LOCK_COLUMNS, row[: len(_COMPANY_LOCK_COLUMNS)]))
     raise TypeError(f"Unsupported company row type: {type(row)!r}")
@@ -56,16 +59,32 @@ class StorageLimitExceededError(Exception):
     def __init__(
         self,
         message: str = "Storage limit reached. Upgrade your plan to continue.",
+        *,
+        company_id: str | None = None,
+        used_storage_bytes: int | None = None,
+        storage_limit_bytes: int | None = None,
+        image_size_bytes: int | None = None,
     ):
         self.message = message
+        self.company_id = company_id
+        self.used_storage_bytes = used_storage_bytes
+        self.storage_limit_bytes = storage_limit_bytes
+        self.image_size_bytes = image_size_bytes
         super().__init__(message)
 
     def to_response(self) -> dict[str, Any]:
-        return {
+        body: dict[str, Any] = {
             "success": False,
             "error": self.code,
             "message": self.message,
         }
+        if self.used_storage_bytes is not None:
+            body["used_storage_bytes"] = self.used_storage_bytes
+        if self.storage_limit_bytes is not None:
+            body["storage_limit_bytes"] = self.storage_limit_bytes
+        if self.image_size_bytes is not None:
+            body["image_size_bytes"] = self.image_size_bytes
+        return body
 
 
 def calculate_image_size_bytes(card_image_base64: str | None) -> int:
@@ -81,7 +100,7 @@ def calculate_image_size_bytes(card_image_base64: str | None) -> int:
     try:
         return len(base64.b64decode(raw, validate=False))
     except Exception:
-        # Approximate if decode fails (corrupt padding, etc.)
+        logger.warning("[STORAGE] base64 decode failed; using size estimate", exc_info=True)
         return max(0, (len(raw) * 3) // 4)
 
 
@@ -89,31 +108,45 @@ def _bytes_to_mb(value: int | float) -> float:
     return round(float(value) / (1024 * 1024), 2)
 
 
-def _normalize_row(row: dict[str, Any] | None, company_id: str) -> dict[str, Any]:
-    if not row:
-        return {
-            "company_id": company_id,
-            "plan": DEFAULT_PLAN_NAME,
-            "plan_name": DEFAULT_PLAN_NAME,
-            "storage_limit_bytes": DEFAULT_STORAGE_LIMIT_BYTES,
-            "used_storage_bytes": 0,
-            "remaining_storage_bytes": DEFAULT_STORAGE_LIMIT_BYTES,
-            "used_percentage": 0.0,
-            "used_mb": 0.0,
-            "limit_mb": _bytes_to_mb(DEFAULT_STORAGE_LIMIT_BYTES),
-            "remaining_mb": _bytes_to_mb(DEFAULT_STORAGE_LIMIT_BYTES),
-        }
+def _warning_level(used_bytes: int, limit_bytes: int, used_pct: float) -> str:
+    if limit_bytes <= 0 or used_bytes >= limit_bytes:
+        return "BLOCKED"
+    if used_pct >= _CRITICAL_THRESHOLD_PCT:
+        return "CRITICAL"
+    if used_pct >= _WARNING_THRESHOLD_PCT:
+        return "WARNING"
+    return "NORMAL"
 
-    plan = str(row.get("plan_name") or DEFAULT_PLAN_NAME).strip() or DEFAULT_PLAN_NAME
-    limit_bytes = int(row.get("storage_limit_bytes") or DEFAULT_STORAGE_LIMIT_BYTES)
-    if limit_bytes < 0:
+
+def _fits_within_quota(used_bytes: int, limit_bytes: int, image_size_bytes: int) -> bool:
+    """True when used + size fits within the company's storage_limit_bytes."""
+    size = max(0, int(image_size_bytes or 0))
+    if size == 0:
+        return True
+    return (max(0, used_bytes) + size) <= max(0, limit_bytes)
+
+
+def _normalize_row(row: dict[str, Any] | None, company_id: str) -> dict[str, Any]:
+    """Build the canonical storage usage payload from a companies row."""
+    if not row:
         limit_bytes = DEFAULT_STORAGE_LIMIT_BYTES
-    used_bytes = max(0, int(row.get("used_storage_bytes") or 0))
+        used_bytes = 0
+        plan = DEFAULT_PLAN_NAME
+        resolved_id = company_id
+    else:
+        plan = str(row.get("plan_name") or DEFAULT_PLAN_NAME).strip() or DEFAULT_PLAN_NAME
+        limit_bytes = int(row.get("storage_limit_bytes") or DEFAULT_STORAGE_LIMIT_BYTES)
+        if limit_bytes < 0:
+            limit_bytes = DEFAULT_STORAGE_LIMIT_BYTES
+        used_bytes = max(0, int(row.get("used_storage_bytes") or 0))
+        resolved_id = str(row.get("id") or company_id)
+
     remaining = max(0, limit_bytes - used_bytes)
     used_pct = round((used_bytes / limit_bytes) * 100, 1) if limit_bytes > 0 else 0.0
+    can_upload_more = remaining > 0 and used_bytes < limit_bytes
 
     return {
-        "company_id": str(row.get("id") or company_id),
+        "company_id": resolved_id,
         "plan": plan,
         "plan_name": plan,
         "storage_limit_bytes": limit_bytes,
@@ -123,6 +156,8 @@ def _normalize_row(row: dict[str, Any] | None, company_id: str) -> dict[str, Any
         "used_mb": _bytes_to_mb(used_bytes),
         "limit_mb": _bytes_to_mb(limit_bytes),
         "remaining_mb": _bytes_to_mb(remaining),
+        "can_upload": can_upload_more,
+        "warning_level": _warning_level(used_bytes, limit_bytes, used_pct),
     }
 
 
@@ -131,17 +166,22 @@ def get_company_storage(company_id: str) -> dict[str, Any]:
     from db.pool import db_cursor
 
     started = _log_step("STORAGE", "Fetch Company", company_id=company_id)
-    with db_cursor(commit=False) as cur:
-        cur.execute(
-            """
-            SELECT id, plan_name, storage_limit_bytes, used_storage_bytes
-            FROM companies
-            WHERE id = %s
-            """,
-            (company_id,),
-        )
-        row = cur.fetchone()
-    info = _normalize_row(_row_as_dict(row) if row else None, company_id)
+    try:
+        with db_cursor(commit=False) as cur:
+            cur.execute(
+                """
+                SELECT id, plan_name, storage_limit_bytes, used_storage_bytes
+                FROM companies
+                WHERE id = %s
+                """,
+                (company_id,),
+            )
+            row = cur.fetchone()
+        info = _normalize_row(_row_as_dict(row) if row else None, company_id)
+    except Exception:
+        logger.exception("[STORAGE] Fetch Company failed company_id=%s", company_id)
+        raise
+
     _log_step(
         "STORAGE",
         "Fetch Company Completed",
@@ -149,13 +189,27 @@ def get_company_storage(company_id: str) -> dict[str, Any]:
         company_id=company_id,
         used=info["used_storage_bytes"],
         limit=info["storage_limit_bytes"],
+        warning_level=info["warning_level"],
     )
     return info
 
 
 def get_storage_usage(company_id: str) -> dict[str, Any]:
     """Public usage snapshot for GET /api/storage/usage."""
-    return get_company_storage(company_id)
+    started = _log_step("STORAGE", "Storage Usage Request", company_id=company_id)
+    info = get_company_storage(company_id)
+    _log_step(
+        "STORAGE",
+        "Storage Usage Response",
+        started_at=started,
+        company_id=company_id,
+        used=info["used_storage_bytes"],
+        limit=info["storage_limit_bytes"],
+        remaining=info["remaining_storage_bytes"],
+        warning_level=info["warning_level"],
+        can_upload=info["can_upload"],
+    )
+    return info
 
 
 def can_upload(company_id: str, image_size_bytes: int) -> bool:
@@ -164,7 +218,11 @@ def can_upload(company_id: str, image_size_bytes: int) -> bool:
     if size == 0:
         return True
     info = get_company_storage(company_id)
-    return (info["used_storage_bytes"] + size) <= info["storage_limit_bytes"]
+    return _fits_within_quota(
+        info["used_storage_bytes"],
+        info["storage_limit_bytes"],
+        size,
+    )
 
 
 def _apply_txn_timeouts(cur: Any) -> None:
@@ -189,7 +247,6 @@ def _lock_company(cur: Any, company_id: str) -> dict[str, Any]:
         )
         row = cur.fetchone()
     except Exception as exc:
-        # psycopg2: QueryCanceled / lock_not_available when lock_timeout fires
         err = str(exc).lower()
         _log_step(
             "STORAGE",
@@ -216,34 +273,52 @@ def _lock_company(cur: Any, company_id: str) -> dict[str, Any]:
     return result
 
 
-def assert_can_upload(company_id: str | None, image_size_bytes: int) -> None:
-    """Raise StorageLimitExceededError when the upload would exceed the plan.
-
-    When company_id is missing (e.g. Super Admin with no company), the check is skipped.
-    """
-    size = max(0, int(image_size_bytes or 0))
-    if not company_id or size == 0:
-        return
-
-    info = get_company_storage(company_id)
-    if (info["used_storage_bytes"] + size) <= info["storage_limit_bytes"]:
-        logger.info(
-            "Storage upload accepted company=%s size=%s used=%s limit=%s",
-            company_id,
-            size,
-            info["used_storage_bytes"],
-            info["storage_limit_bytes"],
-        )
-        return
-
+def _raise_quota_exceeded(company_id: str, info: dict[str, Any], size: int) -> None:
     logger.warning(
-        "Storage upload rejected company=%s size=%s used=%s limit=%s",
+        "[STORAGE] Quota exceeded company_id=%s size=%s used=%s limit=%s",
         company_id,
         size,
         info["used_storage_bytes"],
         info["storage_limit_bytes"],
     )
-    raise StorageLimitExceededError()
+    raise StorageLimitExceededError(
+        company_id=company_id,
+        used_storage_bytes=info["used_storage_bytes"],
+        storage_limit_bytes=info["storage_limit_bytes"],
+        image_size_bytes=size,
+    )
+
+
+def assert_can_upload(company_id: str | None, image_size_bytes: int) -> None:
+    """Raise StorageLimitExceededError when the upload would exceed the plan.
+
+    When company_id is missing (e.g. Super Admin with no company), the check is skipped.
+    Non-locking advisory check — prefer assert_can_upload_locked inside write txns.
+    """
+    size = max(0, int(image_size_bytes or 0))
+    if not company_id or size == 0:
+        return
+
+    started = _log_step(
+        "STORAGE",
+        "Storage Validation Started",
+        company_id=company_id,
+        size=size,
+        locked=False,
+    )
+    info = get_company_storage(company_id)
+    if _fits_within_quota(info["used_storage_bytes"], info["storage_limit_bytes"], size):
+        _log_step(
+            "STORAGE",
+            "Storage Validation Passed",
+            started_at=started,
+            company_id=company_id,
+            size=size,
+            used=info["used_storage_bytes"],
+            limit=info["storage_limit_bytes"],
+        )
+        return
+    _raise_quota_exceeded(company_id, info, size)
 
 
 def assert_can_upload_locked(cur: Any, company_id: str | None, image_size_bytes: int) -> None:
@@ -257,10 +332,11 @@ def assert_can_upload_locked(cur: Any, company_id: str | None, image_size_bytes:
         "Storage Validation Started",
         company_id=company_id,
         size=size,
+        locked=True,
     )
     row = _lock_company(cur, company_id)
     info = _normalize_row(row, company_id)
-    if (info["used_storage_bytes"] + size) <= info["storage_limit_bytes"]:
+    if _fits_within_quota(info["used_storage_bytes"], info["storage_limit_bytes"], size):
         _log_step(
             "STORAGE",
             "Storage Validation Passed",
@@ -271,7 +347,6 @@ def assert_can_upload_locked(cur: Any, company_id: str | None, image_size_bytes:
             limit=info["storage_limit_bytes"],
         )
         return
-
     _log_step(
         "STORAGE",
         "Storage Validation Rejected",
@@ -281,7 +356,7 @@ def assert_can_upload_locked(cur: Any, company_id: str | None, image_size_bytes:
         used=info["used_storage_bytes"],
         limit=info["storage_limit_bytes"],
     )
-    raise StorageLimitExceededError()
+    _raise_quota_exceeded(company_id, info, size)
 
 
 def update_storage_after_upload(
@@ -307,19 +382,27 @@ def update_storage_after_upload(
         )
         _log_step(
             "STORAGE",
-            "Updating Used Storage",
+            "Storage Update",
             company_id=company_id,
             delta=size,
+            action="upload",
         )
 
-    if cur is not None:
-        _run(cur)
-        return
+    try:
+        if cur is not None:
+            _run(cur)
+            return
+        from db.pool import db_cursor
 
-    from db.pool import db_cursor
-
-    with db_cursor(commit=True) as active_cur:
-        _run(active_cur)
+        with db_cursor(commit=True) as active_cur:
+            _run(active_cur)
+    except Exception:
+        logger.exception(
+            "[STORAGE] Storage update failed company_id=%s delta=%s",
+            company_id,
+            size,
+        )
+        raise
 
 
 def release_storage_after_delete(
@@ -343,20 +426,29 @@ def release_storage_after_delete(
             """,
             (size, company_id),
         )
-        logger.info(
-            "Storage released (delete) company=%s delta=%s",
+        _log_step(
+            "STORAGE",
+            "Storage Release",
+            company_id=company_id,
+            delta=size,
+            action="delete",
+        )
+
+    try:
+        if cur is not None:
+            _run(cur)
+            return
+        from db.pool import db_cursor
+
+        with db_cursor(commit=True) as active_cur:
+            _run(active_cur)
+    except Exception:
+        logger.exception(
+            "[STORAGE] Storage release failed company_id=%s delta=%s",
             company_id,
             size,
         )
-
-    if cur is not None:
-        _run(cur)
-        return
-
-    from db.pool import db_cursor
-
-    with db_cursor(commit=True) as active_cur:
-        _run(active_cur)
+        raise
 
 
 def resolve_company_id_for_user(user: dict[str, Any] | None) -> str | None:
