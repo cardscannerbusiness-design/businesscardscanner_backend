@@ -12,10 +12,10 @@ from config.urls import get_frontend_base_url
 logger = logging.getLogger(__name__)
 
 _SMTP_AUTH_HELP = (
-    "SMTP authentication failed. If using Gmail, create a Google App Password "
-    "(not your login password): enable 2-Step Verification, then visit "
-    "https://myaccount.google.com/apppasswords and set GMAIL_APP_PASSWORD "
-    "to the 16-character password for GMAIL_USER."
+    "SMTP authentication failed. For Amazon SES: open SES console → SMTP settings → "
+    "Create SMTP credentials, then set SMTP_USER and SMTP_PASSWORD. "
+    "From address (SMTP_FROM / BUSINESS_EMAIL) must be on a verified SES identity. "
+    "For Gmail fallback, use a Google App Password."
 )
 
 _SMTP_NETWORK_HINT = (
@@ -67,9 +67,12 @@ def _send_email(to: str, subject: str, html_body: str) -> dict:
         logger.warning("SMTP not configured — skipping email to %s", to)
         return {"sent": False, "reason": "SMTP not configured"}
 
+    company = _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan"
+    from_header = f"{company} <{cfg['from']}>" if cfg["from"] else company
+
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = cfg["from"]
+    msg["From"] = from_header
     msg["To"] = to
     if cfg.get("reply_to") and cfg["reply_to"].lower() != cfg["from"].lower():
         msg["Reply-To"] = cfg["reply_to"]

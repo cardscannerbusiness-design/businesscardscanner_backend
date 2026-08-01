@@ -103,10 +103,10 @@ _RENDER_SMTP_HINT = (
 )
 
 _SMTP_AUTH_HELP = (
-    "SMTP authentication failed. If using Gmail, create a Google App Password "
-    "(not your login password): enable 2-Step Verification, then visit "
-    "https://myaccount.google.com/apppasswords and set GMAIL_APP_PASSWORD "
-    "to the 16-character password for GMAIL_USER."
+    "SMTP authentication failed. For Amazon SES: open SES console → SMTP settings → "
+    "Create SMTP credentials, then set SMTP_USER and SMTP_PASSWORD. "
+    "From address (BUSINESS_EMAIL / SMTP_FROM) must be on a verified SES identity "
+    "(e.g. noreply@namecardscan.com). For Gmail fallback, use a Google App Password."
 )
 
 
