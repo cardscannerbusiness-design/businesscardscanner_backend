@@ -100,11 +100,18 @@ def email_response(
     test_override = is_test_recipient_mode()
     sent = bool(result.get("sent"))
     attempted = bool(result.get("attempted"))
+    error = result.get("error")
+    skipped = bool(result.get("skipped")) or (
+        isinstance(error, str)
+        and "skip" in error.lower()
+        and not sent
+    )
     return {
-        "email_attempted": attempted,
+        "email_attempted": attempted or skipped,
         "email_queued": sent,
         "email_sent": sent,
-        "email_error": result.get("error"),
+        "email_skipped": skipped and not sent,
+        "email_error": error,
         "email_to": delivered_to,
         "email_cc": result.get("cc_emails") or [],
         "email_cc_invalid": result.get("cc_invalid") or [],
@@ -139,13 +146,26 @@ async def schedule_outreach_for_contact(
     whatsapp_result: dict[str, Any] = {
         "attempted": False,
         "sent": False,
-        "error": "Skipped by request." if skip_whatsapp else None,
+        "skipped": bool(skip_whatsapp),
+        "error": "Skipped by request (skipWhatsApp=true)." if skip_whatsapp else None,
     }
     email_result: dict[str, Any] = {
         "attempted": False,
         "sent": False,
-        "error": "Skipped by request." if skip_email else None,
+        "skipped": bool(skip_email),
+        "error": (
+            "Skipped by request (skipEmail=true). "
+            "Enable Email notifications in Settings, then save again."
+            if skip_email
+            else None
+        ),
     }
+
+    if skip_email:
+        logger.info(
+            "Email outreach skipped for %s (skipEmail=true / settings).",
+            log_context,
+        )
 
     tasks: list[tuple[str, Any]] = []
     if not skip_whatsapp:
