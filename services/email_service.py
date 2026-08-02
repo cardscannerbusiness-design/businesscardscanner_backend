@@ -4,18 +4,14 @@ import logging
 import os
 import smtplib
 import time
+import uuid
 from email.message import EmailMessage
+from email.utils import formataddr, formatdate, make_msgid
 from typing import Any
 
 from utils.parser_utils import is_valid_email
 
 from services.email_cc_validation import validate_cc_address_list
-from services.email_mime import (
-    apply_standard_headers,
-    domain_of_email,
-    email_only,
-    resolve_envelope_mail_from,
-)
 from services.email_template_service import (
     cc_scanned_contact_email_context,
     render_cc_scanned_contact_email_html,
@@ -31,8 +27,19 @@ _SEND_DEDUPE_SECONDS = 120
 DEFAULT_SMTP_HOST = "smtp.gmail.com"
 DEFAULT_SMTP_PORT = 587
 
-SUBJECT = "Thank You for Your Interest"
+# Neutral subject — marketing/salesy subjects raise Gmail/Yahoo spam scores.
+SUBJECT = "Nice meeting you — Name Card Scan"
 CC_SCANNED_SUBJECT_PREFIX = "Scanned contact:"
+
+_SPAM_BLOCK_HINT = (
+    "The mail provider blocked this message (spam / policy filter). "
+    "Common fixes: (1) From must match the authenticated SMTP mailbox, "
+    "(2) keep content conversational (avoid “Reply YES” / hard sells), "
+    "(3) configure SPF/DKIM/DMARC for your sending domain, "
+    "(4) avoid sending bursts to many new recipients. "
+    "If you send via Gmail SMTP, use GMAIL_USER as From and set BUSINESS_EMAIL "
+    "only as Reply-To."
+)
 
 # Brand palette aligned with NameCardScan UI (Inter / cyan-teal)
 _BRAND_PRIMARY = "#0891b2"
@@ -96,10 +103,10 @@ _RENDER_SMTP_HINT = (
 )
 
 _SMTP_AUTH_HELP = (
-    "SMTP authentication failed. If using Gmail, create a Google App Password "
-    "(not your login password): enable 2-Step Verification, then visit "
-    "https://myaccount.google.com/apppasswords and set GMAIL_APP_PASSWORD "
-    "to the 16-character password for GMAIL_USER."
+    "SMTP authentication failed. For Amazon SES: open SES console → SMTP settings → "
+    "Create SMTP credentials, then set SMTP_USER and SMTP_PASSWORD. "
+    "From address (BUSINESS_EMAIL / SMTP_FROM) must be on a verified SES identity "
+    "(e.g. noreply@namecardscan.com). For Gmail fallback, use a Google App Password."
 )
 
 
@@ -122,33 +129,13 @@ def is_gmail_configured() -> bool:
 
 
 def smtp_sender_email() -> str:
-    """
-    From address aligned with the authenticated SMTP mailbox when domains differ.
+    """Authenticated mailbox for the From header — must match SMTP login (Gmail requirement)."""
+    return SMTP_USER or BUSINESS_EMAIL
 
-    Prefer SMTP_FROM / BUSINESS_EMAIL only when that domain matches SMTP_USER;
-    otherwise send From the auth mailbox and keep Reply-To on the business address.
-    """
-    preferred = email_only(
-        _normalize_env(os.getenv("SMTP_FROM")) or BUSINESS_EMAIL or SMTP_USER
-    )
-    auth = email_only(SMTP_USER)
-    preferred_domain = domain_of_email(preferred)
-    auth_domain = domain_of_email(auth)
 
-    if preferred and auth_domain and preferred_domain == auth_domain:
-        return preferred
-    if auth:
-        if preferred and preferred_domain and preferred_domain != auth_domain:
-            logger.info(
-                "From domain %s differs from SMTP auth domain %s; "
-                "sending From=%s with Reply-To=%s to reduce spam filtering.",
-                preferred_domain,
-                auth_domain,
-                auth,
-                preferred,
-            )
-        return auth
-    return preferred or SMTP_USER
+def smtp_reply_to_email() -> str:
+    """Public reply address; may differ from the authenticated From mailbox."""
+    return BUSINESS_EMAIL or SMTP_USER
 
 
 def receive_inbox_email() -> str | None:
@@ -185,16 +172,63 @@ def get_email_provider() -> str | None:
 
 
 def _format_from_address(email: str, name: str | None = None) -> str:
-    display = name or BUSINESS_COMPANY_NAME
-    addr = email_only(email)
-    if display and addr:
-        return f"{display} <{addr}>"
-    return addr or email
+    display = (name or BUSINESS_COMPANY_NAME or "").strip()
+    if display and email:
+        return formataddr((display, email))
+    return email
 
 
-def _reply_to_address(sender: str) -> str:
-    """Always prefer the business inbox for replies when configured."""
-    return email_only(BUSINESS_EMAIL) or email_only(sender) or sender
+def _message_id_domain(smtp_user: str, from_address: str) -> str:
+    for candidate in (smtp_user, from_address):
+        if "@" in candidate:
+            return candidate.rsplit("@", 1)[-1].strip(">") or "localhost"
+    return "localhost"
+
+
+def _looks_like_spam_block(exc: BaseException | str) -> bool:
+    text = str(exc).lower()
+    markers = (
+        "spam",
+        "blocked",
+        "message blocked",
+        "5.7.1",
+        "policy",
+        "reputation",
+        "suspect",
+        "rejected due to",
+        "content-filter",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _apply_deliverability_headers(
+    message: EmailMessage,
+    *,
+    smtp_user: str,
+    from_address: str,
+    reply_to: str,
+) -> None:
+    """Headers that improve inbox placement and reduce provider blocks."""
+    if "Date" not in message:
+        message["Date"] = formatdate(localtime=True)
+    if "Message-ID" not in message:
+        message["Message-ID"] = make_msgid(
+            idstring=uuid.uuid4().hex[:12],
+            domain=_message_id_domain(smtp_user, from_address),
+        )
+    if "MIME-Version" not in message:
+        message["MIME-Version"] = "1.0"
+    # Prefer authenticated mailbox for envelope/From; Reply-To carries business address.
+    if reply_to and reply_to.lower() != (smtp_user or "").lower():
+        message["Reply-To"] = reply_to
+    elif reply_to:
+        message["Reply-To"] = reply_to
+    unsub = reply_to or smtp_user
+    if unsub:
+        message["List-Unsubscribe"] = f"<mailto:{unsub}?subject=unsubscribe>"
+        message["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+    message["X-Auto-Response-Suppress"] = "OOF, AutoReply"
+    message["X-Mailer"] = "NameCardScan"
 
 
 def _redact_email(email: str | None) -> str:
@@ -242,7 +276,6 @@ def _send_via_smtp_relay(
     reply_to: str,
     provider_label: str,
     cc_addresses: list[str] | None = None,
-    mail_from: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "success": False,
@@ -256,20 +289,24 @@ def _send_via_smtp_relay(
     if cc_invalid:
         result["cc_invalid"] = cc_invalid
 
+    # From MUST be the authenticated mailbox. Spoofing BUSINESS_EMAIL via Gmail SMTP
+    # is a common cause of "Message blocked" (spam / policy) for Yahoo/Outlook recipients.
+    authenticated_from = smtp_user or from_address
     message = EmailMessage()
-    apply_standard_headers(
+    message["Subject"] = subject
+    message["From"] = _format_from_address(authenticated_from)
+    message["To"] = to_address
+    if cc_list:
+        message["Cc"] = ", ".join(cc_list)
+    _apply_deliverability_headers(
         message,
-        from_address=from_address,
-        to_address=to_address,
-        subject=subject,
-        reply_to=reply_to,
-        cc_addresses=cc_list or None,
-        message_id_domain=domain_of_email(from_address),
+        smtp_user=smtp_user,
+        from_address=authenticated_from,
+        reply_to=reply_to or authenticated_from,
     )
     _attach_multipart_body(message, plain_body, html_body)
 
     recipients = [to_address, *cc_list]
-    envelope_from = email_only(mail_from) or email_only(from_address)
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as smtp:
@@ -277,17 +314,39 @@ def _send_via_smtp_relay(
             smtp.starttls()
             smtp.ehlo()
             smtp.login(smtp_user, smtp_password)
-            smtp.send_message(message, from_addr=envelope_from, to_addrs=recipients)
+            # Envelope MAIL FROM must match the authenticated account for Gmail.
+            smtp.send_message(
+                message,
+                from_addr=authenticated_from,
+                to_addrs=recipients,
+            )
     except smtplib.SMTPAuthenticationError as exc:
         result["error"] = f"{provider_label} authentication failed: {exc}"
         logger.error("SMTP auth failed for %s: %s", to_address, exc, exc_info=True)
         return result
     except smtplib.SMTPRecipientsRefused as exc:
-        result["error"] = f"{provider_label} rejected recipient {to_address}: {exc.recipients}"
+        detail = exc.recipients
+        if _looks_like_spam_block(exc) or _looks_like_spam_block(str(detail)):
+            result["error"] = f"{provider_label} blocked delivery to {to_address}. {_SPAM_BLOCK_HINT}"
+            result["error_code"] = "EMAIL_BLOCKED_SPAM"
+        else:
+            result["error"] = f"{provider_label} rejected recipient {to_address}: {detail}"
         logger.error("SMTP recipient refused: %s", result["error"], exc_info=True)
         return result
+    except smtplib.SMTPDataError as exc:
+        if _looks_like_spam_block(exc):
+            result["error"] = f"{provider_label} blocked this message. {_SPAM_BLOCK_HINT} Details: {exc}"
+            result["error_code"] = "EMAIL_BLOCKED_SPAM"
+        else:
+            result["error"] = f"SMTP data error while sending to {to_address}: {exc}"
+        logger.error("SMTP data error: %s", result["error"], exc_info=True)
+        return result
     except smtplib.SMTPException as exc:
-        result["error"] = f"SMTP error while sending to {to_address}: {exc}"
+        if _looks_like_spam_block(exc):
+            result["error"] = f"{provider_label} blocked this message. {_SPAM_BLOCK_HINT} Details: {exc}"
+            result["error_code"] = "EMAIL_BLOCKED_SPAM"
+        else:
+            result["error"] = f"SMTP error while sending to {to_address}: {exc}"
         logger.error("SMTP error: %s", result["error"], exc_info=True)
         return result
     except OSError as exc:
@@ -319,8 +378,8 @@ def _send_via_smtp(
             "recipient_email": to_address,
             "error": "SMTP is not configured. Set GMAIL_USER + GMAIL_APP_PASSWORD (or SMTP_USER + SMTP_PASSWORD) in .env.",
         }
-    # Align From with SMTP auth mailbox when domains differ; keep Reply-To on business email.
-    sender = smtp_sender_email()
+    # Authenticated mailbox only — never put BUSINESS_EMAIL in From when using Gmail SMTP.
+    auth_mailbox = SMTP_USER
     result = _send_via_smtp_relay(
         to_address,
         subject=subject,
@@ -330,9 +389,8 @@ def _send_via_smtp(
         smtp_port=SMTP_PORT,
         smtp_user=SMTP_USER,
         smtp_password=SMTP_PASSWORD,
-        from_address=_format_from_address(sender),
-        reply_to=_reply_to_address(sender),
-        mail_from=resolve_envelope_mail_from(sender),
+        from_address=auth_mailbox,
+        reply_to=smtp_reply_to_email(),
         provider_label="SMTP",
         cc_addresses=cc_addresses,
     )
@@ -423,32 +481,20 @@ def build_thank_you_email_plain(recipient_name: str | None = None) -> str:
     """Build the plain-text fallback for the business thank-you email."""
     greeting = _greeting_name(recipient_name)
     event_name = BUSINESS_EVENT_NAME
+    reply = smtp_reply_to_email() or "dhana@ulavitech.com"
     return (
         f"Hi {greeting},\n\n"
-        f"Dhana here. It was great meeting you at {event_name}.\n\n"
-        "Quick question: After collecting business cards, how many prospects actually "
-        "become customers?\n\n"
-        "Most businesses at exhibitions and events struggle with:\n"
-        "• Delayed follow-ups\n"
-        "• Poor brand recall\n"
-        "• Manual business card data entry\n"
-        "• No clear Return on Exhibition Spend (ROES)\n\n"
-        "That’s why we built Name Card Scan (NCS).\n\n"
-        "With NCS, you can:\n"
-        "• Scan or upload business cards\n"
-        "• Instantly capture contact details\n"
-        "• Automatically send your WhatsApp & Email introduction, digital business "
-        "card, brochures (PDF) and videos\n"
-        "• Store all data in Google Drive\n"
-        "• Push leads directly to Zoho CRM via API\n\n"
-        "NCS helps you engage prospects while your brand is still fresh in their minds.\n\n"
-        "ROES = Prospect → Qualified Lead → Sale → Customer\n\n"
-        "Reply YES and let my team help you get started with NCS to improve your ROES.\n\n"
+        f"It was a pleasure meeting you at {event_name}.\n\n"
+        "I'm Dhana, founder of Name Card Scan (NCS). We help teams turn exhibition "
+        "contacts into timely follow-ups — scan cards, capture details, and share your "
+        "introduction, brochure, and CRM updates without manual re-entry.\n\n"
+        f"Brochure: {_pdf_download_href()}\n\n"
+        f"If you'd like a short walkthrough, just reply to this email ({reply}) "
+        "or call +91 8838747273 / +65 97310793.\n\n"
         "Regards,\n"
         "Dhana\n"
         "Founder, Name Card Scan\n"
-        "dhana@ulavitech.com\n"
-        "+91 8838747273 | +65 97310793\n"
+        f"{reply}\n"
     )
 
 
@@ -491,7 +537,7 @@ def _contact_detail_rows() -> str:
 
 def build_thank_you_email_html(recipient_name: str | None = None) -> str:
     """Build a table-based HTML email body compatible with major email clients."""
-    reply_addr = BUSINESS_EMAIL or GMAIL_USER or ""
+    reply_addr = smtp_reply_to_email() or GMAIL_USER or ""
     context = thank_you_email_context(
         greeting=_greeting_name(recipient_name),
         company=BUSINESS_COMPANY_NAME,

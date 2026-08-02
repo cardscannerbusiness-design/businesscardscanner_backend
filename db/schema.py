@@ -8,6 +8,9 @@ from db.pool import db_cursor
 
 logger = logging.getLogger(__name__)
 
+# Keep DDL defaults aligned with StorageService seed constants (single source).
+from services.storage_service import DEFAULT_PLAN_NAME, DEFAULT_STORAGE_LIMIT_BYTES
+
 # ---------------------------------------------------------------------------
 # Schema DDL
 # ---------------------------------------------------------------------------
@@ -92,6 +95,10 @@ SCHEMA_STATEMENTS: list[str] = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(255) NOT NULL DEFAULT '';",
     # Role-based Google Sheets: one workbook per company (Admin); Super Admin sheet on users
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
+    # Company storage quota (defaults from StorageService constants)
+    f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS plan_name VARCHAR(64) NOT NULL DEFAULT '{DEFAULT_PLAN_NAME}';",
+    f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS storage_limit_bytes BIGINT NOT NULL DEFAULT {int(DEFAULT_STORAGE_LIMIT_BYTES)};",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS used_storage_bytes BIGINT NOT NULL DEFAULT 0;",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
     # Admin / Super Admin Google OAuth (create sheets in their own Drive — free)
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_refresh_token TEXT;",
@@ -331,9 +338,12 @@ SCHEMA_STATEMENTS: list[str] = [
     "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS whatsapp_delivery_status VARCHAR(32);",
     "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS whatsapp_delivery_error TEXT;",
     'ALTER TABLE contacts ADD COLUMN IF NOT EXISTS "cardImageBase64" TEXT;',
+    "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS image_size_bytes BIGINT NOT NULL DEFAULT 0;",
     "CREATE INDEX IF NOT EXISTS idx_contacts_is_deleted ON contacts(is_deleted);",
     "CREATE INDEX IF NOT EXISTS idx_contacts_created_by ON contacts(created_by_user_id);",
     "CREATE INDEX IF NOT EXISTS idx_contacts_owner_company ON contacts(owner_company_id);",
+    # Speeds company-scoped active-contact / storage aggregate lookups.
+    "CREATE INDEX IF NOT EXISTS idx_contacts_owner_company_active ON contacts(owner_company_id) WHERE (is_deleted = FALSE OR is_deleted IS NULL);",
     "CREATE INDEX IF NOT EXISTS idx_contacts_created_at ON contacts(\"createdAt\");",
     'CREATE INDEX IF NOT EXISTS idx_contacts_event_name ON contacts("eventName");',
     # ── Contacts: country + event day (idempotent) ─────────────────────────

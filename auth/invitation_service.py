@@ -29,6 +29,7 @@ from auth.constants import (
 from auth.email_service import send_invitation_email
 from auth.password_utils import hash_password, validate_password_policy
 from db.pool import db_cursor
+from services.storage_service import DEFAULT_PLAN_NAME, DEFAULT_STORAGE_LIMIT_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -624,8 +625,9 @@ def accept_invitation(
                 """
                 INSERT INTO companies (
                     id, company_name, company_code, address, phone, email, website,
-                    status, created_at, updated_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,'active',%s,%s)
+                    status, plan_name, storage_limit_bytes, used_storage_bytes,
+                    created_at, updated_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,0,%s,%s)
                 """,
                 (
                     company_id,
@@ -635,6 +637,8 @@ def accept_invitation(
                     final_company_phone,
                     final_company_email,
                     final_company_website,
+                    DEFAULT_PLAN_NAME,
+                    DEFAULT_STORAGE_LIMIT_BYTES,
                     _now(),
                     _now(),
                 ),

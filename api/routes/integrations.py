@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from api.auth_context import get_receive_email_from_request
 from api.outreach import (
@@ -21,6 +21,8 @@ from api.schemas import (
     WhatsAppMessageRequest,
     WhatsAppTestRequest,
 )
+from auth.constants import ROLE_ADMIN, ROLE_SUPER_ADMIN
+from auth.dependencies import require_role
 from services.email_service import email_queue, is_email_configured, send_business_thank_you_email
 from services.whatsapp_inbound import (
     get_phone_verify_status,
@@ -202,14 +204,18 @@ async def queue_email_message(request: EmailMessageRequest):
 @router.post(
     "/integrations/email/test",
     summary="Send a test thank-you email (Swagger / production check)",
+    description="Requires Bearer JWT (ADMIN or SUPER_ADMIN). Prefer POST /health/email/test under Health.",
 )
-async def test_email_message(request: EmailTestRequest):
+async def test_email_message(
+    request: EmailTestRequest,
+    _user: dict = Depends(require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)),
+):
     if not is_email_configured():
         raise HTTPException(
             status_code=503,
             detail=(
-                "Email is not configured. Set GMAIL_USER + GMAIL_APP_PASSWORD "
-                "(or SMTP_USER + SMTP_PASSWORD) in .env."
+                "Email is not configured. Set SMTP_USER + SMTP_PASSWORD "
+                "(and BUSINESS_EMAIL / SMTP_FROM for SES From) in .env."
             ),
         )
 

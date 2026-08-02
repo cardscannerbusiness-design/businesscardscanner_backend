@@ -32,10 +32,24 @@ from services.contact_service import (
 from services.contact_storage import ContactStorageError
 from services.google_sheets_service import fire_sheets_sync
 from services.local_db_service import LocalDbError
+from services.storage_service import (
+    StorageLimitExceededError,
+    get_storage_usage as get_company_quota_usage,
+    resolve_company_id_for_user,
+)
 from utils.file_utils import cleanup_temp_file, save_temp_file, validate_file
 
 router = APIRouter(tags=["Contacts"])
 logger = logging.getLogger(__name__)
+
+
+def _raise_storage_limit(exc: StorageLimitExceededError) -> None:
+    logger.warning(
+        "[STORAGE] API rejected upload error=%s detail=%s",
+        exc.code,
+        exc.to_response(),
+    )
+    raise HTTPException(status_code=403, detail=exc.to_response()) from exc
 
 
 def _sheets_extras(data: dict[str, Any]) -> dict[str, Any]:
@@ -63,7 +77,13 @@ async def update_existing_contact(
 ):
     existing = storage.get_contact(contact_id, user=user)
     require_contact_access(user, existing)
-    result = update_contact(contact_id, request.contact)
+    try:
+        result = update_contact(contact_id, request.contact)
+    except StorageLimitExceededError as exc:
+        _raise_storage_limit(exc)
+    except LocalDbError as exc:
+        logger.exception("[STORAGE] Contact update failed contact_id=%s", contact_id)
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error", "Contact not found"))
     fire_sheets_sync(contact_id, _sheets_extras(request.contact))
@@ -96,6 +116,8 @@ async def create_contact(
 
         try:
             result = save_contact(contact_data, image_path=temp_path)
+        except StorageLimitExceededError as exc:
+            _raise_storage_limit(exc)
         except LocalDbError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
@@ -142,13 +164,102 @@ async def fetch_contacts(
 
 
 @router.get("/api/storage/config")
-async def storage_config(_user: dict = Depends(get_current_user)):
+async def storage_config(user: dict = Depends(get_current_user)):
+    import asyncio
+
     from utils.storage_config import get_contact_storage_mode
 
-    return {
-        "storage": get_contact_storage_mode(),
-        "database": storage.check_storage(),
-    }
+    # Heavy aggregates must not block the asyncio event loop — that froze
+    # concurrent OCR requests after Storage Usage was added to this endpoint.
+    def _build() -> dict[str, Any]:
+        response: dict[str, Any] = {
+            "storage": get_contact_storage_mode(),
+            "database": storage.check_storage(),
+            "usage": storage.get_storage_usage(user=user),
+        }
+        company_id = resolve_company_id_for_user(user)
+        if company_id:
+            try:
+                response["quota"] = get_company_quota_usage(company_id)
+            except Exception as exc:
+                logger.exception(
+                    "[STORAGE] Could not load company storage quota company_id=%s: %s",
+                    company_id,
+                    exc,
+                )
+        return response
+
+    return await asyncio.to_thread(_build)
+
+
+@router.get(
+    "/api/storage/usage",
+    summary="Company storage quota usage",
+    tags=["Storage"],
+    responses={
+        200: {
+            "description": "Current plan storage usage for the authenticated user's company",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "plan": "FREEMIUM",
+                        "storage_limit_bytes": 20971520,
+                        "used_storage_bytes": 8458240,
+                        "remaining_storage_bytes": 12513280,
+                        "used_percentage": 40.3,
+                        "used_mb": 8.06,
+                        "limit_mb": 20.0,
+                        "remaining_mb": 11.94,
+                        "can_upload": True,
+                        "warning_level": "NORMAL",
+                    }
+                }
+            },
+        },
+        400: {"description": "User has no company (e.g. Super Admin without company)"},
+        403: {
+            "description": "Returned by contact create/update when quota is exceeded",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "success": False,
+                            "error": "STORAGE_LIMIT_EXCEEDED",
+                            "message": "Storage limit reached. Upgrade your plan to continue.",
+                            "used_storage_bytes": 20971520,
+                            "storage_limit_bytes": 20971520,
+                            "image_size_bytes": 50000,
+                        }
+                    }
+                }
+            },
+        },
+    },
+)
+async def storage_usage(user: dict = Depends(get_current_user)):
+    """Return plan, used/limit/remaining bytes, can_upload, and warning_level."""
+    company_id = resolve_company_id_for_user(user)
+    if not company_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "NO_COMPANY",
+                "message": "No company is associated with this account.",
+            },
+        )
+    try:
+        return get_company_quota_usage(company_id)
+    except Exception as exc:
+        logger.exception("[STORAGE] Storage usage request failed company_id=%s", company_id)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "STORAGE_USAGE_FAILED",
+                "message": "Failed to load storage usage.",
+            },
+        ) from exc
 
 
 @router.get("/api/contacts", summary="List contacts (UI shape)")
@@ -203,7 +314,26 @@ async def get_contact_card_image(contact_id: str, user: dict = Depends(get_curre
     return Response(content=image_bytes, media_type=media_type)
 
 
-@router.post("/api/contacts", summary="Save contact")
+@router.post(
+    "/api/contacts",
+    summary="Save contact",
+    responses={
+        403: {
+            "description": "Company storage quota exceeded",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "success": False,
+                            "error": "STORAGE_LIMIT_EXCEEDED",
+                            "message": "Storage limit reached. Upgrade your plan to continue.",
+                        }
+                    }
+                }
+            },
+        }
+    },
+)
 async def create_contact_json(
     body: LocalContactBody,
     request: Request,
@@ -242,6 +372,8 @@ async def create_contact_json(
                 response["outreachError"] = str(exc)
 
         return response
+    except StorageLimitExceededError as exc:
+        _raise_storage_limit(exc)
     except ContactStorageError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except LocalDbError as exc:
@@ -264,6 +396,8 @@ async def update_contact_json(
             raise HTTPException(status_code=404, detail=result.get("error", "Contact not found"))
         fire_sheets_sync(contact_id, _sheets_extras(payload))
         return {"success": True, "id": contact_id, "contact": storage.get_contact(contact_id, user=user)}
+    except StorageLimitExceededError as exc:
+        _raise_storage_limit(exc)
     except ContactStorageError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except LocalDbError as exc:

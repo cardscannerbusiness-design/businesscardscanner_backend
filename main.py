@@ -12,7 +12,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Response
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer
 from fastapi.staticfiles import StaticFiles
@@ -52,6 +52,9 @@ from config.settings import (  # noqa: E402
     get_allowed_origins,
 )
 from auth.middleware import RBACMiddleware  # noqa: E402
+from auth.constants import ROLE_ADMIN, ROLE_SUPER_ADMIN  # noqa: E402
+from auth.dependencies import require_role  # noqa: E402
+from api.schemas import EmailTestRequest  # noqa: E402
 from services.email_service import email_queue  # noqa: E402
 from services.whatsapp_service import whatsapp_queue  # noqa: E402
 
@@ -79,6 +82,12 @@ async def lifespan(app: FastAPI):
     await whatsapp_queue.start()
     await email_queue.start()
     try:
+        from services.google_oauth_service import warn_if_oauth_not_configured
+
+        warn_if_oauth_not_configured()
+    except Exception as exc:
+        logger.warning("Google OAuth startup check skipped: %s", exc)
+    try:
         sub = await asyncio.to_thread(ensure_waba_webhook_subscription)
         if not sub.get("subscribed"):
             logger.warning("WhatsApp WABA webhook subscription: %s", sub)
@@ -102,7 +111,13 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json",
     openapi_tags=[
-        {"name": "Health", "description": "Service health and connectivity checks"},
+        {
+            "name": "Health",
+            "description": (
+                "Service health and connectivity checks. "
+                "Public: GET /health. Authenticated email checks: GET /health/email, POST /health/email/test."
+            ),
+        },
         {"name": "Auth", "description": "Login, logout, refresh, forgot/reset password, email verification"},
         {"name": "Users", "description": "User management (SuperAdmin + Admin)"},
         {"name": "Companies", "description": "Company management (SuperAdmin)"},
@@ -265,4 +280,105 @@ def health_check():
                 get_waba_subscription_status() if is_whatsapp_configured() else {"subscribed": False}
             ),
         },
+    }
+
+
+def _email_health_payload() -> dict:
+    from services.email_service import (
+        BUSINESS_COMPANY_NAME,
+        BUSINESS_EMAIL,
+        SMTP_HOST,
+        SMTP_PORT,
+        SMTP_USER,
+        get_email_provider,
+        is_email_configured,
+        is_email_test_recipient_configured,
+        is_smtp_configured,
+        smtp_sender_email,
+    )
+
+    from_addr = smtp_sender_email() or SMTP_USER or None
+    return {
+        "ok": is_email_configured() and bool(from_addr),
+        "configured": is_email_configured(),
+        "provider": get_email_provider(),
+        "smtp_configured": is_smtp_configured(),
+        "smtp_host": SMTP_HOST,
+        "smtp_port": SMTP_PORT,
+        "smtp_user_set": bool(SMTP_USER),
+        "test_recipient_env_set": is_email_test_recipient_configured(),
+        "from": from_addr,
+        "business_email": BUSINESS_EMAIL or None,
+        "business_company_name": BUSINESS_COMPANY_NAME or None,
+        "hint": (
+            None
+            if is_email_configured() and from_addr
+            else "Set SMTP_USER/SMTP_PASSWORD and BUSINESS_EMAIL (verified SES From) then restart."
+        ),
+    }
+
+
+@app.get(
+    "/health/email",
+    tags=["Health"],
+    summary="Email / SMTP status (authorized)",
+    description=(
+        "Returns live SMTP/SES configuration used by the running process "
+        "(host, From address, company name). Requires Bearer JWT. "
+        "Roles: ADMIN, SUPER_ADMIN."
+    ),
+)
+def health_email_status(
+    _user: dict = Depends(require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)),
+):
+    return _email_health_payload()
+
+
+@app.post(
+    "/health/email/test",
+    tags=["Health"],
+    summary="Send test thank-you email (authorized)",
+    description=(
+        "Sends a real thank-you email via the configured SMTP/SES transport. "
+        "Use this in Swagger to verify production email after Authorize. "
+        "Requires Bearer JWT. Roles: ADMIN, SUPER_ADMIN."
+    ),
+)
+async def health_email_test(
+    body: EmailTestRequest,
+    _user: dict = Depends(require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)),
+):
+    import asyncio
+
+    from services.email_service import is_email_configured, send_business_thank_you_email
+
+    if not is_email_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Email is not configured. Set SMTP_USER + SMTP_PASSWORD "
+                "(and BUSINESS_EMAIL / SMTP_FROM for SES From) in .env, then restart."
+            ),
+        )
+
+    try:
+        result = await asyncio.to_thread(
+            send_business_thank_you_email,
+            body.contact_email,
+            test_override=body.test_override or None,
+        )
+    except Exception as exc:
+        logger.error("Health email test failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=result.get("error") or "Email send failed.",
+        )
+
+    return {
+        "success": True,
+        "email": _email_health_payload(),
+        "result": result,
     }
