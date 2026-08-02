@@ -10,6 +10,12 @@ from typing import Any
 from utils.parser_utils import is_valid_email
 
 from services.email_cc_validation import validate_cc_address_list
+from services.email_mime import (
+    apply_standard_headers,
+    domain_of_email,
+    email_only,
+    resolve_envelope_mail_from,
+)
 from services.email_template_service import (
     cc_scanned_contact_email_context,
     render_cc_scanned_contact_email_html,
@@ -116,7 +122,33 @@ def is_gmail_configured() -> bool:
 
 
 def smtp_sender_email() -> str:
-    return BUSINESS_EMAIL or SMTP_USER
+    """
+    From address aligned with the authenticated SMTP mailbox when domains differ.
+
+    Prefer SMTP_FROM / BUSINESS_EMAIL only when that domain matches SMTP_USER;
+    otherwise send From the auth mailbox and keep Reply-To on the business address.
+    """
+    preferred = email_only(
+        _normalize_env(os.getenv("SMTP_FROM")) or BUSINESS_EMAIL or SMTP_USER
+    )
+    auth = email_only(SMTP_USER)
+    preferred_domain = domain_of_email(preferred)
+    auth_domain = domain_of_email(auth)
+
+    if preferred and auth_domain and preferred_domain == auth_domain:
+        return preferred
+    if auth:
+        if preferred and preferred_domain and preferred_domain != auth_domain:
+            logger.info(
+                "From domain %s differs from SMTP auth domain %s; "
+                "sending From=%s with Reply-To=%s to reduce spam filtering.",
+                preferred_domain,
+                auth_domain,
+                auth,
+                preferred,
+            )
+        return auth
+    return preferred or SMTP_USER
 
 
 def receive_inbox_email() -> str | None:
@@ -154,9 +186,15 @@ def get_email_provider() -> str | None:
 
 def _format_from_address(email: str, name: str | None = None) -> str:
     display = name or BUSINESS_COMPANY_NAME
-    if display:
-        return f"{display} <{email}>"
-    return email
+    addr = email_only(email)
+    if display and addr:
+        return f"{display} <{addr}>"
+    return addr or email
+
+
+def _reply_to_address(sender: str) -> str:
+    """Always prefer the business inbox for replies when configured."""
+    return email_only(BUSINESS_EMAIL) or email_only(sender) or sender
 
 
 def _redact_email(email: str | None) -> str:
@@ -204,6 +242,7 @@ def _send_via_smtp_relay(
     reply_to: str,
     provider_label: str,
     cc_addresses: list[str] | None = None,
+    mail_from: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "success": False,
@@ -218,15 +257,19 @@ def _send_via_smtp_relay(
         result["cc_invalid"] = cc_invalid
 
     message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = from_address
-    message["To"] = to_address
-    message["Reply-To"] = reply_to
-    if cc_list:
-        message["Cc"] = ", ".join(cc_list)
+    apply_standard_headers(
+        message,
+        from_address=from_address,
+        to_address=to_address,
+        subject=subject,
+        reply_to=reply_to,
+        cc_addresses=cc_list or None,
+        message_id_domain=domain_of_email(from_address),
+    )
     _attach_multipart_body(message, plain_body, html_body)
 
     recipients = [to_address, *cc_list]
+    envelope_from = email_only(mail_from) or email_only(from_address)
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as smtp:
@@ -234,7 +277,7 @@ def _send_via_smtp_relay(
             smtp.starttls()
             smtp.ehlo()
             smtp.login(smtp_user, smtp_password)
-            smtp.send_message(message, to_addrs=recipients)
+            smtp.send_message(message, from_addr=envelope_from, to_addrs=recipients)
     except smtplib.SMTPAuthenticationError as exc:
         result["error"] = f"{provider_label} authentication failed: {exc}"
         logger.error("SMTP auth failed for %s: %s", to_address, exc, exc_info=True)
@@ -276,6 +319,7 @@ def _send_via_smtp(
             "recipient_email": to_address,
             "error": "SMTP is not configured. Set GMAIL_USER + GMAIL_APP_PASSWORD (or SMTP_USER + SMTP_PASSWORD) in .env.",
         }
+    # Align From with SMTP auth mailbox when domains differ; keep Reply-To on business email.
     sender = smtp_sender_email()
     result = _send_via_smtp_relay(
         to_address,
@@ -287,7 +331,8 @@ def _send_via_smtp(
         smtp_user=SMTP_USER,
         smtp_password=SMTP_PASSWORD,
         from_address=_format_from_address(sender),
-        reply_to=BUSINESS_EMAIL or sender,
+        reply_to=_reply_to_address(sender),
+        mail_from=resolve_envelope_mail_from(sender),
         provider_label="SMTP",
         cc_addresses=cc_addresses,
     )
