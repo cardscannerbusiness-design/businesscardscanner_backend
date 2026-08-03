@@ -40,13 +40,15 @@ def _smtp_config() -> dict[str, str]:
     password = _normalize_smtp_password(os.getenv("SMTP_PASSWORD")) or _normalize_smtp_password(
         os.getenv("GMAIL_APP_PASSWORD")
     )
-    # From MUST match the authenticated mailbox (Gmail blocks spoofed BUSINESS_EMAIL From).
-    from_addr = user or _normalize_env(os.getenv("SMTP_FROM")) or "noreply@cardsync.ai"
-    reply_to = (
-        _normalize_env(os.getenv("BUSINESS_EMAIL"))
-        or _normalize_env(os.getenv("SMTP_FROM"))
-        or from_addr
-    )
+    smtp_from = _normalize_env(os.getenv("SMTP_FROM"))
+    business = _normalize_env(os.getenv("BUSINESS_EMAIL"))
+    # Gmail: SMTP_USER is the mailbox email and must be From.
+    # SES: SMTP_USER is an IAM access key — From must be a verified identity.
+    if user and "@" in user:
+        from_addr = user
+    else:
+        from_addr = smtp_from or business or "noreply@cardsync.ai"
+    reply_to = business or smtp_from or from_addr
     return {
         "host": _normalize_env(os.getenv("SMTP_HOST"))
         or _normalize_env(os.getenv("GMAIL_SMTP_HOST"))

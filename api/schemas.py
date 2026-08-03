@@ -1,16 +1,14 @@
-from typing import Any
-
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field
 
 
 class WhatsAppMessageRequest(BaseModel):
-    contact_phone: str
-    message: str
+    contact_phone: str = Field(..., description="Recipient phone number")
+    message: str = Field(..., description="WhatsApp message body")
 
 
 class WhatsAppTestRequest(BaseModel):
-    contact_phone: str
-    message: str = "hai"
+    contact_phone: str = Field(..., description="Recipient phone number")
+    message: str = Field(..., description="WhatsApp message body")
     mode: str = Field(
         default="auto",
         description=(
@@ -24,14 +22,13 @@ class WhatsAppCardReceivedRequest(BaseModel):
     contact_phone: str = Field(
         ...,
         description="Recipient phone number (E.164 or local 10-digit Indian number).",
-        examples=["6309248193"],
     )
     full_name: str = Field(
-        default="Yogesh VR",
+        ...,
         description="Name for card_final_ula {{1}} (Hi {{1}}). First word is used.",
     )
     event_name: str = Field(
-        default="TTF Kolkata 2026",
+        ...,
         description="Event/place for card_final_ula {{2}} (meeting you at {{2}}).",
     )
 
@@ -55,23 +52,18 @@ class WhatsAppChatReplyRegisterRequest(BaseModel):
 
 
 class EmailMessageRequest(BaseModel):
-    contact_email: str
-    message: str
+    contact_email: str = Field(..., description="Recipient email address")
+    message: str = Field(..., description="Email message body")
 
 
 class EmailTestRequest(BaseModel):
-    contact_email: str = Field(
-        ...,
-        description="Email parsed from a scanned contact (simulated).",
-        examples=["saligantisandeepzzz6@gmail.com"],
-    )
+    contact_email: str = Field(..., description="Email parsed from a scanned contact (simulated).")
     test_override: str = Field(
-        default="",
+        ...,
         description=(
             "Optional inbox that receives the mail instead of contact_email. "
-            "Leave empty to send to contact_email."
+            "Use empty string to send to contact_email."
         ),
-        examples=[""],
     )
 
 
@@ -88,32 +80,7 @@ class ContactUpdateRequest(BaseModel):
 
 
 class LocalContactBody(BaseModel):
-    model_config = ConfigDict(
-        json_schema_extra={
-            "examples": [
-                {
-                    "fullName": "Sandeep Saliganti",
-                    "firstName": "Sandeep",
-                    "lastName": "Saliganti",
-                    "designation": "Developer",
-                    "company": "CardSync Demo",
-                    "phone": "9884993074",
-                    "countryCode": "+91",
-                    "countryName": "India",
-                    "email": "saligantisandeepzzz6@gmail.com",
-                    "website": "https://cardsync.ai",
-                    "eventName": "Mall Opening",
-                    "eventDay": "Day 1",
-                    "notes": "Met at booth — follow up next week.",
-                    "connectionMode": "online",
-                    "skipWhatsApp": True,
-                    "skipEmail": False,
-                }
-            ]
-        }
-    )
-
-    fullName: str
+    fullName: str = Field(..., description="Contact full name")
     firstName: str = ""
     lastName: str = ""
     designation: str = ""
@@ -160,7 +127,7 @@ class LocalContactBody(BaseModel):
 
 
 class SyncStatusBody(BaseModel):
-    syncStatus: str
+    syncStatus: str = Field(..., description="New sync status")
 
 
 class SyncOutreachOptions(BaseModel):
@@ -223,11 +190,6 @@ class UserInfo(BaseModel):
 
 
 class CreateUserRequest(BaseModel):
-    model_config = ConfigDict(json_schema_extra={"examples": [{
-        "first_name": "John", "last_name": "Doe", "email": "john@example.com",
-        "username": "johndoe", "password": "Password@123", "role": "USER", "phone": "+1234567890",
-    }]})
-
     first_name: str = Field(..., min_length=1)
     last_name: str = Field(..., min_length=1)
     email: EmailStr
@@ -256,11 +218,6 @@ class AdminResetPasswordRequest(BaseModel):
 
 class CreateCompanyRequest(BaseModel):
     """Invite an Admin for a new company. Admin sets their own password via the invite link."""
-
-    model_config = ConfigDict(json_schema_extra={"examples": [{
-        "company_name": "Acme Corp", "company_code": "ACME",
-        "admin_email": "admin@acme.com",
-    }]})
 
     company_name: str = Field(..., min_length=1)
     company_code: str = Field(..., min_length=2)
