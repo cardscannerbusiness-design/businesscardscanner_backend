@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 # Seed / migration defaults only. Runtime quota math always uses the company's
 # stored storage_limit_bytes / used_storage_bytes columns.
 DEFAULT_PLAN_NAME = "FREEMIUM"
-DEFAULT_STORAGE_LIMIT_BYTES = 20 * 1024 * 1024  # 20 MiB
+DEFAULT_STORAGE_LIMIT_BYTES = 1 * 1024 * 1024  # 1 MiB
 
 # Prevent SELECT … FOR UPDATE from waiting forever under contention.
 _LOCK_TIMEOUT_MS = 5_000

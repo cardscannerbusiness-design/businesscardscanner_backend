@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from api.schemas import WipeAllDataBody
 from auth.constants import ROLE_ADMIN, ROLE_SUPER_ADMIN
 from auth.dependencies import require_role
+from auth.email_service import send_data_deletion_confirmation
 from services import contact_storage as storage
 from services.contact_service import delete_all_contacts
 
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 )
 def wipe_all_data(
     body: WipeAllDataBody,
-    _user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN)),
+    user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN)),
 ):
     if not body.confirm:
         raise HTTPException(
@@ -31,4 +32,12 @@ def wipe_all_data(
         "contacts": delete_all_contacts(),
         "storage": storage.storage_label(),
     }
-    return {"success": True, **result}
+    email = str(user.get("email") or "").strip()
+    email_sent = False
+    if email:
+        try:
+            send_result = send_data_deletion_confirmation(email, "organisation")
+            email_sent = bool(send_result.get("sent"))
+        except Exception:
+            logger.exception("Organisation deletion confirmation email failed")
+    return {"success": True, "email_sent": email_sent, **result}

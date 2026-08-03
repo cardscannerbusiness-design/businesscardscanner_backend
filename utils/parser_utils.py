@@ -216,6 +216,21 @@ def extract_phones(lines: List[str]) -> tuple[List[str], List[str]]:
         re.IGNORECASE,
     )
 
+    def collapse_digit_spaces(text: str) -> str:
+        """Ignore formatting spaces between digits so spaced OCR phones keep all digits."""
+        return re.sub(r'(\d)[\s.]+(?=\d)', r'\1', text)
+
+    def normalize_phone_digits(phone: str) -> str:
+        """Preserve digits only; keep leading + / 00 country-code marker unchanged in spirit."""
+        trimmed = (phone or "").strip()
+        if not trimmed:
+            return ""
+        has_plus = trimmed.startswith("+") or trimmed.startswith("00") or trimmed.startswith("(+")
+        digits = "".join(c for c in trimmed if c.isdigit())
+        if not digits:
+            return ""
+        return f"+{digits}" if has_plus else digits
+
     def is_false_phone_match(match: str, line: str) -> bool:
         """Avoid treating PIN codes / plot numbers as phone numbers."""
         digits = "".join(c for c in match if c.isdigit())
@@ -239,21 +254,23 @@ def extract_phones(lines: List[str]) -> tuple[List[str], List[str]]:
 
     for line in lines:
         clean_line = re.sub(r'^(tel|phone|mobile|cell|m|p|t|f|office|direct)\s*[:\-\.]?\s*', '', line, flags=re.IGNORECASE).strip()
+        # Collapse digit spaces before matching so "98765 43210" keeps all 10 digits.
+        match_line = collapse_digit_spaces(clean_line)
         
-        matches = phone_pattern.findall(clean_line)
+        matches = phone_pattern.findall(match_line)
         matched_in_line = False
         for match in matches:
-            if is_false_phone_match(match, clean_line):
+            if is_false_phone_match(match, match_line):
                 continue
             if is_valid_phone(match):
-                phones.append(match.strip())
+                phones.append(normalize_phone_digits(match))
                 matched_in_line = True
-                clean_line = clean_line.replace(match, '').strip()
+                match_line = match_line.replace(match, '').strip()
             else:
                 logger.info(f"[OCR Noise Filter] Rejected invalid phone candidate: '{match}'")
                 
         if matched_in_line:
-            clean_line = re.sub(r'^(tel|phone|mobile|cell|m|p|t|f|office|direct|support\s*no\.?)\s*[:\-\.]?\s*', '', clean_line, flags=re.IGNORECASE).strip()
+            clean_line = re.sub(r'^(tel|phone|mobile|cell|m|p|t|f|office|direct|support\s*no\.?)\s*[:\-\.]?\s*', '', match_line, flags=re.IGNORECASE).strip()
             # Drop leftover labels like "ID:" after email stripping on other paths.
             if len(clean_line) > 2 and not re.match(r'^(?:id|email|e-?mail|web|www)\s*:?\s*$', clean_line, re.IGNORECASE):
                 remaining_lines.append(clean_line)

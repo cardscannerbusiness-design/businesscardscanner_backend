@@ -2,18 +2,55 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import random
+import string
+import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field
 
 from api.schemas import ChangeEmailRequest, ChangePasswordRequest, UpdateProfileRequest
 from auth.dependencies import get_current_user
+from auth.email_service import (
+    send_data_deletion_confirmation,
+    send_mobile_verification_otp,
+)
 from auth.service import AuthError, change_password, request_email_change
 from db.pool import db_cursor
 
 router = APIRouter(prefix="/api/profile", tags=["Profile"])
 logger = logging.getLogger(__name__)
+
+# In-memory OTP store for mobile verification (user_id -> payload). No schema change.
+_MOBILE_OTP: dict[str, dict] = {}
+_MOBILE_OTP_TTL_SEC = 10 * 60
+
+
+class MobileVerifySendBody(BaseModel):
+    phone: str = Field(min_length=7, max_length=32)
+
+
+class MobileVerifyConfirmBody(BaseModel):
+    phone: str = Field(min_length=7, max_length=32)
+    otp: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class DataDeletionNoticeBody(BaseModel):
+    kind: str = Field(description="local_queue | organisation")
+
+
+def _generate_otp(length: int = 6) -> str:
+    return "".join(random.choices(string.digits, k=length))
+
+
+def _purge_mobile_otps() -> None:
+    now = time.time()
+    expired = [uid for uid, row in _MOBILE_OTP.items() if float(row.get("expires_at", 0)) <= now]
+    for uid in expired:
+        _MOBILE_OTP.pop(uid, None)
 
 
 @router.get(
@@ -105,3 +142,91 @@ def change_email_route(body: ChangeEmailRequest, request: Request):
         return request_email_change(user["id"], body.new_email, ip=meta["ip"], user_agent=meta["user_agent"])
     except AuthError as exc:
         raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": exc.message}) from exc
+
+
+@router.post(
+    "/mobile-verify/send-otp",
+    summary="Send mobile verification OTP",
+    description="Emails a 6-digit OTP (same UX as password-reset OTP) to verify the user's mobile after Freemium expiry.",
+)
+def send_mobile_verify_otp(body: MobileVerifySendBody, request: Request):
+    user = get_current_user(request)
+    phone = "".join(c for c in body.phone.strip() if c.isdigit() or c == "+")
+    if len("".join(c for c in phone if c.isdigit())) < 7:
+        raise HTTPException(status_code=400, detail="Enter a valid mobile number.")
+
+    email = str(user.get("email") or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="No registered email on your account.")
+
+    _purge_mobile_otps()
+    otp = _generate_otp()
+    user_id = str(user["id"])
+    _MOBILE_OTP[user_id] = {
+        "phone": phone,
+        "otp_hash": hashlib.sha256(otp.encode()).hexdigest(),
+        "expires_at": time.time() + _MOBILE_OTP_TTL_SEC,
+    }
+
+    result = send_mobile_verification_otp(email, otp, phone)
+    if not result.get("sent"):
+        logger.warning("Mobile OTP email failed for %s: %s", email, result)
+    return {"success": True, "message": "Verification code sent to your registered email."}
+
+
+@router.post(
+    "/mobile-verify/confirm",
+    summary="Confirm mobile verification OTP",
+)
+def confirm_mobile_verify_otp(body: MobileVerifyConfirmBody, request: Request):
+    user = get_current_user(request)
+    user_id = str(user["id"])
+    phone = "".join(c for c in body.phone.strip() if c.isdigit() or c == "+")
+    _purge_mobile_otps()
+    entry = _MOBILE_OTP.get(user_id)
+    if not entry or entry.get("phone") != phone:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
+    expected = entry.get("otp_hash")
+    actual = hashlib.sha256(body.otp.strip().encode()).hexdigest()
+    if actual != expected:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
+    _MOBILE_OTP.pop(user_id, None)
+
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE users
+            SET phone = %s, updated_at = %s
+            WHERE id = %s AND deleted_at IS NULL
+            """,
+            (phone, datetime.now(timezone.utc), user_id),
+        )
+
+    return {"success": True, "message": "Mobile number verified.", "phone": phone}
+
+
+@router.post(
+    "/data-deletion-notice",
+    summary="Email confirmation after local or organisation data deletion",
+)
+def data_deletion_notice(body: DataDeletionNoticeBody, request: Request):
+    user = get_current_user(request)
+    kind = (body.kind or "").strip().lower()
+    if kind not in ("local_queue", "organisation"):
+        raise HTTPException(status_code=400, detail="kind must be local_queue or organisation.")
+    email = str(user.get("email") or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="No registered email on your account.")
+    result = send_data_deletion_confirmation(
+        email,
+        "organisation" if kind == "organisation" else "local_queue",
+    )
+    return {
+        "success": True,
+        "sent": bool(result.get("sent")),
+        "message": (
+            "Confirmation email requested."
+            if result.get("sent")
+            else "Deletion recorded; email could not be sent."
+        ),
+    }

@@ -29,11 +29,11 @@ class TestRowAsDict(unittest.TestCase):
 
     def test_tuple_row_from_plain_cursor(self) -> None:
         # Regression: create_contact used plain cursor; dict(tuple) crashed.
-        row = ("c1", "FREEMIUM", 20971520, 1000)
+        row = ("c1", "FREEMIUM", 1048576, 1000)
         parsed = svc._row_as_dict(row)
         self.assertEqual(parsed["id"], "c1")
         self.assertEqual(parsed["plan_name"], "FREEMIUM")
-        self.assertEqual(parsed["storage_limit_bytes"], 20971520)
+        self.assertEqual(parsed["storage_limit_bytes"], 1048576)
         self.assertEqual(parsed["used_storage_bytes"], 1000)
 
 
@@ -52,16 +52,16 @@ class TestCanUpload(unittest.TestCase):
     @patch.object(svc, "get_company_storage")
     def test_within_limit(self, get_storage: MagicMock) -> None:
         get_storage.return_value = {
-            "storage_limit_bytes": 20 * 1024 * 1024,
-            "used_storage_bytes": 1_000_000,
+            "storage_limit_bytes": 1 * 1024 * 1024,
+            "used_storage_bytes": 100_000,
         }
-        self.assertTrue(svc.can_upload("c1", 500_000))
+        self.assertTrue(svc.can_upload("c1", 50_000))
 
     @patch.object(svc, "get_company_storage")
     def test_exceeding_limit(self, get_storage: MagicMock) -> None:
         get_storage.return_value = {
-            "storage_limit_bytes": 20 * 1024 * 1024,
-            "used_storage_bytes": 20 * 1024 * 1024 - 100,
+            "storage_limit_bytes": 1 * 1024 * 1024,
+            "used_storage_bytes": 1 * 1024 * 1024 - 100,
         }
         self.assertFalse(svc.can_upload("c1", 200))
 
@@ -81,8 +81,8 @@ class TestAssertCanUploadLocked(unittest.TestCase):
         cur.fetchone.return_value = {
             "id": "c1",
             "plan_name": "FREEMIUM",
-            "storage_limit_bytes": 20971520,
-            "used_storage_bytes": 1_000_000,
+            "storage_limit_bytes": 1048576,
+            "used_storage_bytes": 100_000,
         }
         svc.assert_can_upload_locked(cur, "c1", 100_000)
 
@@ -91,8 +91,8 @@ class TestAssertCanUploadLocked(unittest.TestCase):
         cur.fetchone.return_value = {
             "id": "c1",
             "plan_name": "FREEMIUM",
-            "storage_limit_bytes": 20971520,
-            "used_storage_bytes": 20971520,
+            "storage_limit_bytes": 1048576,
+            "used_storage_bytes": 1048576,
         }
         with self.assertRaises(svc.StorageLimitExceededError) as ctx:
             svc.assert_can_upload_locked(cur, "c1", 1)
@@ -100,8 +100,8 @@ class TestAssertCanUploadLocked(unittest.TestCase):
         body = ctx.exception.to_response()
         self.assertFalse(body["success"])
         self.assertEqual(body["error"], "STORAGE_LIMIT_EXCEEDED")
-        self.assertEqual(body["used_storage_bytes"], 20971520)
-        self.assertEqual(body["storage_limit_bytes"], 20971520)
+        self.assertEqual(body["used_storage_bytes"], 1048576)
+        self.assertEqual(body["storage_limit_bytes"], 1048576)
         self.assertEqual(body["image_size_bytes"], 1)
 
     def test_no_company_skips_check(self) -> None:
@@ -127,7 +127,7 @@ class TestStorageUpdateAndRelease(unittest.TestCase):
         self.assertEqual(cur.execute.call_args[0][1], (500, "c1"))
 
     def test_multiple_uploads_accumulate_math(self) -> None:
-        limit = 20971520
+        limit = 1048576
         used = 0
         sizes = [100_000, 250_000, 400_000]
         for size in sizes:
@@ -144,16 +144,16 @@ class TestGetStorageUsageShape(unittest.TestCase):
         cur.fetchone.return_value = {
             "id": "c1",
             "plan_name": "FREEMIUM",
-            "storage_limit_bytes": 20971520,
-            "used_storage_bytes": 8458240,
+            "storage_limit_bytes": 1048576,
+            "used_storage_bytes": 422576,
         }
         db_cursor.return_value.__enter__.return_value = cur
 
         usage = svc.get_storage_usage("c1")
         self.assertEqual(usage["plan"], "FREEMIUM")
-        self.assertEqual(usage["storage_limit_bytes"], 20971520)
-        self.assertEqual(usage["used_storage_bytes"], 8458240)
-        self.assertEqual(usage["remaining_storage_bytes"], 20971520 - 8458240)
+        self.assertEqual(usage["storage_limit_bytes"], 1048576)
+        self.assertEqual(usage["used_storage_bytes"], 422576)
+        self.assertEqual(usage["remaining_storage_bytes"], 1048576 - 422576)
         self.assertIn("used_mb", usage)
         self.assertIn("limit_mb", usage)
         self.assertIn("remaining_mb", usage)
