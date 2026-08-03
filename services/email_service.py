@@ -129,9 +129,9 @@ def is_smtp_configured() -> bool:
     return bool(SMTP_USER and SMTP_PASSWORD)
 
 
-# Backward-compatible alias — SMTP is the only transport now.
-def is_gmail_configured() -> bool:
-    return is_smtp_configured()
+def _is_ses_smtp() -> bool:
+    host = (SMTP_HOST or "").lower()
+    return "amazonaws.com" in host or host.startswith("email-smtp.")
 
 
 def _looks_like_email(value: str | None) -> bool:
@@ -154,6 +154,10 @@ def smtp_sender_email() -> str:
 def smtp_reply_to_email() -> str:
     """Public reply address; may differ from the authenticated From mailbox."""
     return BUSINESS_EMAIL or SMTP_FROM or smtp_sender_email()
+
+
+def is_gmail_configured() -> bool:
+    return is_smtp_configured()
 
 
 def receive_inbox_email() -> str | None:
@@ -217,6 +221,60 @@ def _looks_like_spam_block(exc: BaseException | str) -> bool:
         "content-filter",
     )
     return any(marker in text for marker in markers)
+
+
+def _check_recipient_mx(email: str) -> tuple[bool, str]:
+    """
+    Best-effort MX check so we fail fast when a domain cannot receive mail
+    (e.g. missing MX → Gmail 'Delivery Incomplete / timed out').
+    Returns (ok, error_message). Lookup failures do not block sending.
+    """
+    address = (email or "").strip()
+    if "@" not in address:
+        return False, f"Invalid recipient email: {address!r}"
+    domain = address.rsplit("@", 1)[-1].strip().lower()
+    if not domain or "." not in domain:
+        return False, f"Invalid recipient domain on {address}"
+
+    try:
+        import subprocess
+        import sys
+
+        if sys.platform.startswith("win"):
+            ps = (
+                f"$r = Resolve-DnsName -Name '{domain}' -Type MX -ErrorAction SilentlyContinue; "
+                f"@($r | Where-Object {{ $_.Type -eq 'MX' }}).Count"
+            )
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            count = int((completed.stdout or "0").strip().splitlines()[-1] or "0")
+        else:
+            completed = subprocess.run(
+                ["dig", "+short", "MX", domain],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            lines = [ln.strip() for ln in (completed.stdout or "").splitlines() if ln.strip()]
+            count = len(lines)
+
+        if count <= 0:
+            return False, (
+                f"Cannot deliver to {address}: domain '{domain}' has no MX records "
+                "(mail server is not configured). Fix DNS MX for that domain, or use a "
+                "recipient address on Gmail/Outlook/Yahoo. "
+                "This matches Gmail's 'Delivery Incomplete / recipient server timed out' bounce."
+            )
+        return True, ""
+    except Exception as exc:
+        logger.debug("MX lookup skipped for %s: %s", domain, exc)
+        return True, ""
 
 
 def _apply_deliverability_headers(
@@ -417,6 +475,17 @@ def _send_via_smtp(
                 "to a verified SES identity (not the SMTP username)."
             ),
         }
+
+    mx_ok, mx_error = _check_recipient_mx(to_address)
+    if not mx_ok:
+        logger.error("Recipient MX check failed for %s: %s", to_address, mx_error)
+        return {
+            "success": False,
+            "recipient_email": to_address,
+            "error": mx_error,
+            "error_code": "EMAIL_RECIPIENT_MX_MISSING",
+        }
+
     result = _send_via_smtp_relay(
         to_address,
         subject=subject,
@@ -428,7 +497,7 @@ def _send_via_smtp(
         smtp_password=SMTP_PASSWORD,
         from_address=from_mailbox,
         reply_to=smtp_reply_to_email(),
-        provider_label="SMTP",
+        provider_label="Amazon SES" if _is_ses_smtp() else "SMTP",
         cc_addresses=cc_addresses,
     )
     if not result["success"] and "authentication failed" in str(result.get("error", "")).lower():

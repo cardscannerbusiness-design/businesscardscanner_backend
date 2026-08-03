@@ -15,8 +15,10 @@ COMMON_TITLES = [
 
 # Common company suffixes
 COMPANY_SUFFIXES = [
-    "inc", "llc", "ltd", "corp", "corporation", "company", "co", "group", 
-    "holdings", "gmbh", "solutions", "technologies", "studios", "labs", "partners"
+    "inc", "llc", "ltd", "corp", "corporation", "company", "co", "group",
+    "holdings", "gmbh", "solutions", "technologies", "technology", "studios",
+    "labs", "partners", "consulting", "consultants", "pvt", "private",
+    "limited", "llp", "plc", "sa", "ag",
 ]
 
 # Valid top-level business domain suffixes for website validation
@@ -283,7 +285,17 @@ def extract_phones(lines: List[str]) -> tuple[List[str], List[str]]:
     duplicates_removed = 0
     
     for phone in phones:
-        norm = "".join(c for c in phone if c.isdigit())
+        # Preserve leading + / 00 country-code prefix exactly as OCR produced it.
+        cleaned = phone.strip()
+        if cleaned.startswith("00"):
+            cleaned = f"+{cleaned[2:]}"
+        # Collapse internal OCR spacing but keep a single space after +CC when present.
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        plus_match = re.match(r"^(\+\d{1,3})\s*(.+)$", cleaned)
+        if plus_match:
+            local_digits = re.sub(r"\D", "", plus_match.group(2))
+            cleaned = f"{plus_match.group(1)} {local_digits}" if local_digits else plus_match.group(1)
+        norm = "".join(c for c in cleaned if c.isdigit())
         is_duplicate = False
         for existing in list(seen_normalized):
             # Suffix/prefix matching (e.g. 9876543210 is suffix of +919876543210)
@@ -297,12 +309,12 @@ def extract_phones(lines: List[str]) -> tuple[List[str], List[str]]:
                     for idx, val in enumerate(unique_phones):
                         val_norm = "".join(c for c in val if c.isdigit())
                         if val_norm == existing:
-                            unique_phones[idx] = phone
+                            unique_phones[idx] = cleaned
                             break
                 break
         if not is_duplicate:
             seen_normalized.add(norm)
-            unique_phones.append(phone)
+            unique_phones.append(cleaned)
             
     if duplicates_removed > 0:
         logger.info(f"[Deduplication] Removed {duplicates_removed} duplicate phone number(s).")
@@ -422,14 +434,34 @@ def extract_address(lines: List[str]) -> tuple[str, List[str]]:
     return ("\n".join(address_list[:1]) if address_list else ""), remaining_lines
 
 def extract_company(lines: List[str], emails: List[str], websites: List[str]) -> str:
-    """Extract company name using suffixes or domain names from emails/websites."""
-    # 1. Look for explicit company suffixes
-    for line in lines:
+    """Extract company name using suffixes or domain names from emails/websites.
+
+    Multiline company names (e.g. ABC / Technologies / Private Limited) are
+    merged into a single spaced string when consecutive fragment lines sit
+    immediately above a suffix line.
+    """
+    def _line_has_company_suffix(line: str) -> bool:
         lower_line = line.lower()
-        for suffix in COMPANY_SUFFIXES:
-            if re.search(r'\b' + re.escape(suffix) + r'\b', lower_line):
-                return line
-                
+        return any(
+            re.search(r'\b' + re.escape(suffix) + r'\b', lower_line)
+            for suffix in COMPANY_SUFFIXES
+        )
+
+    # 1. Look for explicit company suffixes and merge preceding/following fragments
+    for i, line in enumerate(lines):
+        if not _line_has_company_suffix(line):
+            continue
+        # Extend forward through consecutive company fragments so
+        # "Technologies" + "Private Limited" merge into one name.
+        anchor = i
+        j = i + 1
+        while j < len(lines) and _is_company_name_fragment(lines[j]):
+            anchor = j
+            j += 1
+            if j - i >= 4:
+                break
+        return _merge_multiline_company(lines, anchor)
+
     # 2. Guess from domain name
     domain_hints = []
     for email in emails:
@@ -438,18 +470,18 @@ def extract_company(lines: List[str], emails: List[str], websites: List[str]) ->
             domain = parts[1].split('.')[0]
             if domain not in ['gmail', 'yahoo', 'hotmail', 'outlook', 'icloud']:
                 domain_hints.append(domain)
-                
+
     for website in websites:
         match = re.search(r'(?:www\.)?([a-zA-Z0-9-]+)\.', website)
         if match:
             domain_hints.append(match.group(1))
-            
+
     if domain_hints:
         hint = domain_hints[0].lower()
         # Look for a line that contains this hint
-        for line in lines:
+        for i, line in enumerate(lines):
             if hint in line.lower():
-                return line
+                return _merge_multiline_company(lines, i)
         # Fallback: humanize domain (pinnacleadvisors -> Pinnacle Advisors)
         spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", hint)
         spaced = re.sub(r"[-_]", " ", spaced)
@@ -460,13 +492,66 @@ def extract_company(lines: List[str], emails: List[str], websites: List[str]) ->
                     prefix = spaced[: -len(suffix)]
                     return f"{prefix.capitalize()} {suffix.capitalize()}"
         return " ".join(w.capitalize() for w in spaced.split())
-        
+
     # 3. Fallback: Take the first reasonably short remaining line
     for line in lines:
         if len(line.split()) <= 4:
             return line
-            
+
     return ""
+
+
+_ADDRESS_LIKE = re.compile(
+    r'\b(?:plot|plt|pin|pincode|postal|zip|road|rd|street|st|floor|colony|nagar|'
+    r'house|door|sector|block|address|avenue|lane|suite)\b|\b\d{6}\b',
+    re.IGNORECASE,
+)
+_COMPANY_FRAGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9&.'\- ]{0,40}$")
+
+
+def _is_company_name_fragment(line: str) -> bool:
+    """True for short brand/company fragment lines safe to merge."""
+    text = (line or "").strip()
+    if not text or len(text) > 45:
+        return False
+    if EMAIL_IN_LINE_REGEX.search(text) or WEBSITE_IN_LINE_REGEX.search(text):
+        return False
+    if re.search(r"\+?\d[\d\s\-().]{7,}", text):
+        return False
+    if _ADDRESS_LIKE.search(text):
+        return False
+    lower = text.lower()
+    if any(re.search(r'\b' + re.escape(title) + r'\b', lower) for title in COMMON_TITLES):
+        return False
+    if lower in INDIAN_REGIONS:
+        return False
+    words = text.split()
+    if len(words) > 5:
+        return False
+    return bool(_COMPANY_FRAGMENT.match(text))
+
+
+def _merge_multiline_company(lines: List[str], anchor_idx: int) -> str:
+    """Merge consecutive company fragment lines ending at anchor_idx into one name."""
+    if anchor_idx < 0 or anchor_idx >= len(lines):
+        return ""
+    parts = [lines[anchor_idx].strip()]
+    i = anchor_idx - 1
+    while i >= 0:
+        candidate = lines[i].strip()
+        if not _is_company_name_fragment(candidate):
+            break
+        # Stop if the fragment already contains a full company suffix alone
+        # and we already have a longer name — prefer building upward only for
+        # short brand tokens.
+        if len(candidate.split()) > 4:
+            break
+        parts.insert(0, candidate)
+        i -= 1
+        if len(parts) >= 5:
+            break
+    merged = " ".join(parts)
+    return re.sub(r"\s+", " ", merged).strip()
 
 def repair_ocr_mistakes(text: str) -> str:
     """Repair typical spacing issues and common OCR typos in emails and websites."""
@@ -914,7 +999,8 @@ def parse_business_card(raw_text: str) -> Dict[str, Any]:
     mobile_numbers, telephone_numbers = classify_phones(phones)
     social_links = extract_social_links(raw_text)
     gst_numbers = extract_tax_numbers(raw_text)
-    notes = " ".join(lines[:3]).strip() if lines else ""
+    # Notes are user-entered (voice/typed) only — never dump leftover OCR lines.
+    notes = ""
     address = address_list[0] if address_list else ""
 
     result = {
@@ -933,7 +1019,7 @@ def parse_business_card(raw_text: str) -> Dict[str, Any]:
         "socialLinks": social_links,
         "gstNumbers": gst_numbers,
         "address": address.strip(),
-        "company": company.title().strip(),
+        "company": company.strip(),
         "notes": notes,
     }
     result["confidence"] = build_confidence(result, raw_text)

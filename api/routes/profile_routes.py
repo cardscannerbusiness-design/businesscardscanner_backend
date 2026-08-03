@@ -12,7 +12,14 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from api.schemas import ChangeEmailRequest, ChangePasswordRequest, UpdateProfileRequest
+from api.schemas import (
+    ChangeEmailRequest,
+    ChangePasswordRequest,
+    DeleteAccountRequest,
+    UpdateProfileRequest,
+)
+from auth import audit_service
+from auth.constants import AUDIT_ACCOUNT_DELETED
 from auth.dependencies import get_current_user
 from auth.email_service import (
     send_data_deletion_confirmation,
@@ -230,3 +237,59 @@ def data_deletion_notice(body: DataDeletionNoticeBody, request: Request):
             else "Deletion recorded; email could not be sent."
         ),
     }
+
+
+@router.delete(
+    "/account",
+    summary="Delete own account",
+    description=(
+        "Soft-deletes the authenticated user's account, revokes all sessions/refresh tokens, "
+        "and prevents further login."
+    ),
+)
+def delete_own_account(body: DeleteAccountRequest, request: Request):
+    if not body.confirm:
+        raise HTTPException(status_code=422, detail="Set confirm=true to delete your account.")
+
+    user = get_current_user(request)
+
+    user_id = user["id"]
+    now = datetime.now(timezone.utc)
+    meta = {
+        "ip": request.client.host if request.client else "",
+        "user_agent": request.headers.get("user-agent", ""),
+    }
+
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE users
+            SET deleted_at = %s, is_active = FALSE, updated_at = %s
+            WHERE id = %s AND deleted_at IS NULL
+            RETURNING id, email
+            """,
+            (now, now, user_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Account not found.")
+
+        # Revoke active sessions and refresh tokens so the account cannot linger.
+        cur.execute(
+            "UPDATE refresh_tokens SET revoked_at = %s WHERE user_id = %s AND revoked_at IS NULL",
+            (now, user_id),
+        )
+        cur.execute(
+            "UPDATE sessions SET status = 'ended' WHERE user_id = %s AND status = 'active'",
+            (user_id,),
+        )
+
+    audit_service.log_action(
+        user_id,
+        AUDIT_ACCOUNT_DELETED,
+        ip=meta["ip"],
+        user_agent=meta["user_agent"],
+        new_value={"email": row["email"]},
+    )
+    logger.info("User self-deleted account %s", user_id)
+    return {"success": True, "message": "Account deleted."}
