@@ -203,13 +203,13 @@ async def storage_config(user: dict = Depends(get_current_user)):
                 "application/json": {
                     "example": {
                         "plan": "FREEMIUM",
-                        "storage_limit_bytes": 20971520,
-                        "used_storage_bytes": 8458240,
-                        "remaining_storage_bytes": 12513280,
+                        "storage_limit_bytes": 1048576,
+                        "used_storage_bytes": 422576,
+                        "remaining_storage_bytes": 626000,
                         "used_percentage": 40.3,
-                        "used_mb": 8.06,
-                        "limit_mb": 20.0,
-                        "remaining_mb": 11.94,
+                        "used_mb": 0.4,
+                        "limit_mb": 1.0,
+                        "remaining_mb": 0.6,
                         "can_upload": True,
                         "warning_level": "NORMAL",
                     }
@@ -226,8 +226,8 @@ async def storage_config(user: dict = Depends(get_current_user)):
                             "success": False,
                             "error": "STORAGE_LIMIT_EXCEEDED",
                             "message": "Storage limit reached. Upgrade your plan to continue.",
-                            "used_storage_bytes": 20971520,
-                            "storage_limit_bytes": 20971520,
+                            "used_storage_bytes": 1048576,
+                            "storage_limit_bytes": 1048576,
                             "image_size_bytes": 50000,
                         }
                     }

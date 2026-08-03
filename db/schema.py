@@ -204,6 +204,25 @@ SCHEMA_STATEMENTS: list[str] = [
         created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
     );
     """,
+    # ── Managed events (Super Admin Event Management) ─────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS managed_events (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name        VARCHAR(255) NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        location    VARCHAR(512) NOT NULL DEFAULT '',
+        start_date  DATE,
+        end_date    DATE,
+        status      VARCHAR(32)  NOT NULL DEFAULT 'active',
+        created_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+        updated_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+        created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        deleted_at  TIMESTAMPTZ
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_managed_events_status ON managed_events(status) WHERE deleted_at IS NULL;",
+    "CREATE INDEX IF NOT EXISTS idx_managed_events_name ON managed_events(name) WHERE deleted_at IS NULL;",
     # ── Indexes ────────────────────────────────────────────────────────────
     "CREATE INDEX IF NOT EXISTS idx_users_email        ON users(email);",
     "CREATE INDEX IF NOT EXISTS idx_users_username     ON users(username);",

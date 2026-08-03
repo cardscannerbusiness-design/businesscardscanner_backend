@@ -224,3 +224,44 @@ def send_invitation_email(
     </div>
     """
     return _send_email(to_email, subject, html)
+
+
+def send_mobile_verification_otp(to_email: str, otp_code: str, phone: str) -> dict:
+    subject = "NameCardScan — Mobile Verification Code"
+    html = f"""
+    <div style="font-family: sans-serif; max-width: 480px; margin: auto;">
+      <h2 style="color: #0891b2;">Verify Your Mobile Number</h2>
+      <p>Enter this code to verify <strong>{phone}</strong> and continue after Freemium expiry:</p>
+      <div style="background: #f1f5f9; padding: 16px; border-radius: 8px; text-align: center; margin: 16px 0;">
+        <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #0891b2;">{otp_code}</span>
+      </div>
+      <p style="color: #64748b;">This code expires in 10 minutes. Do not share it with anyone.</p>
+    </div>
+    """
+    return _send_email(to_email, subject, html)
+
+
+def send_data_deletion_confirmation(to_email: str, kind: str) -> dict:
+    """Notify the user that local or organisation data was deleted."""
+    if kind == "organisation":
+        subject = "NameCardScan — Organisation data deleted"
+        body = (
+            "Your organisation data deletion request was completed. "
+            "Contacts and related records for your workspace have been removed as requested."
+        )
+    else:
+        subject = "NameCardScan — Local data deleted"
+        body = (
+            "Your Delete My Data request was completed. "
+            "All scans stored in your local offline queue on that device have been permanently deleted."
+        )
+    html = f"""
+    <div style="font-family: sans-serif; max-width: 480px; margin: auto;">
+      <h2 style="color: #0891b2;">Deletion confirmed</h2>
+      <p>{body}</p>
+      <p style="color: #64748b; font-size: 12px; margin-top: 16px;">
+        If you did not request this action, contact support immediately.
+      </p>
+    </div>
+    """
+    return _send_email(to_email, subject, html)
