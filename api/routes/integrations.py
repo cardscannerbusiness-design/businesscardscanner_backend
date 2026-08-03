@@ -8,6 +8,7 @@ from api.outreach import (
     body_to_outreach_contact,
     email_response,
     is_online_mode,
+    run_post_save_outreach,
     schedule_outreach_for_contact,
     whatsapp_response,
 )
@@ -237,15 +238,28 @@ async def test_email_message(
 @router.post("/api/outreach/thank-you", summary="Send thank-you after review save")
 async def send_thank_you_outreach(body: LocalContactBody, request: Request):
     try:
-        contact = body_to_outreach_contact(body)
-        whatsapp_result, email_result = await schedule_outreach_for_contact(
-            contact,
-            online_mode=is_online_mode(body.connectionMode),
-            contact_id=None,
-            skip_whatsapp=body.skipWhatsApp,
-            skip_email=body.skipEmail,
-            scanner_email=get_receive_email_from_request(request),
-        )
+        contact_id = str(body.contactId or "").strip() or None
+        scanner_email = get_receive_email_from_request(request)
+
+        if contact_id:
+            # Resend / post-edit: use stored contact (updated fields) and persist delivery.
+            whatsapp_result, email_result = await run_post_save_outreach(
+                contact_id=contact_id,
+                skip_whatsapp=body.skipWhatsApp,
+                skip_email=body.skipEmail,
+                log_context="thank-you-resend",
+                scanner_email=scanner_email,
+            )
+        else:
+            contact = body_to_outreach_contact(body)
+            whatsapp_result, email_result = await schedule_outreach_for_contact(
+                contact,
+                online_mode=is_online_mode(body.connectionMode),
+                contact_id=None,
+                skip_whatsapp=body.skipWhatsApp,
+                skip_email=body.skipEmail,
+                scanner_email=scanner_email,
+            )
         return {
             "success": True,
             **whatsapp_response(whatsapp_result),

@@ -116,6 +116,9 @@ class LocalContactBody(BaseModel):
     connectionMode: str = "online"
     skipWhatsApp: bool = False
     skipEmail: bool = False
+    # When set on /api/outreach/thank-you, load + persist delivery on this contact
+    # (resend / post-edit). Does not create a new contact.
+    contactId: str | None = None
     # Scan metadata — not persisted in PostgreSQL; forwarded to the
     # Google Sheets reporting sync when configured.
     ocrEngine: str = ""
