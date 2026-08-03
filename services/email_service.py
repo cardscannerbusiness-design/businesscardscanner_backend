@@ -88,11 +88,17 @@ SMTP_HOST = _normalize_env(os.getenv("SMTP_HOST")) or DEFAULT_SMTP_HOST
 SMTP_PORT = int(_normalize_env(os.getenv("SMTP_PORT")) or str(DEFAULT_SMTP_PORT))
 SMTP_USER = _normalize_env(os.getenv("SMTP_USER")) or GMAIL_USER
 SMTP_PASSWORD = _normalize_gmail_app_password(os.getenv("SMTP_PASSWORD")) or GMAIL_APP_PASSWORD
+SMTP_FROM = _normalize_env(os.getenv("SMTP_FROM"))
 
 BUSINESS_COMPANY_NAME = _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan"
 BUSINESS_PHONE = _normalize_env(os.getenv("BUSINESS_PHONE")) or ""
 BUSINESS_WEBSITE = _normalize_env(os.getenv("BUSINESS_WEBSITE")) or ""
-BUSINESS_EMAIL = _normalize_env(os.getenv("BUSINESS_EMAIL")) or SMTP_USER
+# Prefer a real mailbox identity. Never fall back to SES SMTP usernames (AKIA...).
+BUSINESS_EMAIL = (
+    _normalize_env(os.getenv("BUSINESS_EMAIL"))
+    or SMTP_FROM
+    or (SMTP_USER if "@" in (SMTP_USER or "") else "")
+)
 BUSINESS_EVENT_NAME = (
     _normalize_env(os.getenv("BUSINESS_EVENT_NAME")) or "the exhibition"
 )
@@ -128,14 +134,26 @@ def is_gmail_configured() -> bool:
     return is_smtp_configured()
 
 
+def _looks_like_email(value: str | None) -> bool:
+    text = str(value or "").strip()
+    return "@" in text and " " not in text
+
+
 def smtp_sender_email() -> str:
-    """Authenticated mailbox for the From header — must match SMTP login (Gmail requirement)."""
-    return SMTP_USER or BUSINESS_EMAIL
+    """Address used for From / MAIL FROM.
+
+    Gmail SMTP: SMTP_USER is the mailbox and must be the From address.
+    Amazon SES SMTP: SMTP_USER is an IAM access key (AKIA...) — From must be a
+    verified identity from SMTP_FROM / BUSINESS_EMAIL.
+    """
+    if _looks_like_email(SMTP_USER):
+        return SMTP_USER
+    return SMTP_FROM or BUSINESS_EMAIL or ""
 
 
 def smtp_reply_to_email() -> str:
     """Public reply address; may differ from the authenticated From mailbox."""
-    return BUSINESS_EMAIL or SMTP_USER
+    return BUSINESS_EMAIL or SMTP_FROM or smtp_sender_email()
 
 
 def receive_inbox_email() -> str | None:
@@ -289,9 +307,19 @@ def _send_via_smtp_relay(
     if cc_invalid:
         result["cc_invalid"] = cc_invalid
 
-    # From MUST be the authenticated mailbox. Spoofing BUSINESS_EMAIL via Gmail SMTP
-    # is a common cause of "Message blocked" (spam / policy) for Yahoo/Outlook recipients.
-    authenticated_from = smtp_user or from_address
+    # Gmail requires From == authenticated mailbox. SES SMTP usernames are not emails —
+    # use the verified From identity passed in from_address instead.
+    if _looks_like_email(smtp_user):
+        authenticated_from = smtp_user
+    else:
+        authenticated_from = from_address or smtp_user
+    if not _looks_like_email(authenticated_from):
+        result["error"] = (
+            "Invalid MAIL FROM address. For Amazon SES set SMTP_FROM or BUSINESS_EMAIL "
+            "to a verified identity (e.g. ratetourezee@ulacab.com). "
+            f"Got: {authenticated_from!r}"
+        )
+        return result
     message = EmailMessage()
     message["Subject"] = subject
     message["From"] = _format_from_address(authenticated_from)
@@ -378,8 +406,17 @@ def _send_via_smtp(
             "recipient_email": to_address,
             "error": "SMTP is not configured. Set GMAIL_USER + GMAIL_APP_PASSWORD (or SMTP_USER + SMTP_PASSWORD) in .env.",
         }
-    # Authenticated mailbox only — never put BUSINESS_EMAIL in From when using Gmail SMTP.
-    auth_mailbox = SMTP_USER
+    # Prefer verified From identity (SES) or Gmail mailbox when SMTP_USER is an email.
+    from_mailbox = smtp_sender_email()
+    if not _looks_like_email(from_mailbox):
+        return {
+            "success": False,
+            "recipient_email": to_address,
+            "error": (
+                "Email From address is not configured. Set SMTP_FROM or BUSINESS_EMAIL "
+                "to a verified SES identity (not the SMTP username)."
+            ),
+        }
     result = _send_via_smtp_relay(
         to_address,
         subject=subject,
@@ -389,7 +426,7 @@ def _send_via_smtp(
         smtp_port=SMTP_PORT,
         smtp_user=SMTP_USER,
         smtp_password=SMTP_PASSWORD,
-        from_address=auth_mailbox,
+        from_address=from_mailbox,
         reply_to=smtp_reply_to_email(),
         provider_label="SMTP",
         cc_addresses=cc_addresses,
