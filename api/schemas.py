@@ -250,3 +250,25 @@ class UpdateProfileRequest(BaseModel):
     first_name: str | None = None
     last_name: str | None = None
     phone: str | None = None
+
+
+class DeleteAccountRequest(BaseModel):
+    confirm: bool = Field(..., description="Must be true to delete the account.")
+
+
+class CreateManagedEventRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    description: str = ""
+    location: str = ""
+    start_date: str | None = None
+    end_date: str | None = None
+    status: str = Field(default="active", pattern="^(active|inactive|completed)$")
+
+
+class UpdateManagedEventRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = None
+    location: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    status: str | None = Field(default=None, pattern="^(active|inactive|completed)$")

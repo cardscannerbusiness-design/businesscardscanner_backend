@@ -28,7 +28,7 @@ DEFAULT_SMTP_HOST = "smtp.gmail.com"
 DEFAULT_SMTP_PORT = 587
 
 # Neutral subject — marketing/salesy subjects raise Gmail/Yahoo spam scores.
-SUBJECT = "Nice meeting you — Name Card Scan"
+SUBJECT = "Thank You for Meeting Us — Name Card Scan"
 CC_SCANNED_SUBJECT_PREFIX = "Scanned contact:"
 
 _SPAM_BLOCK_HINT = (
@@ -129,9 +129,9 @@ def is_smtp_configured() -> bool:
     return bool(SMTP_USER and SMTP_PASSWORD)
 
 
-# Backward-compatible alias — SMTP is the only transport now.
-def is_gmail_configured() -> bool:
-    return is_smtp_configured()
+def _is_ses_smtp() -> bool:
+    host = (SMTP_HOST or "").lower()
+    return "amazonaws.com" in host or host.startswith("email-smtp.")
 
 
 def _looks_like_email(value: str | None) -> bool:
@@ -154,6 +154,10 @@ def smtp_sender_email() -> str:
 def smtp_reply_to_email() -> str:
     """Public reply address; may differ from the authenticated From mailbox."""
     return BUSINESS_EMAIL or SMTP_FROM or smtp_sender_email()
+
+
+def is_gmail_configured() -> bool:
+    return is_smtp_configured()
 
 
 def receive_inbox_email() -> str | None:
@@ -217,6 +221,60 @@ def _looks_like_spam_block(exc: BaseException | str) -> bool:
         "content-filter",
     )
     return any(marker in text for marker in markers)
+
+
+def _check_recipient_mx(email: str) -> tuple[bool, str]:
+    """
+    Best-effort MX check so we fail fast when a domain cannot receive mail
+    (e.g. missing MX → Gmail 'Delivery Incomplete / timed out').
+    Returns (ok, error_message). Lookup failures do not block sending.
+    """
+    address = (email or "").strip()
+    if "@" not in address:
+        return False, f"Invalid recipient email: {address!r}"
+    domain = address.rsplit("@", 1)[-1].strip().lower()
+    if not domain or "." not in domain:
+        return False, f"Invalid recipient domain on {address}"
+
+    try:
+        import subprocess
+        import sys
+
+        if sys.platform.startswith("win"):
+            ps = (
+                f"$r = Resolve-DnsName -Name '{domain}' -Type MX -ErrorAction SilentlyContinue; "
+                f"@($r | Where-Object {{ $_.Type -eq 'MX' }}).Count"
+            )
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            count = int((completed.stdout or "0").strip().splitlines()[-1] or "0")
+        else:
+            completed = subprocess.run(
+                ["dig", "+short", "MX", domain],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            lines = [ln.strip() for ln in (completed.stdout or "").splitlines() if ln.strip()]
+            count = len(lines)
+
+        if count <= 0:
+            return False, (
+                f"Cannot deliver to {address}: domain '{domain}' has no MX records "
+                "(mail server is not configured). Fix DNS MX for that domain, or use a "
+                "recipient address on Gmail/Outlook/Yahoo. "
+                "This matches Gmail's 'Delivery Incomplete / recipient server timed out' bounce."
+            )
+        return True, ""
+    except Exception as exc:
+        logger.debug("MX lookup skipped for %s: %s", domain, exc)
+        return True, ""
 
 
 def _apply_deliverability_headers(
@@ -417,6 +475,17 @@ def _send_via_smtp(
                 "to a verified SES identity (not the SMTP username)."
             ),
         }
+
+    mx_ok, mx_error = _check_recipient_mx(to_address)
+    if not mx_ok:
+        logger.error("Recipient MX check failed for %s: %s", to_address, mx_error)
+        return {
+            "success": False,
+            "recipient_email": to_address,
+            "error": mx_error,
+            "error_code": "EMAIL_RECIPIENT_MX_MISSING",
+        }
+
     result = _send_via_smtp_relay(
         to_address,
         subject=subject,
@@ -428,7 +497,7 @@ def _send_via_smtp(
         smtp_password=SMTP_PASSWORD,
         from_address=from_mailbox,
         reply_to=smtp_reply_to_email(),
-        provider_label="SMTP",
+        provider_label="Amazon SES" if _is_ses_smtp() else "SMTP",
         cc_addresses=cc_addresses,
     )
     if not result["success"] and "authentication failed" in str(result.get("error", "")).lower():
@@ -514,24 +583,56 @@ def _greeting_name(recipient_name: str | None) -> str:
     return name.split()[0] if name else "Valued Customer"
 
 
-def build_thank_you_email_plain(recipient_name: str | None = None) -> str:
+def _resolve_event_name(event_name: str | None = None, contact: dict[str, Any] | None = None) -> str:
+    """Prefer the contact's eventName; fall back to BUSINESS_EVENT_NAME."""
+    for candidate in (
+        event_name,
+        (contact or {}).get("eventName"),
+        (contact or {}).get("event_name"),
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return BUSINESS_EVENT_NAME or "the exhibition"
+
+
+def build_thank_you_email_plain(
+    recipient_name: str | None = None,
+    *,
+    event_name: str | None = None,
+) -> str:
     """Build the plain-text fallback for the business thank-you email."""
     greeting = _greeting_name(recipient_name)
-    event_name = BUSINESS_EVENT_NAME
-    reply = smtp_reply_to_email() or "dhana@ulavitech.com"
+    resolved_event = _resolve_event_name(event_name)
     return (
         f"Hi {greeting},\n\n"
-        f"It was a pleasure meeting you at {event_name}.\n\n"
-        "I'm Dhana, founder of Name Card Scan (NCS). We help teams turn exhibition "
-        "contacts into timely follow-ups — scan cards, capture details, and share your "
-        "introduction, brochure, and CRM updates without manual re-entry.\n\n"
-        f"Brochure: {_pdf_download_href()}\n\n"
-        f"If you'd like a short walkthrough, just reply to this email ({reply}) "
-        "or call +91 8838747273 / +65 97310793.\n\n"
+        f"Dhana here. It was great meeting you at {resolved_event}.\n\n"
+        "Quick question: After collecting business cards, how many prospects "
+        "actually become customers?\n\n"
+        "Most businesses at exhibitions and events struggle with:\n"
+        "- Delayed follow-ups\n"
+        "- Poor brand recall\n"
+        "- Manual business card data entry\n"
+        "- No clear Return on Exhibition Spend (ROES)\n\n"
+        "That's why we built Name Card Scan (NCS).\n\n"
+        "With NCS, you can:\n"
+        "- Scan or upload business cards\n"
+        "- Instantly capture contact details\n"
+        "- Automatically send your WhatsApp & Email introduction, digital business "
+        "card, brochures (PDF) and videos\n"
+        "- Store all data in Google Drive\n"
+        "- Push leads directly to Zoho CRM via API\n\n"
+        "NCS helps you engage prospects while your brand is still fresh in their minds.\n"
+        "ROES = Prospect → Qualified Lead → Sale → Customer\n\n"
+        f"Brochure: {_pdf_download_href()}\n"
+        "Video: https://api.namecardscan.com/assets/Promo.mp4\n\n"
+        "For any enquiries:\n"
+        "India: +91 88387 47273\n"
+        "Singapore: +65 9731 0793\n"
+        "Email: dhana@ulavitech.com\n\n"
         "Regards,\n"
         "Dhana\n"
-        "Founder, Name Card Scan\n"
-        f"{reply}\n"
+        "Founder, Name Card Scan.\n"
     )
 
 
@@ -572,7 +673,11 @@ def _contact_detail_rows() -> str:
     return "\n".join(rows)
 
 
-def build_thank_you_email_html(recipient_name: str | None = None) -> str:
+def build_thank_you_email_html(
+    recipient_name: str | None = None,
+    *,
+    event_name: str | None = None,
+) -> str:
     """Build a table-based HTML email body compatible with major email clients."""
     reply_addr = smtp_reply_to_email() or GMAIL_USER or ""
     context = thank_you_email_context(
@@ -591,16 +696,20 @@ def build_thank_you_email_html(recipient_name: str | None = None) -> str:
         brand_border=_BRAND_BORDER,
         pdf_download_href=_pdf_download_href(),
         assets_base=_assets_base(),
-        event_name=BUSINESS_EVENT_NAME,
+        event_name=_resolve_event_name(event_name),
     )
     return render_thank_you_email_html(context)
 
 
-def build_thank_you_email_body(recipient_name: str | None = None) -> tuple[str, str]:
+def build_thank_you_email_body(
+    recipient_name: str | None = None,
+    *,
+    event_name: str | None = None,
+) -> tuple[str, str]:
     """Return (plain_text, html) bodies for the business thank-you email."""
     return (
-        build_thank_you_email_plain(recipient_name),
-        build_thank_you_email_html(recipient_name),
+        build_thank_you_email_plain(recipient_name, event_name=event_name),
+        build_thank_you_email_html(recipient_name, event_name=event_name),
     )
 
 
@@ -795,7 +904,10 @@ def send_business_thank_you_email(
         result["error"] = error
         return result
 
-    plain_body, html_body = build_thank_you_email_body(recipient_name)
+    plain_body, html_body = build_thank_you_email_body(
+        recipient_name,
+        event_name=_resolve_event_name(contact=contact),
+    )
     provider = get_email_provider()
     cc_list, cc_invalid = _prepare_cc_addresses(cc_addresses, to_address=to_address)
     result["cc_emails"] = cc_list
