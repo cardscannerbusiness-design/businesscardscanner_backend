@@ -210,8 +210,10 @@ def extract_phones(lines: List[str]) -> tuple[List[str], List[str]]:
     phones = []
     remaining_lines = []
     
-    # A broad international and domestic phone number pattern
-    phone_pattern = re.compile(r'(?:(?:\+|00)\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}(?:[\s.-]?\d{2,4})?')
+    # A broad international and domestic phone number pattern (keeps final digits).
+    phone_pattern = re.compile(
+        r'(?:(?:\+|00)\d{1,3}[\s.-]?)?(?:\(?\d{2,5}\)?[\s.-]?)?\d{3,5}[\s.-]?\d{3,5}(?:[\s.-]?\d{1,5})?'
+    )
     address_context = re.compile(
         r'\b(?:plot|plt|pin|pincode|postal|zip|road|rd|street|st|floor|colony|nagar|'
         r'house|door|sector|block|mouza|address)\b|,\s*\w+.*(pin|india)|\b\d{6}\b',
@@ -220,7 +222,7 @@ def extract_phones(lines: List[str]) -> tuple[List[str], List[str]]:
 
     def collapse_digit_spaces(text: str) -> str:
         """Ignore formatting spaces between digits so spaced OCR phones keep all digits."""
-        return re.sub(r'(\d)[\s.]+(?=\d)', r'\1', text)
+        return re.sub(r'(\d)[\s.\-]+(?=\d)', r'\1', text)
 
     def normalize_phone_digits(phone: str) -> str:
         """Preserve digits only; keep leading + / 00 country-code marker unchanged in spirit."""
@@ -439,6 +441,9 @@ def extract_company(lines: List[str], emails: List[str], websites: List[str]) ->
     Multiline company names (e.g. ABC / Technologies / Private Limited) are
     merged into a single spaced string when consecutive fragment lines sit
     immediately above a suffix line.
+
+    OCR text with printed spaces is preferred. Domain inference is a last resort
+    only when OCR yields no usable company line.
     """
     def _line_has_company_suffix(line: str) -> bool:
         lower_line = line.lower()
@@ -462,7 +467,13 @@ def extract_company(lines: List[str], emails: List[str], websites: List[str]) ->
                 break
         return _merge_multiline_company(lines, anchor)
 
-    # 2. Guess from domain name
+    # 2. Prefer spaced OCR brand lines before domain inference
+    for i, line in enumerate(lines):
+        text = (line or "").strip()
+        if " " in text and _is_company_name_fragment(text) and len(text) >= 4:
+            return _merge_multiline_company(lines, i)
+
+    # 3. Guess from domain name only when OCR completely failed
     domain_hints = []
     for email in emails:
         parts = email.split('@')
@@ -478,22 +489,22 @@ def extract_company(lines: List[str], emails: List[str], websites: List[str]) ->
 
     if domain_hints:
         hint = domain_hints[0].lower()
-        # Look for a line that contains this hint
+        # Prefer an OCR line that contains this hint (keeps printed spaces)
         for i, line in enumerate(lines):
-            if hint in line.lower():
+            compact = re.sub(r'\s+', '', line.lower())
+            if hint in compact or hint in line.lower():
                 return _merge_multiline_company(lines, i)
         # Fallback: humanize domain (pinnacleadvisors -> Pinnacle Advisors)
         spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", hint)
         spaced = re.sub(r"[-_]", " ", spaced)
         if spaced.isalpha() and len(spaced) > 6:
-            # Split camelCase-like runs: pinnacleadvisors -> try word split via common suffixes
             for suffix in ("advisors", "solutions", "technologies", "consulting", "group", "labs", "studio"):
                 if spaced.endswith(suffix) and len(spaced) > len(suffix):
                     prefix = spaced[: -len(suffix)]
                     return f"{prefix.capitalize()} {suffix.capitalize()}"
         return " ".join(w.capitalize() for w in spaced.split())
 
-    # 3. Fallback: Take the first reasonably short remaining line
+    # 4. Fallback: Take the first reasonably short remaining line
     for line in lines:
         if len(line.split()) <= 4:
             return line
