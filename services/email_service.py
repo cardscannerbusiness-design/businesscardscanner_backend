@@ -721,22 +721,59 @@ def _contact_field(contact: dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _format_phone_with_country(phone: str, country_code: str = "") -> str:
+    """Format phone for email display as ``+91 9876543210`` (country code + local)."""
+    raw = str(phone or "").strip()
+    if not raw:
+        return ""
+    digits = "".join(c for c in raw if c.isdigit())
+    if not digits:
+        return ""
+    cc_digits = "".join(c for c in str(country_code or "") if c.isdigit())
+    has_plus = raw.startswith("+") or raw.startswith("00") or raw.startswith("(+")
+
+    if has_plus and not cc_digits:
+        # Keep a readable space after a short international prefix when possible.
+        for n in (3, 2, 1):
+            if len(digits) > n + 6:
+                return f"+{digits[:n]} {digits[n:]}"
+        return f"+{digits}"
+
+    if cc_digits:
+        local = digits
+        if local.startswith(cc_digits) and len(local) > len(cc_digits):
+            local = local[len(cc_digits) :]
+        return f"+{cc_digits} {local}"
+
+    return digits
+
+
 def _scanned_contact_detail_rows(contact: dict[str, Any]) -> str:
     """Build table rows for the CC scanned-contact template."""
     rows_spec: list[tuple[str, str]] = []
-    field_map: list[tuple[str, tuple[str, ...]]] = [
-        ("Name", ("fullName", "name")),
-        ("Email", ("email", "emailAddress")),
-        ("Phone", ("phone",)),
-        ("Company", ("company", "companyName")),
-        ("Title", ("designation", "title")),
-        ("Event", ("eventName",)),
-        ("Website", ("website", "secondaryWebsite")),
-        ("Address", ("address", "secondaryAddress")),
-        ("Notes", ("notes",)),
+    country_code = _contact_field(contact, "countryCode", "country_code")
+    primary_phone = _format_phone_with_country(
+        _contact_field(contact, "phone", "phoneNumber"),
+        country_code,
+    )
+    secondary_phone = _format_phone_with_country(
+        _contact_field(contact, "secondaryPhone", "secondaryPhoneNumber"),
+        country_code,
+    )
+    field_map: list[tuple[str, str]] = [
+        ("Name", _contact_field(contact, "fullName", "name")),
+        ("Email", _contact_field(contact, "email", "emailAddress")),
+        ("Phone", primary_phone),
+        ("Secondary Phone", secondary_phone),
+        ("Secondary Email", _contact_field(contact, "secondaryEmail", "secondaryEmailAddress")),
+        ("Company", _contact_field(contact, "company", "companyName")),
+        ("Title", _contact_field(contact, "designation", "title")),
+        ("Event", _contact_field(contact, "eventName")),
+        ("Website", _contact_field(contact, "website", "secondaryWebsite")),
+        ("Address", _contact_field(contact, "address", "secondaryAddress")),
+        ("Notes", _contact_field(contact, "notes")),
     ]
-    for label, keys in field_map:
-        value = _contact_field(contact, *keys)
+    for label, value in field_map:
         if value:
             rows_spec.append((label, value))
 
@@ -783,10 +820,16 @@ def build_cc_scanned_contact_body(contact: dict[str, Any]) -> tuple[str, str]:
     )
     html_body = render_cc_scanned_contact_email_html(context)
 
+    country_code = _contact_field(contact, "countryCode", "country_code")
     plain_lines = [f"{label}: {value}" for label, value in [
         ("Name", _contact_field(contact, "fullName", "name")),
         ("Email", _contact_field(contact, "email", "emailAddress")),
-        ("Phone", _contact_field(contact, "phone")),
+        ("Phone", _format_phone_with_country(_contact_field(contact, "phone", "phoneNumber"), country_code)),
+        ("Secondary Phone", _format_phone_with_country(
+            _contact_field(contact, "secondaryPhone", "secondaryPhoneNumber"),
+            country_code,
+        )),
+        ("Secondary Email", _contact_field(contact, "secondaryEmail", "secondaryEmailAddress")),
         ("Company", _contact_field(contact, "company", "companyName")),
         ("Title", _contact_field(contact, "designation", "title")),
         ("Event", _contact_field(contact, "eventName")),
