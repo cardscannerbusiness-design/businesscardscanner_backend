@@ -402,6 +402,20 @@ SCHEMA_STATEMENTS: list[str] = [
     "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS company_phone VARCHAR(64) NOT NULL DEFAULT '';",
     "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS company_email VARCHAR(255) NOT NULL DEFAULT '';",
     "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS company_website VARCHAR(255) NOT NULL DEFAULT '';",
+    # ── Per-Admin CMS env settings (Super Admin manages; one row per ADMIN user) ──
+    """
+    CREATE TABLE IF NOT EXISTS admin_env_settings (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        admin_user_id   UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+        whatsapp        JSONB NOT NULL DEFAULT '{}'::jsonb,
+        email           JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_by      UUID REFERENCES users(id) ON DELETE SET NULL,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_admin_env_settings_admin ON admin_env_settings(admin_user_id);",
+    "ALTER TABLE admin_env_settings ADD COLUMN IF NOT EXISTS templates JSONB NOT NULL DEFAULT '{}'::jsonb;",
 ]
 
 

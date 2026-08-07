@@ -126,7 +126,59 @@ def _auto_send_enabled() -> bool:
 
 
 def is_smtp_configured() -> bool:
+    from services.admin_runtime_config import runtime_email
+
+    em = runtime_email()
+    if em:
+        user = str(em.get("smtp_user") or em.get("smtp_username") or "").strip()
+        password = str(em.get("smtp_password") or "").strip()
+        if user and password:
+            return True
     return bool(SMTP_USER and SMTP_PASSWORD)
+
+
+def _active_smtp() -> dict[str, Any]:
+    """SMTP settings: CMS Admin override when complete, else global .env."""
+    from services.admin_runtime_config import runtime_email
+
+    em = runtime_email()
+    if em:
+        user = str(em.get("smtp_user") or em.get("smtp_username") or "").strip()
+        password = str(em.get("smtp_password") or "").strip()
+        if user and password:
+            host = str(em.get("smtp_host") or "").strip() or SMTP_HOST
+            port_raw = str(em.get("smtp_port") or "").strip()
+            try:
+                port = int(port_raw) if port_raw else SMTP_PORT
+            except ValueError:
+                port = SMTP_PORT
+            sender = str(em.get("smtp_from") or em.get("sender_email") or "").strip()
+            if not sender and _looks_like_email(user):
+                sender = user
+            if not sender:
+                sender = SMTP_FROM or BUSINESS_EMAIL or ""
+            reply = sender or BUSINESS_EMAIL or SMTP_FROM or ""
+            name = BUSINESS_COMPANY_NAME
+            return {
+                "host": host,
+                "port": port,
+                "user": user,
+                "password": password,
+                "from": sender,
+                "reply": reply,
+                "name": name,
+            }
+
+    from_mailbox = SMTP_USER if _looks_like_email(SMTP_USER) else (SMTP_FROM or BUSINESS_EMAIL or "")
+    return {
+        "host": SMTP_HOST,
+        "port": SMTP_PORT,
+        "user": SMTP_USER,
+        "password": SMTP_PASSWORD,
+        "from": from_mailbox,
+        "reply": BUSINESS_EMAIL or SMTP_FROM or from_mailbox,
+        "name": BUSINESS_COMPANY_NAME,
+    }
 
 
 def _is_ses_smtp() -> bool:
@@ -145,15 +197,14 @@ def smtp_sender_email() -> str:
     Gmail SMTP: SMTP_USER is the mailbox and must be the From address.
     Amazon SES SMTP: SMTP_USER is an IAM access key (AKIA...) — From must be a
     verified identity from SMTP_FROM / BUSINESS_EMAIL.
+    CMS Admin email env overrides when active.
     """
-    if _looks_like_email(SMTP_USER):
-        return SMTP_USER
-    return SMTP_FROM or BUSINESS_EMAIL or ""
+    return str(_active_smtp().get("from") or "")
 
 
 def smtp_reply_to_email() -> str:
     """Public reply address; may differ from the authenticated From mailbox."""
-    return BUSINESS_EMAIL or SMTP_FROM or smtp_sender_email()
+    return str(_active_smtp().get("reply") or "") or smtp_sender_email()
 
 
 def is_gmail_configured() -> bool:
@@ -194,7 +245,7 @@ def get_email_provider() -> str | None:
 
 
 def _format_from_address(email: str, name: str | None = None) -> str:
-    display = (name or BUSINESS_COMPANY_NAME or "").strip()
+    display = (name or str(_active_smtp().get("name") or "") or BUSINESS_COMPANY_NAME or "").strip()
     if display and email:
         return formataddr((display, email))
     return email
@@ -486,18 +537,23 @@ def _send_via_smtp(
             "error_code": "EMAIL_RECIPIENT_MX_MISSING",
         }
 
+    smtp = _active_smtp()
+    from_mailbox = str(smtp.get("from") or from_mailbox)
+    host = str(smtp.get("host") or SMTP_HOST)
     result = _send_via_smtp_relay(
         to_address,
         subject=subject,
         plain_body=plain_body,
         html_body=html_body,
-        smtp_host=SMTP_HOST,
-        smtp_port=SMTP_PORT,
-        smtp_user=SMTP_USER,
-        smtp_password=SMTP_PASSWORD,
+        smtp_host=host,
+        smtp_port=int(smtp.get("port") or SMTP_PORT),
+        smtp_user=str(smtp.get("user") or ""),
+        smtp_password=str(smtp.get("password") or ""),
         from_address=from_mailbox,
-        reply_to=smtp_reply_to_email(),
-        provider_label="Amazon SES" if _is_ses_smtp() else "SMTP",
+        reply_to=str(smtp.get("reply") or smtp_reply_to_email()),
+        provider_label=(
+            "Amazon SES" if ("amazonaws.com" in host.lower() or host.lower().startswith("email-smtp.")) else "SMTP"
+        ),
         cc_addresses=cc_addresses,
     )
     if not result["success"] and "authentication failed" in str(result.get("error", "")).lower():
@@ -673,17 +729,64 @@ def _contact_detail_rows() -> str:
     return "\n".join(rows)
 
 
+def _cms_email_subject(
+    recipient_name: str | None = None,
+    *,
+    contact: dict[str, Any] | None = None,
+) -> str:
+    from services.admin_runtime_config import runtime_email, runtime_templates
+    from services.template_token_service import apply_numbered_tokens, resolve_token_values
+
+    tpl = runtime_templates() or {}
+    raw = str(tpl.get("email_subject") or "").strip()
+    if not raw:
+        return SUBJECT
+
+    smtp = _active_smtp()
+    em = runtime_email() or {}
+    sender = str(em.get("sender_name") or smtp.get("name") or BUSINESS_COMPANY_NAME or "Team")
+    token_values = resolve_token_values(contact, tpl, sender_name=sender)
+    if "1" not in token_values and recipient_name:
+        token_values["1"] = _greeting_name(recipient_name)
+
+    rendered = apply_numbered_tokens(raw, token_values)
+    return (
+        rendered.replace("{{GREETING}}", _greeting_name(recipient_name))
+        .replace("{{COMPANY}}", BUSINESS_COMPANY_NAME)
+    )
+
+
 def build_thank_you_email_html(
     recipient_name: str | None = None,
     *,
     event_name: str | None = None,
+    contact: dict[str, Any] | None = None,
 ) -> str:
     """Build a table-based HTML email body compatible with major email clients."""
+    from services.admin_runtime_config import runtime_email, runtime_templates
+    from services.template_token_service import resolve_token_values
+
     reply_addr = smtp_reply_to_email() or GMAIL_USER or ""
+    tpl = runtime_templates() or {}
+    em = runtime_email() or {}
+    body_html = str(tpl.get("email_body") or "").strip()
+    smtp = _active_smtp()
+    sign_off = str(em.get("sender_name") or smtp.get("name") or "").strip() or BUSINESS_COMPANY_NAME
+
+    phone = ""
+    email_addr = ""
+    website = ""
+    if contact:
+        phone = str(contact.get("phone") or contact.get("phoneNumber") or "").strip()
+        email_addr = str(contact.get("email") or contact.get("emailAddress") or "").strip()
+        website = str(contact.get("website") or contact.get("url") or "").strip()
+
+    token_values = resolve_token_values(contact, tpl, sender_name=sign_off)
+
     context = thank_you_email_context(
-        greeting=_greeting_name(recipient_name),
+        greeting=_greeting_name(recipient_name or token_values.get("1")),
         company=BUSINESS_COMPANY_NAME,
-        subject=SUBJECT,
+        subject=_cms_email_subject(recipient_name, contact=contact),
         reply_href=f"mailto:{reply_addr}",
         contact_rows=_contact_detail_rows(),
         year=time.strftime("%Y"),
@@ -696,7 +799,13 @@ def build_thank_you_email_html(
         brand_border=_BRAND_BORDER,
         pdf_download_href=_pdf_download_href(),
         assets_base=_assets_base(),
-        event_name=_resolve_event_name(event_name),
+        event_name=_resolve_event_name(event_name, contact=contact),
+        body_html=body_html,
+        phone=phone,
+        email=email_addr,
+        website=website,
+        sign_off_name=sign_off,
+        numbered_tokens=token_values,
     )
     return render_thank_you_email_html(context)
 
@@ -705,11 +814,12 @@ def build_thank_you_email_body(
     recipient_name: str | None = None,
     *,
     event_name: str | None = None,
+    contact: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Return (plain_text, html) bodies for the business thank-you email."""
     return (
         build_thank_you_email_plain(recipient_name, event_name=event_name),
-        build_thank_you_email_html(recipient_name, event_name=event_name),
+        build_thank_you_email_html(recipient_name, event_name=event_name, contact=contact),
     )
 
 
@@ -907,7 +1017,10 @@ def send_business_thank_you_email(
     plain_body, html_body = build_thank_you_email_body(
         recipient_name,
         event_name=_resolve_event_name(contact=contact),
+        contact=contact,
     )
+    subject = _cms_email_subject(recipient_name, contact=contact)
+    result["subject"] = subject
     provider = get_email_provider()
     cc_list, cc_invalid = _prepare_cc_addresses(cc_addresses, to_address=to_address)
     result["cc_emails"] = cc_list
@@ -918,12 +1031,12 @@ def send_business_thank_you_email(
         provider,
         _redact_email(to_address),
         [_redact_email(e) for e in cc_list] or "(none)",
-        SUBJECT,
+        subject,
     )
 
     delivery = _deliver_email(
         to_address,
-        subject=SUBJECT,
+        subject=subject,
         plain_body=plain_body,
         html_body=html_body,
         cc_addresses=None,
@@ -1048,7 +1161,7 @@ async def schedule_email_for_contact(
         logger.warning("Email auto-send skipped: SMTP is not configured.")
         skipped["error"] = (
             "Email is not configured. Set GMAIL_USER + GMAIL_APP_PASSWORD "
-            "(or SMTP_USER + SMTP_PASSWORD) in .env."
+            "(or SMTP_USER + SMTP_PASSWORD) in .env, or configure CMS Admin Email env."
         )
         return skipped
 
@@ -1060,7 +1173,8 @@ async def schedule_email_for_contact(
             logger.info("Email auto-send skipped: already sent for contact %s.", contact_id)
             skipped["attempted"] = True
             skipped["sent"] = True
-            skipped["error"] = None
+            skipped["skipped"] = True
+            skipped["error"] = "already sent"
             skipped["extracted_email"] = extract_primary_email(existing) or None
             return skipped
 

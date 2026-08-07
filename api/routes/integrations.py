@@ -22,7 +22,7 @@ from api.schemas import (
     WhatsAppTestRequest,
 )
 from auth.constants import ROLE_ADMIN, ROLE_SUPER_ADMIN
-from auth.dependencies import require_role
+from auth.dependencies import get_current_user, require_role
 from services.email_service import email_queue, is_email_configured, send_business_thank_you_email
 from services.whatsapp_inbound import (
     get_phone_verify_status,
@@ -236,7 +236,11 @@ async def test_email_message(
 
 
 @router.post("/api/outreach/thank-you", summary="Send thank-you after review save")
-async def send_thank_you_outreach(body: LocalContactBody, request: Request):
+async def send_thank_you_outreach(
+    body: LocalContactBody,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
     try:
         contact_id = str(body.contactId or "").strip() or None
         scanner_email = get_receive_email_from_request(request)
@@ -249,6 +253,7 @@ async def send_thank_you_outreach(body: LocalContactBody, request: Request):
                 skip_email=body.skipEmail,
                 log_context="thank-you-resend",
                 scanner_email=scanner_email,
+                user=user,
             )
         else:
             contact = body_to_outreach_contact(body)
@@ -259,6 +264,7 @@ async def send_thank_you_outreach(body: LocalContactBody, request: Request):
                 skip_whatsapp=body.skipWhatsApp,
                 skip_email=body.skipEmail,
                 scanner_email=scanner_email,
+                user=user,
             )
         return {
             "success": True,
