@@ -133,6 +133,7 @@ async def create_contact(
             skip_whatsapp=bool(contact_data.get("skipWhatsApp")),
             skip_email=bool(contact_data.get("skipEmail")),
             scanner_email=get_receive_email_from_request(request),
+            user=user,
         )
         return {
             **result,
@@ -362,6 +363,7 @@ async def create_contact_json(
                     skip_email=body.skipEmail,
                     log_context="create-contact",
                     scanner_email=get_receive_email_from_request(request),
+                    user=user,
                 )
                 response.update(whatsapp_response(whatsapp_result))
                 response.update(email_response(email_result))

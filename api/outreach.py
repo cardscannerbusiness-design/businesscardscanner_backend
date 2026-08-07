@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from services import contact_storage as storage
+from services.admin_runtime_config import resolve_owner_admin_for_outreach, use_admin_env
 from services.email_service import is_test_recipient_mode, schedule_email_for_contact
 from services.whatsapp_service import schedule_whatsapp_for_contact
 
@@ -137,11 +138,45 @@ async def schedule_outreach_for_contact(
     skip_email: bool = False,
     log_context: str = "outreach",
     scanner_email: str | None = None,
+    user: dict[str, Any] | None = None,
+    admin_user_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    owner_admin_id = resolve_owner_admin_for_outreach(
+        user=user,
+        admin_user_id=admin_user_id,
+        contact=contact,
+    )
+    with use_admin_env(owner_admin_id):
+        return await _schedule_outreach_for_contact_inner(
+            contact,
+            online_mode=online_mode,
+            on_save=on_save,
+            contact_id=contact_id,
+            skip_whatsapp=skip_whatsapp,
+            skip_email=skip_email,
+            log_context=log_context,
+            scanner_email=scanner_email,
+        )
+
+
+async def _schedule_outreach_for_contact_inner(
+    contact: dict[str, Any],
+    *,
+    online_mode: bool = True,
+    on_save: bool = False,
+    contact_id: str | None = None,
+    skip_whatsapp: bool = False,
+    skip_email: bool = False,
+    log_context: str = "outreach",
+    scanner_email: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    # Contacts "Resend" must actually hit Meta/SMTP again (do not treat marker as success).
+    force_resend = "resend" in str(log_context or "").lower()
     outreach_kwargs = {
         "online_mode": online_mode,
         "on_zoho_sync": on_save,  # email/whatsapp services still accept this flag name
         "contact_id": contact_id,
+        "skip_if_already_sent": not force_resend,
     }
     whatsapp_result: dict[str, Any] = {
         "attempted": False,
@@ -251,6 +286,8 @@ async def run_post_save_outreach(
     skip_email: bool = False,
     log_context: str = "post-save-outreach",
     scanner_email: str | None = None,
+    user: dict[str, Any] | None = None,
+    admin_user_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run thank-you WhatsApp/email after a contact is saved to PostgreSQL."""
     skipped_whatsapp: dict[str, Any] = {
@@ -276,6 +313,8 @@ async def run_post_save_outreach(
                 skip_email=skip_email,
                 log_context=log_context,
                 scanner_email=scanner_email,
+                user=user,
+                admin_user_id=admin_user_id,
             )
 
         if contact:
@@ -287,6 +326,8 @@ async def run_post_save_outreach(
                 skip_email=skip_email,
                 log_context=log_context,
                 scanner_email=scanner_email,
+                user=user,
+                admin_user_id=admin_user_id,
             )
     except Exception as exc:
         logger.error("Outreach failed: %s", exc, exc_info=True)
@@ -304,6 +345,8 @@ def fire_post_save_outreach(
     skip_whatsapp: bool = False,
     skip_email: bool = False,
     scanner_email: str | None = None,
+    user: dict[str, Any] | None = None,
+    admin_user_id: str | None = None,
 ) -> None:
     """Fire-and-forget outreach after contact save."""
     async def _run() -> None:
@@ -313,6 +356,8 @@ def fire_post_save_outreach(
             skip_whatsapp=skip_whatsapp,
             skip_email=skip_email,
             scanner_email=scanner_email,
+            user=user,
+            admin_user_id=admin_user_id,
         )
 
     asyncio.create_task(_run())
