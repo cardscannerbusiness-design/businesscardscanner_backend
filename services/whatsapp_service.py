@@ -69,7 +69,59 @@ _TEMPLATE_LANG_CACHE: dict[str, str] = {}
 
 
 def is_whatsapp_configured() -> bool:
+    from services.admin_runtime_config import runtime_whatsapp
+
+    wa = runtime_whatsapp()
+    if wa:
+        token = str(wa.get("access_token") or "").strip()
+        phone_id = str(wa.get("phone_number_id") or "").strip()
+        if token and phone_id:
+            return True
+        # CMS row present but incomplete — fall through to global
     return bool(ACCESS_TOKEN and PHONE_NUMBER_ID)
+
+
+def _active_whatsapp_credentials() -> tuple[str, str, str]:
+    """Return (access_token, phone_number_id, graph_api_version)."""
+    from services.admin_runtime_config import runtime_whatsapp
+
+    wa = runtime_whatsapp()
+    if wa:
+        token = str(wa.get("access_token") or "").strip()
+        phone_id = str(wa.get("phone_number_id") or "").strip()
+        version = (
+            str(wa.get("graph_api_version") or wa.get("api_version") or "").strip()
+            or GRAPH_API_VERSION
+        )
+        if token and phone_id:
+            return token, phone_id, version
+    return ACCESS_TOKEN, PHONE_NUMBER_ID, GRAPH_API_VERSION
+
+
+def _active_whatsapp_template_name(fallback: str | None = None) -> str:
+    from services.admin_runtime_config import runtime_whatsapp
+
+    wa = runtime_whatsapp()
+    if wa:
+        name = str(
+            wa.get("template_name")
+            or wa.get("card_received_template_name")
+            or ""
+        ).strip()
+        if name:
+            return name
+    return (fallback or CARD_RECEIVED_TEMPLATE_NAME or TEMPLATE_NAME or "").strip()
+
+
+def _active_whatsapp_template_language(fallback: str | None = None) -> str:
+    from services.admin_runtime_config import runtime_whatsapp
+
+    wa = runtime_whatsapp()
+    if wa:
+        lang = str(wa.get("template_language_code") or "").strip()
+        if lang:
+            return lang
+    return (fallback or TEMPLATE_LANGUAGE_CODE or "en_US").strip()
 
 
 _BUSINESS_PHONE_CACHE: dict[str, Any] = {"fetched_at": 0.0, "data": None}
@@ -159,9 +211,15 @@ def get_whatsapp_chat_link_config(
 
 def resolve_template_language(template_name: str) -> str:
     """Use the language Meta approved for this template (e.g. en vs en_US)."""
+    cms_lang = _active_whatsapp_template_language()
+    from services.admin_runtime_config import runtime_whatsapp
+
+    if runtime_whatsapp().get("template_language_code") and cms_lang:
+        return cms_lang
+
     name = (template_name or "").strip()
     if not name:
-        return TEMPLATE_LANGUAGE_CODE
+        return cms_lang or TEMPLATE_LANGUAGE_CODE
     if name in _TEMPLATE_LANG_CACHE:
         return _TEMPLATE_LANG_CACHE[name]
     json_name = _CARD_RECEIVED_TEMPLATE_DEF.get("name")
@@ -169,7 +227,7 @@ def resolve_template_language(template_name: str) -> str:
     if json_name and json_lang and name == json_name:
         return str(json_lang)
     if not ACCESS_TOKEN or not WABA_ID:
-        return TEMPLATE_LANGUAGE_CODE
+        return cms_lang or TEMPLATE_LANGUAGE_CODE
     try:
         url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{WABA_ID}/message_templates"
         response = requests.get(
@@ -308,12 +366,14 @@ def _format_whatsapp_error(error_json: Any) -> str:
 def _post_message(payload: dict[str, Any]) -> dict[str, Any]:
     if not is_whatsapp_configured():
         raise RuntimeError(
-            "Missing WhatsApp config. Set WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID in .env."
+            "Missing WhatsApp config. Set WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID in .env "
+            "(or configure them in CMS for this Admin)."
         )
 
-    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
+    access_token, phone_number_id, graph_version = _active_whatsapp_credentials()
+    url = f"https://graph.facebook.com/{graph_version}/{phone_number_id}/messages"
     headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
     }
 
@@ -351,22 +411,54 @@ def send_whatsapp_template(
     language_code: str | None = None,
     components: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    resolved_name = template_name or TEMPLATE_NAME
-    resolved_lang = language_code or resolve_template_language(resolved_name)
-    template: dict[str, Any] = {
-        "name": resolved_name,
-        "language": {"code": resolved_lang},
-    }
-    if components:
-        template["components"] = components
+    resolved_name = (template_name or TEMPLATE_NAME or "").strip()
+    preferred_lang = language_code or resolve_template_language(resolved_name)
 
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": normalize_whatsapp_phone(phone),
-        "type": "template",
-        "template": template,
-    }
-    return _post_message(payload)
+    lang_candidates: list[str] = []
+    for candidate in (
+        preferred_lang,
+        _active_whatsapp_template_language(),
+        TEMPLATE_LANGUAGE_CODE,
+        "en",
+        "en_US",
+    ):
+        code = (candidate or "").strip()
+        if code and code not in lang_candidates:
+            lang_candidates.append(code)
+
+    last_error: Exception | None = None
+    for resolved_lang in lang_candidates:
+        template: dict[str, Any] = {
+            "name": resolved_name,
+            "language": {"code": resolved_lang},
+        }
+        if components:
+            template["components"] = components
+
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": normalize_whatsapp_phone(phone),
+            "type": "template",
+            "template": template,
+        }
+        try:
+            return _post_message(payload)
+        except RuntimeError as exc:
+            last_error = exc
+            text = str(exc)
+            if "132001" in text or "does not exist in the translation" in text.lower():
+                logger.warning(
+                    "WhatsApp template %s language %s failed (%s); trying next language.",
+                    resolved_name,
+                    resolved_lang,
+                    exc,
+                )
+                continue
+            raise
+
+    raise last_error or RuntimeError(
+        f"WhatsApp template '{resolved_name}' failed for languages: {', '.join(lang_candidates)}"
+    )
 
 
 def send_business_card_template(
@@ -485,7 +577,29 @@ def build_scan_thank_you_text(
     contact_name: str,
     company: str = "",
     designation: str = "",
+    contact: dict[str, Any] | None = None,
 ) -> str:
+    from services.admin_runtime_config import runtime_email, runtime_templates
+    from services.template_token_service import apply_numbered_tokens, resolve_token_values
+
+    tpl = runtime_templates() or {}
+    custom_body = str(tpl.get("whatsapp_body") or "").strip()
+    if custom_body:
+        em = runtime_email() or {}
+        sender = str(em.get("sender_name") or "").strip()
+        payload = contact or {
+            "fullName": contact_name,
+            "name": contact_name,
+            "company": company,
+            "companyName": company,
+            "designation": designation,
+        }
+        values = resolve_token_values(payload, tpl, sender_name=sender)
+        header = apply_numbered_tokens(str(tpl.get("whatsapp_header") or "").strip(), values)
+        body = apply_numbered_tokens(custom_body, values)
+        footer = apply_numbered_tokens(str(tpl.get("whatsapp_footer") or "").strip(), values)
+        return "\n\n".join(part for part in (header, body, footer) if part)
+
     first_name = (contact_name or "there").strip().split()[0]
     company_bit = f" from {company}" if company else ""
     title_bit = f" ({designation})" if designation else ""
@@ -639,6 +753,70 @@ def _header_media_component(
     }
 
 
+def _build_cms_header_component(templates: dict[str, Any]) -> dict[str, Any] | None:
+    """Build Meta send header from CMS template settings (IMAGE / VIDEO / DOCUMENT / TEXT)."""
+    fmt = str(templates.get("whatsapp_header_format") or "NONE").strip().upper()
+    if fmt in ("", "NONE", "NULL"):
+        return None
+
+    if fmt == "TEXT":
+        text = str(templates.get("whatsapp_header") or "").strip()
+        if not text:
+            return None
+        return {
+            "type": "header",
+            "parameters": [{"type": "text", "text": text}],
+        }
+
+    media_url = _resolve_public_asset_url(
+        str(templates.get("whatsapp_header_media_url") or "").strip()
+    )
+    if not media_url:
+        return None
+
+    media_type = {
+        "IMAGE": "image",
+        "VIDEO": "video",
+        "DOCUMENT": "document",
+    }.get(fmt)
+    if not media_type:
+        return None
+
+    filename = str(templates.get("whatsapp_header_media_filename") or "").strip()
+    if not filename and media_type == "document":
+        filename = media_url.split("/")[-1] or "brochure.pdf"
+
+    if not _is_publicly_reachable_url(media_url):
+        local_path = _local_path_for_static_url(media_url)
+        media_id = _get_or_upload_header_media(local_path) if local_path else None
+        if media_id:
+            return _header_media_component(
+                media_type,
+                media_id=media_id,
+                filename=filename if media_type == "document" else None,
+            )
+        logger.warning(
+            "CMS WhatsApp header %s URL is not public and upload failed: %s",
+            media_type,
+            media_url,
+        )
+        return None
+
+    local_path = _local_path_for_static_url(media_url)
+    media_id = _get_or_upload_header_media(local_path) if local_path else None
+    if media_id:
+        return _header_media_component(
+            media_type,
+            media_id=media_id,
+            filename=filename if media_type == "document" else None,
+        )
+    return _header_media_component(
+        media_type,
+        link=media_url,
+        filename=filename if media_type == "document" else None,
+    )
+
+
 def _build_header_component(template_def: dict[str, Any]) -> dict[str, Any] | None:
     """Build a Meta template header component from the JSON definition."""
     for comp in template_def.get("components", []):
@@ -696,6 +874,26 @@ def _build_header_component(template_def: dict[str, Any]) -> dict[str, Any] | No
             if media_id:
                 return _header_media_component("video", media_id=media_id)
             return _header_media_component("video", link=video_url)
+        if fmt == "IMAGE":
+            image_url = _resolve_public_asset_url(
+                template_def.get("header_image_url")
+                or comp.get("image_url")
+                or template_def.get("header_handle")
+                or (comp.get("example") or {}).get("header_handle", [None])[0]
+            )
+            if not image_url:
+                return None
+            if not _is_publicly_reachable_url(image_url):
+                local_path = _local_path_for_static_url(image_url)
+                media_id = _get_or_upload_header_media(local_path) if local_path else None
+                if media_id:
+                    return _header_media_component("image", media_id=media_id)
+                return None
+            local_path = _local_path_for_static_url(image_url)
+            media_id = _get_or_upload_header_media(local_path) if local_path else None
+            if media_id:
+                return _header_media_component("image", media_id=media_id)
+            return _header_media_component("image", link=image_url)
         if fmt == "TEXT":
             text = comp.get("text")
             if text is None:
@@ -707,41 +905,80 @@ def _build_header_component(template_def: dict[str, Any]) -> dict[str, Any] | No
     return None
 
 
-def build_card_received_template_components(contact: dict[str, Any]) -> list[dict[str, Any]]:
-    """Map scanned card fields to the approved card-received template variables."""
+def build_card_received_template_components(
+    contact: dict[str, Any],
+    template_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Map scanned card fields to Meta template body/header params.
+
+    card_final_ula expects: VIDEO header + body {{1}}=name, {{2}}=event.
+    """
+    from services.admin_runtime_config import runtime_email, runtime_templates
+    from services.template_token_service import resolve_token_values
+
     contact_name = extract_contact_name(contact)
     first_name = (contact_name or "there").strip().split()[0]
     event_name = extract_event_name(contact)
 
-    positions = _extract_variable_positions(_CARD_RECEIVED_TEMPLATE_DEF) or [1]
-    if len(positions) == 1:
-        # Single-variable templates expect the full name.
-        field_by_position: dict[int, str] = {
-            1: _template_param(contact_name, "there"),
-        }
-    elif positions == [1, 2]:
-        # card_final_ula: Hi {{1}} … meeting you at {{2}}.
-        field_by_position = {
-            1: _template_param(first_name, "there"),
-            2: _template_param(event_name, "the exhibition"),
-        }
-    else:
-        field_by_position = {
-            1: _template_param(first_name, "there"),
-            2: _template_param(contact_name),
-            3: _template_param(extract_company_name(contact)),
-            4: _template_param(extract_designation(contact)),
-            5: _template_param(extract_primary_email(contact)),
-            6: _template_param(extract_website(contact)),
-            7: _template_param(extract_address(contact)),
-        }
+    tpl = runtime_templates() or {}
+    em = runtime_email() or {}
+    sender = str(em.get("sender_name") or "").strip()
+    cms_tokens = resolve_token_values(contact, tpl, sender_name=sender) if tpl else {}
+
+    resolved_name = (
+        template_name
+        or _active_whatsapp_template_name(CARD_RECEIVED_TEMPLATE_NAME)
+        or CARD_RECEIVED_TEMPLATE_NAME
+    ).strip()
+    name_l = resolved_name.lower()
+
+    # Prefer body variable count from the approved JSON for card_final_ula family.
+    positions = _extract_variable_positions(_CARD_RECEIVED_TEMPLATE_DEF) or [1, 2]
+    is_video_template = name_l in {
+        (CARD_RECEIVED_TEMPLATE_NAME or "").lower(),
+        (BUSINESS_CARD_TEMPLATE_NAME or "").lower(),
+        (SCAN_THANKS_TEMPLATE_NAME or "").lower(),
+        "card_final_ula",
+    }
+    if not is_video_template:
+        body_text = str(tpl.get("whatsapp_body") or "")
+        found = sorted({int(m) for m in re.findall(r"\{\{\s*(\d+)\s*\}\}", body_text)})
+        if found:
+            positions = found
+
+    defaults = {
+        1: _template_param(first_name, "there"),
+        2: _template_param(event_name, "the exhibition"),
+        3: _template_param(extract_company_name(contact)),
+        4: _template_param(extract_designation(contact)),
+        5: _template_param(extract_website(contact)),
+    }
+
+    field_by_position: dict[int, str] = {}
+    for pos in positions:
+        from_cms = str(cms_tokens.get(str(pos)) or "").strip()
+        field_by_position[pos] = (
+            _template_param(from_cms) if from_cms else defaults.get(pos, "—")
+        )
 
     parameters = [
         {"type": "text", "text": field_by_position.get(pos, "—")}
         for pos in positions
     ]
+
     components: list[dict[str, Any]] = []
-    header = _build_header_component(_CARD_RECEIVED_TEMPLATE_DEF)
+
+    # card_final_ula is VIDEO-header in Meta — never send TEXT/IMAGE/DOCUMENT for it.
+    header = None
+    cms_fmt = str(tpl.get("whatsapp_header_format") or "NONE").strip().upper()
+    if is_video_template:
+        if cms_fmt == "VIDEO":
+            header = _build_cms_header_component(tpl)
+        if header is None:
+            header = _build_header_component(_CARD_RECEIVED_TEMPLATE_DEF)
+    else:
+        header = _build_cms_header_component(tpl)
+
     if header:
         components.append(header)
     components.append({"type": "body", "parameters": parameters})
@@ -834,7 +1071,7 @@ def send_scan_thank_you_to_contact(contact: dict[str, Any]) -> dict[str, Any]:
     contact_name = extract_contact_name(contact)
     company = extract_company_name(contact)
     designation = extract_designation(contact)
-    message = build_scan_thank_you_text(contact_name, company, designation)
+    message = build_scan_thank_you_text(contact_name, company, designation, contact=contact)
     normalized_phone = normalize_whatsapp_phone(phone)
 
     # Business API outbound: approved templates with card fields first.
@@ -843,24 +1080,24 @@ def send_scan_thank_you_to_contact(contact: dict[str, Any]) -> dict[str, Any]:
     send_mode = ""
     last_error: Exception | None = None
 
-    components_by_template = _template_components(CARD_RECEIVED_TEMPLATE_NAME, contact)
+    primary_template = _active_whatsapp_template_name(CARD_RECEIVED_TEMPLATE_NAME)
     try:
         result = send_whatsapp_template(
             phone,
-            template_name=CARD_RECEIVED_TEMPLATE_NAME,
-            components=components_by_template,
+            template_name=primary_template,
+            components=_template_components(primary_template, contact),
         )
-        send_mode = CARD_RECEIVED_TEMPLATE_NAME
+        send_mode = primary_template
     except RuntimeError as primary_exc:
         last_error = primary_exc
         logger.warning(
             "WhatsApp primary template %s failed for %s: %s",
-            CARD_RECEIVED_TEMPLATE_NAME,
+            primary_template,
             normalized_phone,
             primary_exc,
         )
         for template_name in _ordered_outbound_template_names():
-            if template_name == CARD_RECEIVED_TEMPLATE_NAME:
+            if template_name == primary_template:
                 continue
             try:
                 result = send_whatsapp_template(
@@ -873,7 +1110,7 @@ def send_scan_thank_you_to_contact(contact: dict[str, Any]) -> dict[str, Any]:
                     "WhatsApp fallback template %s sent to %s (primary %s failed).",
                     template_name,
                     normalized_phone,
-                    CARD_RECEIVED_TEMPLATE_NAME,
+                    primary_template,
                 )
                 break
             except RuntimeError as exc:
@@ -1013,7 +1250,7 @@ async def schedule_whatsapp_for_contact(
         return skipped
 
     if not is_whatsapp_configured():
-        skipped["error"] = "WhatsApp is not configured in .env."
+        skipped["error"] = "WhatsApp is not configured in .env (or CMS Admin WhatsApp env)."
         _log_whatsapp_line("SKIP", "?", context=log_context, error=skipped["error"])
         return skipped
 
@@ -1024,9 +1261,12 @@ async def schedule_whatsapp_for_contact(
 
         existing = storage.get_contact(contact_id)
         if existing and storage.has_whatsapp_sent(existing):
+            # Keep UI green for auto-save dedupe, but mark as skipped so resend
+            # paths can force a real send (see skip_if_already_sent=False).
             skipped["attempted"] = True
             skipped["sent"] = True
-            skipped["error"] = None
+            skipped["skipped"] = True
+            skipped["error"] = "already sent"
             skipped["recipient_phone"] = phone or extract_primary_phone(existing) or None
             _log_whatsapp_line("SKIP", phone or "?", context=log_context, error="already sent")
             return skipped
@@ -1040,7 +1280,9 @@ async def schedule_whatsapp_for_contact(
     recipient_check = evaluate_recipient_before_send(phone)
     skipped["recipient_phone"] = phone
     skipped["recipient_name"] = contact_name or None
-    skipped["message"] = build_scan_thank_you_text(contact_name, extract_company_name(contact))
+    skipped["message"] = build_scan_thank_you_text(
+        contact_name, extract_company_name(contact), contact=contact
+    )
     skipped["contact_chat_verified"] = recipient_check["contact_chat_verified"]
     skipped["recipient_has_whatsapp"] = recipient_check["recipient_has_whatsapp"]
 
@@ -1108,7 +1350,9 @@ async def schedule_whatsapp_for_contact(
             "message_id": None,
             "recipient_phone": phone,
             "recipient_name": contact_name or None,
-            "message": build_scan_thank_you_text(contact_name, extract_company_name(contact)),
+            "message": build_scan_thank_you_text(
+                contact_name, extract_company_name(contact), contact=contact
+            ),
             "send_mode": None,
             "recipient_has_whatsapp": False if not_on_whatsapp else recipient_check["recipient_has_whatsapp"],
             "contact_chat_verified": recipient_check["contact_chat_verified"],

@@ -1,7 +1,8 @@
 """AWS Textract service for business card OCR (online mode).
 
 Uses boto3 with credentials from environment variables (no hardcoded secrets).
-Calls DetectDocumentText (LINES) and optionally enriches via AnalyzeDocument (FORMS).
+Calls DetectDocumentText only — AnalyzeDocument FORMS was removed because it
+added a full second AWS round-trip without contributing any text to parsing.
 """
 import logging
 import os
@@ -87,28 +88,6 @@ def extract_text(image_bytes: bytes) -> str:
         len(lines),
         len(raw_text),
     )
-
-    # Optional enrichment: key-value pairs from FORMS analysis
-    try:
-        forms_started = time.perf_counter()
-        analyze_response = client.analyze_document(
-            Document={"Bytes": image_bytes},
-            FeatureTypes=["FORMS"],
-        )
-        kv_lines = []
-        for block in analyze_response.get("Blocks", []):
-            if block.get("BlockType") == "KEY_VALUE_SET":
-                text = block.get("Text", "")
-                if text:
-                    kv_lines.append(text)
-        if kv_lines:
-            logger.info(
-                "[OCR] Textract FORMS enrichment duration_ms=%.1f kv=%d",
-                (time.perf_counter() - forms_started) * 1000,
-                len(kv_lines),
-            )
-    except Exception as exc:
-        logger.warning("Textract FORMS enrichment failed (non-fatal): %s", exc)
 
     return raw_text
 
