@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
@@ -7,8 +8,8 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from api.auth_context import get_receive_email_from_request
 from api.outreach import (
     email_response,
+    fire_post_save_outreach,
     is_online_mode,
-    run_post_save_outreach,
     schedule_outreach_for_contact,
     whatsapp_response,
 )
@@ -59,6 +60,43 @@ def _sheets_extras(data: dict[str, Any]) -> dict[str, Any]:
         "ocrConfidence": data.get("ocrConfidence"),
         "captureSource": str(data.get("captureSource") or ""),
     }
+
+
+def _parse_contact_created_at(contact: dict[str, Any]) -> datetime | None:
+    raw = contact.get("createdAt") or contact.get("created_at")
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _find_recent_duplicate_contact(
+    payload: dict[str, Any],
+    user: dict[str, Any],
+    *,
+    window_seconds: int = 90,
+) -> dict[str, Any] | None:
+    """Return a matching contact created moments ago (double-submit / retry guard).
+
+    Older intentional duplicates (Save as new) are not in this window and proceed.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+    for entry in find_duplicate_contacts(payload, user=user):
+        contact = entry.get("contact") if isinstance(entry, dict) else None
+        if not isinstance(contact, dict):
+            continue
+        created = _parse_contact_created_at(contact)
+        if created and created >= cutoff:
+            return contact
+    return None
 
 
 @router.post("/contacts/check-duplicates")
@@ -342,9 +380,35 @@ async def create_contact_json(
     try:
         payload = body.model_dump()
         payload["created_by_user_id"] = user["id"]
+
+        # Idempotency: a parallel/retried POST for the same card must not insert again.
+        recent = _find_recent_duplicate_contact(payload, user)
+        if recent and recent.get("id"):
+            contact_id = str(recent["id"])
+            logger.info(
+                "[CONTACT] Reusing recent duplicate contact_id=%s (idempotent create)",
+                contact_id,
+            )
+            response: dict[str, Any] = {
+                "success": True,
+                "id": contact_id,
+                "contact": storage.get_contact(contact_id, user=user),
+                "database": "postgresql",
+                "idempotentReuse": True,
+            }
+            if is_online_mode(body.connectionMode):
+                # Delivery only — never creates another contact row.
+                fire_post_save_outreach(
+                    contact_id=contact_id,
+                    skip_whatsapp=body.skipWhatsApp,
+                    skip_email=body.skipEmail,
+                    scanner_email=get_receive_email_from_request(request),
+                )
+            return response
+
         result = storage.create_contact(payload)
         contact_id = result["id"]
-        response: dict[str, Any] = {
+        response = {
             "success": True,
             "id": contact_id,
             "contact": storage.get_contact(contact_id, user=user),
@@ -355,21 +419,20 @@ async def create_contact_json(
         fire_sheets_sync(contact_id, _sheets_extras(payload))
 
         if is_online_mode(body.connectionMode):
-            try:
-                whatsapp_result, email_result = await run_post_save_outreach(
-                    contact_id=contact_id,
-                    skip_whatsapp=body.skipWhatsApp,
-                    skip_email=body.skipEmail,
-                    log_context="create-contact",
-                    scanner_email=get_receive_email_from_request(request),
-                )
-                response.update(whatsapp_response(whatsapp_result))
-                response.update(email_response(email_result))
-                # Return the contact row after delivery statuses are persisted.
-                response["contact"] = storage.get_contact(contact_id, user=user)
-            except Exception as exc:
-                logger.error("Outreach after save failed for %s: %s", contact_id, exc, exc_info=True)
-                response["outreachError"] = str(exc)
+            # Fire-and-forget outreach so the client receives contact id immediately.
+            # Awaiting WhatsApp/email previously caused timeouts → client queued a
+            # second Pending row while the DB row already had Delivered status.
+            fire_post_save_outreach(
+                contact_id=contact_id,
+                skip_whatsapp=body.skipWhatsApp,
+                skip_email=body.skipEmail,
+                scanner_email=get_receive_email_from_request(request),
+            )
+            # Pending until background outreach persists delivery on this same row.
+            response["whatsappSent"] = False
+            response["whatsappAttempted"] = not body.skipWhatsApp
+            response["emailSent"] = False
+            response["emailAttempted"] = not body.skipEmail
 
         return response
     except StorageLimitExceededError as exc:

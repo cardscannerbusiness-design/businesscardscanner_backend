@@ -57,6 +57,20 @@ def _validate_date_range(start: date | None, end: date | None) -> None:
         raise HTTPException(status_code=422, detail="end_date cannot be before start_date.")
 
 
+def _deactivate_other_active_events(cur, keep_id: str, now: datetime) -> None:
+    """Ensure only one managed event is active for scanning/extraction."""
+    cur.execute(
+        """
+        UPDATE managed_events
+        SET status = 'inactive', updated_at = %s
+        WHERE deleted_at IS NULL
+          AND status = 'active'
+          AND id <> %s
+        """,
+        (now, keep_id),
+    )
+
+
 @router.get(
     "",
     summary="List managed events",
@@ -105,6 +119,29 @@ def list_events(
         "page": page,
         "limit": limit,
     }
+
+
+@router.get(
+    "/active",
+    summary="Get the currently active managed event (any authenticated role)",
+)
+def get_active_event(_user: dict = Depends(get_current_user)):
+    """Return the single platform-active event used to tag scans on Extraction."""
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT id, name, description, location, start_date, end_date, status,
+                   created_by, updated_by, created_at, updated_at
+            FROM managed_events
+            WHERE deleted_at IS NULL AND status = 'active'
+            ORDER BY updated_at DESC NULLS LAST, created_at DESC
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+    if not row:
+        return {"event": None}
+    return {"event": _serialize_event(dict(row))}
 
 
 @router.get(
@@ -183,6 +220,8 @@ def create_event(body: CreateManagedEventRequest, request: Request):
             ),
         )
         row = cur.fetchone()
+        if status == "active" and row:
+            _deactivate_other_active_events(cur, str(row["id"]), now)
 
     audit_service.log_action(
         user["id"],
@@ -278,6 +317,8 @@ def update_event(event_id: str, body: UpdateManagedEventRequest, request: Reques
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Event not found.")
+        if str(row.get("status") or "").lower() == "active":
+            _deactivate_other_active_events(cur, str(row["id"]), updates["updated_at"])
 
     audit_service.log_action(
         user["id"],
