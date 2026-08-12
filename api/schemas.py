@@ -102,6 +102,10 @@ class LocalContactBody(BaseModel):
         description="User-written notes only (not OCR). Max 2000 characters.",
         max_length=2000,
     )
+    prospect_status: str = Field(
+    default="",
+    description="Prospect status: Hot, Warm, or Cold.",
+    )
     eventName: str = Field(
         default="",
         description="Event where the card was collected.",

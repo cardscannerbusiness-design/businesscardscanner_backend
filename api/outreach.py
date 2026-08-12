@@ -67,6 +67,7 @@ def body_to_outreach_contact(body: LocalContactBody) -> dict[str, Any]:
         "secondaryAddress": body.secondaryAddress,
         "eventName": body.eventName,
         "eventDay": body.eventDay,
+        "prospect_status": body.prospect_status,
     }
 
 

@@ -61,12 +61,20 @@ def list_contacts_page(
     limit: int = 10,
     q: str | None = None,
     event: str | None = None,
+    event_id: str | None = None,
 ) -> dict[str, Any]:
     if is_client_side_storage():
         return {"items": [], "total": 0, "page": page, "limit": limit}
     from services import local_db_service as local_db
 
-    return local_db.list_contacts_page(user=user, page=page, limit=limit, q=q, event=event)
+    return local_db.list_contacts_page(
+        user=user,
+        page=page,
+        limit=limit,
+        q=q,
+        event=event,
+        event_id=event_id,
+    )
 
 
 def get_contact(contact_id: str, user: dict[str, Any] | None = None) -> dict[str, Any] | None:

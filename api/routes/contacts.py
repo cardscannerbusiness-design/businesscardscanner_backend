@@ -190,14 +190,16 @@ async def fetch_contacts(
     limit: int | None = Query(None, ge=1, le=100),
     q: str | None = Query(None, max_length=200),
     event: str | None = Query(None, max_length=200),
+    eventId: str | None = Query(None, max_length=100),
 ):
-    if page is not None or limit is not None or q or event:
+    if page is not None or limit is not None or q or event or eventId:
         return storage.list_contacts_page(
             user=user,
             page=page or 1,
             limit=limit or 10,
             q=q,
             event=event,
+            event_id=eventId,
         )
     return storage.list_contacts(user=user)
 
@@ -308,14 +310,16 @@ async def list_contacts_api(
     limit: int | None = Query(None, ge=1, le=100),
     q: str | None = Query(None, max_length=200),
     event: str | None = Query(None, max_length=200),
+    eventId: str | None = Query(None, max_length=100),
 ):
-    if page is not None or limit is not None or q or event:
+    if page is not None or limit is not None or q or event or eventId:
         return storage.list_contacts_page(
             user=user,
             page=page or 1,
             limit=limit or 10,
             q=q,
             event=event,
+            event_id=eventId,
         )
     return storage.list_contacts(user=user)
 
@@ -420,7 +424,7 @@ async def create_contact_json(
         fire_sheets_sync(contact_id, _sheets_extras(payload))
 
         if is_online_mode(body.connectionMode):
-<<<<<<< HEAD
+
             # Fire-and-forget outreach so the client receives contact id immediately.
             # Awaiting WhatsApp/email previously caused timeouts → client queued a
             # second Pending row while the DB row already had Delivered status.
@@ -435,24 +439,8 @@ async def create_contact_json(
             response["whatsappAttempted"] = not body.skipWhatsApp
             response["emailSent"] = False
             response["emailAttempted"] = not body.skipEmail
-=======
-            try:
-                whatsapp_result, email_result = await run_post_save_outreach(
-                    contact_id=contact_id,
-                    skip_whatsapp=body.skipWhatsApp,
-                    skip_email=body.skipEmail,
-                    log_context="create-contact",
-                    scanner_email=get_receive_email_from_request(request),
-                    user=user,
-                )
-                response.update(whatsapp_response(whatsapp_result))
-                response.update(email_response(email_result))
-                # Return the contact row after delivery statuses are persisted.
-                response["contact"] = storage.get_contact(contact_id, user=user)
-            except Exception as exc:
-                logger.error("Outreach after save failed for %s: %s", contact_id, exc, exc_info=True)
-                response["outreachError"] = str(exc)
->>>>>>> a4b6d68ef64b9e7f5d9ee01e502815567b8bcc1c
+
+
 
         return response
     except StorageLimitExceededError as exc:

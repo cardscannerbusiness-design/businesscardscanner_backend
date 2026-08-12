@@ -192,6 +192,7 @@ def _row_to_contact(row: dict[str, Any]) -> dict[str, Any]:
         "socialLinks": row.get("socialLinks") or "",
         "gstNumber": row.get("gstNumber") or "",
         "notes": row.get("notes") or "",
+        "prospect_status": row.get("prospect_status") or "",
         "eventName": row.get("eventName") or "",
         "eventDay": row.get("eventDay") or "Day 1",
         "eventId": row.get("eventId"),
@@ -281,6 +282,7 @@ def _payload_to_local_body(
         "socialLinks": str(contact_data.get("socialLinks") or "").strip(),
         "gstNumber": str(contact_data.get("gstNumber") or "").strip(),
         "notes": str(contact_data.get("notes") or "").strip(),
+        "prospect_status": str(contact_data.get("prospect_status") or "").strip(),
         "eventName": str(contact_data.get("eventName") or "").strip(),
         "eventDay": str(contact_data.get("eventDay") or "Day 1").strip() or "Day 1",
         "eventId": (str(contact_data.get("eventId")).strip() if contact_data.get("eventId") else None),
@@ -322,6 +324,7 @@ def list_contacts_page(
     limit: int = 10,
     q: str | None = None,
     event: str | None = None,
+    event_id: str | None = None,
 ) -> dict[str, Any]:
     """Paginated contacts list — same RBAC as list_contacts, with optional search."""
     page = max(1, int(page or 1))
@@ -330,7 +333,9 @@ def list_contacts_page(
     try:
         with _connect() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                base_query, params = _contacts_list_sql(user, q=q, event=event)
+                base_query, params = _contacts_list_sql(
+                    user, q=q, event=event, event_id=event_id
+                )
                 count_query = f"SELECT COUNT(*) AS count FROM ({base_query}) AS scoped"
                 cur.execute(count_query, params)
                 total = int(cur.fetchone()["count"])
@@ -430,6 +435,7 @@ def _contacts_list_sql(
     *,
     q: str | None = None,
     event: str | None = None,
+    event_id: str | None = None,
 ) -> tuple[str, list[Any]]:
     base_query = """
         SELECT c.*,
@@ -497,7 +503,21 @@ def _contacts_list_sql(
         params.extend([like] * 9)
 
     event_name = (event or "").strip()
-    if event_name:
+    event_id_value = (event_id or "").strip()
+    # Prefer eventId when provided; also match eventName so older rows that
+    # only stored the name still appear for the managed event.
+    if event_id_value and event_name:
+        base_query += """
+            AND (
+                CAST(c."eventId" AS text) = %s
+                OR LOWER(TRIM(COALESCE(c."eventName", ''))) = LOWER(TRIM(%s))
+            )
+        """
+        params.extend([event_id_value, event_name])
+    elif event_id_value:
+        base_query += ' AND CAST(c."eventId" AS text) = %s'
+        params.append(event_id_value)
+    elif event_name:
         base_query += ' AND LOWER(TRIM(COALESCE(c."eventName", \'\'))) = LOWER(TRIM(%s))'
         params.append(event_name)
 
@@ -647,13 +667,13 @@ def create_contact(
                         phone, "secondaryPhone", "countryCode", "countryName",
                         email, "secondaryEmail", website,
                         "secondaryWebsite", address, "secondaryAddress", "socialLinks",
-                        "gstNumber", notes, "eventName", "eventDay", "eventId", "cardImageBase64",
-                        image_size_bytes,
+                        "gstNumber", notes, "prospect_status", "eventName", "eventDay", "eventId", "cardImageBase64",
+                         image_size_bytes,
                         "syncStatus", "createdAt", "updatedAt", created_by_user_id,
                         owner_company_id, created_by_role
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
                     """,
                     (
@@ -676,6 +696,7 @@ def create_contact(
                         body["socialLinks"],
                         body["gstNumber"],
                         body["notes"],
+                        body.get("prospect_status", ""),
                         body["eventName"],
                         body["eventDay"],
                         body.get("eventId"),
@@ -791,7 +812,7 @@ def update_contact(contact_id: str, contact_data: dict[str, Any]) -> dict[str, A
                         "countryCode" = %s, "countryName" = %s,
                         email = %s, "secondaryEmail" = %s, website = %s, "secondaryWebsite" = %s,
                         address = %s, "secondaryAddress" = %s, "socialLinks" = %s,
-                        "gstNumber" = %s, notes = %s, "eventName" = %s, "eventDay" = %s,
+                        "gstNumber" = %s, notes = %s, "prospect_status" = %s, "eventName" = %s, "eventDay" = %s,
                         "eventId" = COALESCE(%s, "eventId"),
                         "cardImageBase64" = COALESCE(%s, "cardImageBase64"),
                         image_size_bytes = %s,
@@ -817,6 +838,7 @@ def update_contact(contact_id: str, contact_data: dict[str, Any]) -> dict[str, A
                         body["socialLinks"],
                         body["gstNumber"],
                         body["notes"],
+                        body.get("prospect_status", ""),
                         body["eventName"],
                         body["eventDay"],
                         body.get("eventId"),
