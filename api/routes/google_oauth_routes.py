@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
-from auth.constants import ROLE_ADMIN, ROLE_SUPER_ADMIN
+from auth.constants import ROLE_ADMIN, ROLE_SUPER_ADMIN, ROLE_USER
 from auth.dependencies import require_role
 from config.urls import get_frontend_base_url
 from services import google_oauth_service as oauth
@@ -30,13 +30,17 @@ def _frontend_settings_redirect(**params: str) -> RedirectResponse:
 
 @router.get("/oauth/status", summary="Google Drive connection status")
 def oauth_status(request: Request):
-    user = require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)(request)
+    # Users also see their company sheet status so they can confirm the
+    # workspace-level connection their Admin created (or connect their own
+    # account for personal syncing). Company/tenant scoping is enforced by
+    # ``get_oauth_status`` which only reads the caller's user row.
+    user = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER)(request)
     return oauth.get_oauth_status(str(user["id"]))
 
 
 @router.get("/oauth/start", summary="Start Google OAuth (Connect Google Drive)")
 def oauth_start(request: Request):
-    user = require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)(request)
+    user = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER)(request)
     try:
         url = oauth.build_authorize_url(
             user_id=str(user["id"]),
@@ -109,25 +113,46 @@ def oauth_callback(code: str | None = None, state: str | None = None, error: str
 
 @router.post("/oauth/disconnect", summary="Disconnect Google Drive")
 def oauth_disconnect(request: Request):
-    user = require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)(request)
+    # Callers can always disconnect their own row regardless of role.
+    user = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER)(request)
     oauth.clear_oauth_tokens(str(user["id"]))
     return {"success": True, "detail": "Google Drive disconnected."}
 
 
 @router.post("/sheets/ensure", summary="Create / refresh company or Super Admin sheet")
 def ensure_sheet(request: Request):
-    user = require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)(request)
+    user = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER)(request)
     role = str(user.get("role") or "").upper()
     try:
         if role == ROLE_SUPER_ADMIN:
             sheet_id = sheets.ensure_superadmin_sheet()
-        else:
+        elif role == ROLE_ADMIN:
             company_id = str(user.get("company_id") or "").strip()
             if not company_id:
                 raise HTTPException(status_code=400, detail="Admin has no company.")
             with sheets._workbook_cache_lock:
                 sheets._workbook_cache.pop(f"company:{company_id}", None)
             sheet_id = sheets.ensure_company_sheet(company_id)
+        else:
+            # Users read-only: they don't own their company's sheet, but they
+            # still need the shared workbook URL for their tenant. Reuse the
+            # existing company sheet (created by the Admin's OAuth tokens);
+            # never mint a new one on a user's behalf.
+            company_id = str(user.get("company_id") or "").strip()
+            if not company_id:
+                raise HTTPException(status_code=400, detail="You are not attached to a company.")
+            meta = sheets._load_company_sheet_meta(company_id)
+            sheet_id = (meta or {}).get("google_sheet_id")
+            if not sheet_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Google Sheet has not been set up yet. Ask your "
+                        "company admin to connect Google Drive from Settings."
+                    ),
+                )
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except oauth.GoogleOAuthError as exc:

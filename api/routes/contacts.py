@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -8,9 +9,10 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from api.auth_context import get_receive_email_from_request
 from api.outreach import (
     email_response,
-    fire_post_save_outreach,
     is_online_mode,
+    run_post_save_outreach,
     schedule_outreach_for_contact,
+    track_background_task,
     whatsapp_response,
 )
 from api.schemas import (
@@ -42,6 +44,78 @@ from utils.file_utils import cleanup_temp_file, save_temp_file, validate_file
 
 router = APIRouter(tags=["Contacts"])
 logger = logging.getLogger(__name__)
+
+# How long the JSON /api/contacts endpoint waits for the initial online-save
+# outreach (email + WhatsApp) to finish before responding. Matches the Resend
+# path which fully awaits provider results; kept bounded so a stalled provider
+# cannot hang the HTTP response forever. On timeout the shielded task keeps
+# running and persists the real status to the same contact row (no second send).
+_INITIAL_OUTREACH_WAIT_SECONDS: float = 45.0
+
+
+async def _await_online_outreach_into_response(
+    response: dict[str, Any],
+    *,
+    contact_id: str,
+    body: LocalContactBody,
+    request: Request,
+    user: dict,
+) -> None:
+    """Await email/WhatsApp like RESEND, then attach results + refreshed contact.
+
+    This is the missing piece vs ``/api/outreach/thank-you``: the create endpoint
+    must return the real per-channel send outcome (and persist it) before the
+    client navigates to Contacts, otherwise the UI shows Pending until Resend.
+    """
+    outreach_task = asyncio.create_task(
+        run_post_save_outreach(
+            contact_id=contact_id,
+            skip_whatsapp=body.skipWhatsApp,
+            skip_email=body.skipEmail,
+            scanner_email=get_receive_email_from_request(request),
+            user=user,
+        )
+    )
+    track_background_task(outreach_task)
+
+    try:
+        whatsapp_result, email_result = await asyncio.wait_for(
+            asyncio.shield(outreach_task),
+            timeout=_INITIAL_OUTREACH_WAIT_SECONDS,
+        )
+        # Same response shape as form-data create + thank-you Resend.
+        response.update(whatsapp_response(whatsapp_result))
+        response.update(email_response(email_result))
+    except asyncio.TimeoutError:
+        # Provider still working — do NOT mark attempted=true (that looks like
+        # a definitive Failed). Leave Pending; background task will persist.
+        logger.info(
+            "[CONTACT] Outreach exceeded %.0fs — returning Pending; "
+            "task continues in background contact_id=%s",
+            _INITIAL_OUTREACH_WAIT_SECONDS,
+            contact_id,
+        )
+        response["whatsapp_sent"] = False
+        response["whatsapp_attempted"] = False
+        response["email_sent"] = False
+        response["email_attempted"] = False
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception(
+            "[CONTACT] Awaited outreach crashed for %s: %s",
+            contact_id,
+            exc,
+        )
+        response["whatsapp_sent"] = False
+        response["whatsapp_attempted"] = not body.skipWhatsApp
+        response["whatsapp_error"] = str(exc)
+        response["email_sent"] = False
+        response["email_attempted"] = not body.skipEmail
+        response["email_error"] = str(exc)
+
+    # Refresh so nested contact carries emailDeliveryStatus / whatsappDeliveryStatus.
+    refreshed = storage.get_contact(contact_id, user=user)
+    if refreshed:
+        response["contact"] = refreshed
 
 
 def _raise_storage_limit(exc: StorageLimitExceededError) -> None:
@@ -402,12 +476,15 @@ async def create_contact_json(
                 "idempotentReuse": True,
             }
             if is_online_mode(body.connectionMode):
-                # Delivery only — never creates another contact row.
-                fire_post_save_outreach(
+                # Same as fresh create / Resend: await + return real delivery status.
+                # skip_if_already_sent inside outreach prevents a duplicate send when
+                # the original create already delivered.
+                await _await_online_outreach_into_response(
+                    response,
                     contact_id=contact_id,
-                    skip_whatsapp=body.skipWhatsApp,
-                    skip_email=body.skipEmail,
-                    scanner_email=get_receive_email_from_request(request),
+                    body=body,
+                    request=request,
+                    user=user,
                 )
             return response
 
@@ -424,23 +501,13 @@ async def create_contact_json(
         fire_sheets_sync(contact_id, _sheets_extras(payload))
 
         if is_online_mode(body.connectionMode):
-
-            # Fire-and-forget outreach so the client receives contact id immediately.
-            # Awaiting WhatsApp/email previously caused timeouts → client queued a
-            # second Pending row while the DB row already had Delivered status.
-            fire_post_save_outreach(
+            await _await_online_outreach_into_response(
+                response,
                 contact_id=contact_id,
-                skip_whatsapp=body.skipWhatsApp,
-                skip_email=body.skipEmail,
-                scanner_email=get_receive_email_from_request(request),
+                body=body,
+                request=request,
+                user=user,
             )
-            # Pending until background outreach persists delivery on this same row.
-            response["whatsappSent"] = False
-            response["whatsappAttempted"] = not body.skipWhatsApp
-            response["emailSent"] = False
-            response["emailAttempted"] = not body.skipEmail
-
-
 
         return response
     except StorageLimitExceededError as exc:

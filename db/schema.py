@@ -269,6 +269,7 @@ SCHEMA_STATEMENTS: list[str] = [
         created_by_user_id  UUID REFERENCES users(id) ON DELETE SET NULL,
         owner_company_id    UUID REFERENCES companies(id) ON DELETE SET NULL,
         created_by_role     VARCHAR(64) NOT NULL DEFAULT '',
+        prospect_status     VARCHAR(64) NOT NULL DEFAULT '',
         email_delivery_status VARCHAR(32),
         email_delivery_error  TEXT,
         whatsapp_delivery_status VARCHAR(32),
@@ -370,6 +371,10 @@ SCHEMA_STATEMENTS: list[str] = [
     'ALTER TABLE contacts ADD COLUMN IF NOT EXISTS "countryName" TEXT NOT NULL DEFAULT \'\';',
     'ALTER TABLE contacts ADD COLUMN IF NOT EXISTS "eventDay" TEXT NOT NULL DEFAULT \'Day 1\';',
     'CREATE INDEX IF NOT EXISTS idx_contacts_event_day ON contacts("eventDay");',
+    # Prospect status (Hot / Warm / Cold). Idempotent for older DBs that predate
+    # the review-page classifier. Kept nullable/blank so historical rows survive.
+    "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS prospect_status VARCHAR(64) NOT NULL DEFAULT '';",
+    "CREATE INDEX IF NOT EXISTS idx_contacts_prospect_status ON contacts(prospect_status);",
     # ── Invitations (secure invite-based onboarding) ───────────────────────
     """
     CREATE TABLE IF NOT EXISTS invitations (

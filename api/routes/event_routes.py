@@ -14,7 +14,9 @@ from auth.constants import (
     AUDIT_EVENT_CREATED,
     AUDIT_EVENT_DELETED,
     AUDIT_EVENT_UPDATED,
+    ROLE_ADMIN,
     ROLE_SUPER_ADMIN,
+    ROLE_USER,
 )
 from auth.dependencies import get_current_user, require_role
 from db.pool import db_cursor
@@ -74,7 +76,9 @@ def _deactivate_other_active_events(cur, keep_id: str, now: datetime) -> None:
 @router.get(
     "",
     summary="List managed events",
-    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+    # Read parity: every authenticated role sees the same event list.
+    # Mutations (POST/PUT/DELETE) remain restricted below.
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER))],
 )
 def list_events(
     page: int = Query(1, ge=1),
@@ -147,7 +151,7 @@ def get_active_event(_user: dict = Depends(get_current_user)):
 @router.get(
     "/{event_id}",
     summary="Get managed event",
-    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER))],
 )
 def get_event(event_id: str):
     with db_cursor(commit=False) as cur:
@@ -169,7 +173,10 @@ def get_event(event_id: str):
 @router.post(
     "",
     summary="Create managed event",
-    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+    # Add-event parity: any authenticated role can create events (same "Add"
+    # affordance as SuperAdmin). Update/Delete remain admin-scoped below so
+    # Users cannot mutate events created by others.
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER))],
 )
 def create_event(body: CreateManagedEventRequest, request: Request):
     user = get_current_user(request)
@@ -237,7 +244,7 @@ def create_event(body: CreateManagedEventRequest, request: Request):
 @router.put(
     "/{event_id}",
     summary="Update managed event",
-    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN))],
 )
 def update_event(event_id: str, body: UpdateManagedEventRequest, request: Request):
     user = get_current_user(request)
@@ -333,7 +340,7 @@ def update_event(event_id: str, body: UpdateManagedEventRequest, request: Reques
 @router.delete(
     "/{event_id}",
     summary="Soft delete managed event",
-    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN))],
 )
 def delete_event(event_id: str, request: Request):
     user = get_current_user(request)

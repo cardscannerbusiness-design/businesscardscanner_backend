@@ -12,13 +12,33 @@ from api.schemas import LocalContactBody
 
 logger = logging.getLogger(__name__)
 
+# Strong references so fire-and-forget outreach tasks are not garbage-collected
+# before they persist their delivery status (Python drops tasks with no strong
+# ref, which left rows stuck on "Pending" after the initial online save).
+_background_outreach_tasks: set[asyncio.Task] = set()
+
+
+def track_background_task(task: asyncio.Task) -> None:
+    """Keep a strong ref until the task finishes so the loop cannot drop it."""
+    _background_outreach_tasks.add(task)
+    task.add_done_callback(_background_outreach_tasks.discard)
+
 
 def _delivery_state(result: dict[str, Any]) -> str:
-    """Canonical DB values shown on Contacts: Sent | Failed | Pending."""
+    """Canonical DB values shown on Contacts: Sent | Failed | not_sent | Pending.
+
+    A result with sent=False, attempted=False is not "actively pending" — it
+    represents a skipped send (channel disabled, not configured, no phone/email
+    on the card, offline, dedupe, or user opted out). Persist that as
+    "not_sent" so the frontend shows the accurate not-sent/disabled badge
+    instead of a misleading "Pending" indicator.
+    """
     if result.get("sent") is True:
         return "Sent"
     if result.get("attempted") is True:
         return "Failed"
+    if result.get("skipped") is True or result.get("error"):
+        return "not_sent"
     return "Pending"
 
 
@@ -349,16 +369,43 @@ def fire_post_save_outreach(
     user: dict[str, Any] | None = None,
     admin_user_id: str | None = None,
 ) -> None:
-    """Fire-and-forget outreach after contact save."""
-    async def _run() -> None:
-        await run_post_save_outreach(
-            contact_id=contact_id,
-            contact=contact,
-            skip_whatsapp=skip_whatsapp,
-            skip_email=skip_email,
-            scanner_email=scanner_email,
-            user=user,
-            admin_user_id=admin_user_id,
-        )
+    """Fire-and-forget outreach after contact save.
 
-    asyncio.create_task(_run())
+    We keep a strong reference to the created task in a module-level set;
+    otherwise the event loop can garbage-collect the task before
+    `_persist_delivery` writes the final Sent/Failed/not_sent status, which
+    used to leave the initial save row stuck on "Pending" until Resend was
+    clicked.
+    """
+    async def _run() -> None:
+        try:
+            await run_post_save_outreach(
+                contact_id=contact_id,
+                contact=contact,
+                skip_whatsapp=skip_whatsapp,
+                skip_email=skip_email,
+                scanner_email=scanner_email,
+                user=user,
+                admin_user_id=admin_user_id,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Background outreach crashed: %s", exc)
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running event loop (called from a sync context) — run inline in a
+        # thread so delivery status still lands in Postgres.
+        import threading
+
+        def _thread_runner() -> None:
+            try:
+                asyncio.run(_run())
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception("Threaded outreach runner failed: %s", exc)
+
+        threading.Thread(target=_thread_runner, daemon=True).start()
+        return
+
+    task = asyncio.create_task(_run())
+    track_background_task(task)
