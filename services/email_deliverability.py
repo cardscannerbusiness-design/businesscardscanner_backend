@@ -273,7 +273,7 @@ def run_deliverability_health_check() -> dict[str, Any]:
     total = len(checks)
     recommendations: list[str] = []
     if not configured:
-        recommendations.append("Configure SMTP_USER/SMTP_PASSWORD or GMAIL_USER/GMAIL_APP_PASSWORD.")
+        recommendations.append("Configure BREVO_API_KEY and BREVO_SENDER_EMAIL in .env.")
     if domain and not spf.get("ok"):
         recommendations.append(
             f"Add a TXT record on {domain}: v=spf1 include:_spf.google.com ~all "

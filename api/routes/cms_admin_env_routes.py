@@ -324,7 +324,7 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
         if not is_email_configured():
             raise HTTPException(
                 status_code=400,
-                detail="Email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL, or fill CMS SMTP fields, then try again.",
+                detail="Email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL in .env, then try again.",
             )
         try:
             result = await asyncio.to_thread(
