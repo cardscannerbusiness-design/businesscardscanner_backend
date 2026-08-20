@@ -260,9 +260,28 @@ def receive_inbox_email() -> str | None:
 
 
 def _cc_recipients_for_scan(receive_email: str | None = None) -> list[str]:
-    """Receive template recipient — Admin (for User scans) or SuperAdmin (for Admin scans)."""
+    """Receive template recipient — Admin (for User scans) or SuperAdmin (for Admin scans).
+
+    If the login inbox cannot receive mail (no MX, e.g. superadmin@ulavi.com),
+    fall back to the verified Brevo sender so the owner still gets a copy.
+    """
     email = str(receive_email or "").strip()
-    return [email] if email else []
+    if not email:
+        return []
+    mx_ok, mx_error = _check_recipient_mx(email)
+    if mx_ok:
+        return [email]
+    fallback = (BREVO_SENDER_EMAIL or BUSINESS_EMAIL or "").strip()
+    if fallback and fallback.lower() != email.lower() and _looks_like_email(fallback):
+        logger.warning(
+            "Owner inbox %s cannot receive mail (%s). Sending owner copy to %s instead.",
+            _redact_email(email),
+            mx_error,
+            _redact_email(fallback),
+        )
+        return [fallback]
+    logger.warning("Owner inbox %s cannot receive mail: %s", _redact_email(email), mx_error)
+    return []
 
 
 def is_email_configured() -> bool:
@@ -641,16 +660,8 @@ def _send_via_brevo(
         result["error"] = _EMAIL_NOT_CONFIGURED
         return result
 
-    mx_ok, mx_error = _check_recipient_mx(to_address)
-    if not mx_ok:
-        logger.error("Recipient MX check failed for %s: %s", to_address, mx_error)
-        return {
-            "success": False,
-            "recipient_email": to_address,
-            "error": mx_error,
-            "error_code": "EMAIL_RECIPIENT_MX_MISSING",
-        }
-
+    # Brevo accepts the message and reports bounces itself. Local MX pre-check
+    # blocked owner copies to domains like ulavi.com even when Brevo was ready.
     cc_list, cc_invalid = _prepare_cc_addresses(cc_addresses, to_address=to_address)
     result["cc_emails"] = cc_list
     if cc_invalid:
