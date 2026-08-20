@@ -333,6 +333,7 @@ def create_admin_registration(
     ip: str = "",
     user_agent: str = "",
 ) -> dict[str, Any]:
+    del phone_verification_token  # Admin signup no longer requires phone OTP.
     _check_rate_limit(ip)
 
     role = (role or ROLE_ADMIN).strip().upper()
@@ -366,10 +367,10 @@ def create_admin_registration(
     if not phone:
         raise RegistrationError("INVALID_PHONE", "Mobile number is required.", 422)
 
-    from auth.phone_otp_service import PhoneOtpError, assert_phone_available, require_verified_phone
+    from auth.phone_otp_service import PhoneOtpError, assert_phone_available, normalize_phone
 
     try:
-        phone_normalized = require_verified_phone(phone=phone, token=phone_verification_token)
+        phone_normalized = normalize_phone(phone)
         assert_phone_available(phone_normalized)
     except PhoneOtpError as exc:
         raise RegistrationError(exc.code, exc.message, exc.status_code) from exc
@@ -455,7 +456,7 @@ def create_admin_registration(
                     first_name, last_name, email, phone, designation, department,
                     username, password_hash, role, company_name, company_code,
                     company_address, company_phone, company_email, company_website,
-                    STATUS_PENDING, requested_company_id, phone_normalized, now, now, request_id,
+                    STATUS_PENDING, requested_company_id, phone_normalized, None, now, request_id,
                 ),
             )
         else:
@@ -476,7 +477,7 @@ def create_admin_registration(
                     request_id, first_name, last_name, email, phone, designation, department,
                     username, password_hash, role, company_name, company_code,
                     company_address, company_phone, company_email, company_website,
-                    STATUS_PENDING, requested_company_id, phone_normalized, now, now, now,
+                    STATUS_PENDING, requested_company_id, phone_normalized, None, now, now,
                 ),
             )
 

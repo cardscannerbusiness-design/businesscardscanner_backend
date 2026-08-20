@@ -207,6 +207,15 @@ def _row_to_contact(row: dict[str, Any]) -> dict[str, Any]:
         "eventDay": row.get("eventDay") or "Day 1",
         "eventId": row.get("eventId"),
         "cardImageBase64": row.get("cardImageBase64"),
+        "hasCardImage": bool(
+            row.get("hasCardImage")
+            if row.get("hasCardImage") is not None
+            else (
+                isinstance(row.get("cardImageBase64"), str)
+                and str(row.get("cardImageBase64") or "").startswith("data:image/")
+                and len(str(row.get("cardImageBase64") or "")) > 32
+            )
+        ),
         "syncStatus": sync_status,
         "source": "localdb",
         "status": status,
@@ -448,7 +457,21 @@ def _contacts_list_sql(
     event_id: str | None = None,
 ) -> tuple[str, list[Any]]:
     base_query = """
-        SELECT c.*,
+        SELECT c.id, c."fullName", c."firstName", c."lastName", c.designation, c.company,
+               c.phone, c."secondaryPhone", c."countryCode", c."countryName",
+               c.email, c."secondaryEmail", c.website, c."secondaryWebsite",
+               c.address, c."secondaryAddress", c."socialLinks", c."gstNumber",
+               c.notes, c."prospect_status", c."eventName", c."eventDay", c."eventId",
+               c."syncStatus", c."createdAt", c."updatedAt", c.is_deleted,
+               c.created_by_user_id, c.owner_company_id, c.created_by_role,
+               c.email_delivery_status, c.email_delivery_error,
+               c.whatsapp_delivery_status, c.whatsapp_delivery_error,
+               c.image_size_bytes,
+               NULL::text AS "cardImageBase64",
+               (
+                   COALESCE(c.image_size_bytes, 0) > 0
+                   OR c."cardImageBase64" IS NOT NULL
+               ) AS "hasCardImage",
                COALESCE(
                    NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''),
                    NULLIF(TRIM(u.email), ''),

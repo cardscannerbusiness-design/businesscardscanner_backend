@@ -30,6 +30,9 @@ class TestNormalize(unittest.TestCase):
         self.assertTrue(info["contacts_allowed"])
         self.assertFalse(info["freemium_exhausted"])
 
+    def test_default_freemium_allowance_is_twenty_five(self) -> None:
+        self.assertEqual(ent.DEFAULT_FREEMIUM_CARD_LIMIT, 25)
+
     def test_exhausted_after_two_cards(self) -> None:
         info = ent._normalize(
             {

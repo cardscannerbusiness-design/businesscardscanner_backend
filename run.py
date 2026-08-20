@@ -16,7 +16,9 @@ def main() -> None:
 
     host = os.environ.get("HOST") or "0.0.0.0"
     port = int(os.environ.get("PORT") or "5000")
-    reload = os.environ.get("RELOAD", "true").lower() in {"1", "true", "yes"}
+    # Default off: file-watch reload restarts the API on log/temp writes and
+    # looks like the app is crashing. Set RELOAD=true for local development.
+    reload = os.environ.get("RELOAD", "false").lower() in {"1", "true", "yes"}
 
     uvicorn.run(
         "main:app",

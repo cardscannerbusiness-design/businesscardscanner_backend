@@ -100,12 +100,25 @@ SCHEMA_STATEMENTS: list[str] = [
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS plan_name VARCHAR(64) NOT NULL DEFAULT '{DEFAULT_PLAN_NAME}';",
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS storage_limit_bytes BIGINT NOT NULL DEFAULT {int(DEFAULT_STORAGE_LIMIT_BYTES)};",
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS used_storage_bytes BIGINT NOT NULL DEFAULT 0;",
-    # Freemium card allowance (test default = 2). Existing rows pick up DEFAULT 2
-    # when the column is first added; cards_used starts at 0 so the next 2 saves count.
+    # Freemium card allowance (default = 25). Existing DBs that still have the
+    # original test default of 2 are raised below; SuperAdmin is not billed via
+    # companies.card_limit (role check in resolve_company_id_for_user / upload).
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS card_limit INTEGER NOT NULL DEFAULT {int(DEFAULT_FREEMIUM_CARD_LIMIT)};",
+    f"ALTER TABLE companies ALTER COLUMN card_limit SET DEFAULT {int(DEFAULT_FREEMIUM_CARD_LIMIT)};",
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS cards_used INTEGER NOT NULL DEFAULT 0;",
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS entitlement_started_at TIMESTAMPTZ;",
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS entitlement_exhausted_at TIMESTAMPTZ;",
+    f"""
+    UPDATE companies
+    SET card_limit = {int(DEFAULT_FREEMIUM_CARD_LIMIT)},
+        entitlement_exhausted_at = CASE
+            WHEN cards_used >= {int(DEFAULT_FREEMIUM_CARD_LIMIT)} THEN COALESCE(entitlement_exhausted_at, NOW())
+            ELSE NULL
+        END
+    WHERE UPPER(COALESCE(plan_name, '{DEFAULT_PLAN_NAME}')) = 'FREEMIUM'
+      AND card_limit = 2
+      AND {int(DEFAULT_FREEMIUM_CARD_LIMIT)} <> 2;
+    """,
     """
     UPDATE companies
     SET entitlement_started_at = COALESCE(entitlement_started_at, created_at, NOW())
