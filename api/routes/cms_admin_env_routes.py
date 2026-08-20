@@ -19,9 +19,11 @@ from services.admin_env_service import (
     delete_admin_env_settings as delete_admin_env,
     get_admin_env_settings as get_admin_env,
     list_admin_env_settings as list_admins_with_env,
+    list_cms_tenant_users,
     merge_admin_env_for_test,
     upsert_admin_env_settings as upsert_admin_env,
 )
+from services.company_lifecycle import CompanyNotFoundError, remove_cms_client
 from services.admin_runtime_config import use_admin_env_payload
 from services.email_service import is_email_configured, send_business_thank_you_email
 from services.email_template_service import get_thank_you_shell
@@ -43,6 +45,7 @@ class AdminEnvUpdateRequest(BaseModel):
     whatsapp: dict[str, Any] | None = Field(default=None)
     email: dict[str, Any] | None = Field(default=None)
     templates: dict[str, Any] | None = Field(default=None)
+    google_sheets: dict[str, Any] | None = Field(default=None)
 
 
 class CmsWhatsAppTestRequest(BaseModel):
@@ -113,6 +116,7 @@ def put_admin_env(admin_id: str, body: AdminEnvUpdateRequest, request: Request):
             whatsapp=body.whatsapp,
             email=body.email,
             templates=body.templates,
+            google_sheets=body.google_sheets,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -151,6 +155,28 @@ def delete_one_admin_env(admin_id: str, request: Request):
         new_value={"admin_id": admin_id},
     )
     return {"success": True, "item": item}
+
+
+@router.delete(
+    "/clients/{admin_id}",
+    summary="Remove a CMS client",
+    description="Deletes the company, its Admin/Users, CMS env, and registration requests so the client leaves both the app and CMS.",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def delete_cms_client(admin_id: str, request: Request):
+    actor = get_current_user(request)
+    try:
+        purged = remove_cms_client(admin_id)
+    except CompanyNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    log_action(
+        str(actor["id"]),
+        "cms_client_removed",
+        ip=request.client.host if request.client else "",
+        new_value={"admin_id": admin_id, **purged},
+    )
+    return {"success": True, **purged}
 
 
 @router.post(
@@ -298,7 +324,7 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
         if not is_email_configured():
             raise HTTPException(
                 status_code=400,
-                detail="Email is not configured. Fill SMTP_USER, SMTP_PASSWORD, and SMTP_FROM, then try again.",
+                detail="Email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL, or fill CMS SMTP fields, then try again.",
             )
         try:
             result = await asyncio.to_thread(
@@ -323,3 +349,42 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
         "to": result.get("recipient_email") or body.contact_email,
         "subject": result.get("subject"),
     }
+
+
+class CmsGoogleSheetsTestRequest(BaseModel):
+    google_sheets: dict[str, Any] | None = None
+
+
+@router.get(
+    "/admin-env/{admin_id}/users",
+    summary="List tenant users with active and connected counts",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+@router.get(
+    "/admin-env/{admin_id}/test-users",
+    summary="Tenant users for CMS Environment (active / connected)",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def get_admin_tenant_users(admin_id: str):
+    try:
+        return list_cms_tenant_users(admin_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/admin-env/{admin_id}/test-google-sheets",
+    summary="Probe Google Sheets access for this Admin using saved Sheet ID",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def test_admin_google_sheets(admin_id: str, body: CmsGoogleSheetsTestRequest):
+    from services.google_sheets_service import probe_spreadsheet
+
+    item = get_admin_env(admin_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Admin not found.")
+    incoming = body.google_sheets or {}
+    saved = item.get("google_sheets") or {}
+    sheet_id = str(incoming.get("google_sheet_id") or saved.get("google_sheet_id") or "").strip()
+    sheet_name = str(incoming.get("google_sheet_name") or saved.get("google_sheet_name") or "").strip()
+    return probe_spreadsheet(spreadsheet_id=sheet_id, worksheet=sheet_name)

@@ -40,6 +40,13 @@ from services.storage_service import (
     get_storage_usage as get_company_quota_usage,
     resolve_company_id_for_user,
 )
+from services.entitlement_service import (
+    CardLimitExceededError,
+    ContactsFrozenError,
+    EntitlementDeniedError,
+    assert_can_access_contacts,
+    assert_can_process_card,
+)
 from utils.file_utils import cleanup_temp_file, save_temp_file, validate_file
 
 router = APIRouter(tags=["Contacts"])
@@ -74,6 +81,7 @@ async def _await_online_outreach_into_response(
             skip_email=body.skipEmail,
             scanner_email=get_receive_email_from_request(request),
             user=user,
+            initial_save=True,
         )
     )
     track_background_task(outreach_task)
@@ -116,6 +124,26 @@ async def _await_online_outreach_into_response(
     refreshed = storage.get_contact(contact_id, user=user)
     if refreshed:
         response["contact"] = refreshed
+
+
+def _raise_entitlement(exc: EntitlementDeniedError) -> None:
+    logger.warning(
+        "[ENTITLEMENT] API rejected error=%s detail=%s",
+        exc.code,
+        exc.to_response(),
+    )
+    raise HTTPException(status_code=403, detail=exc.to_response()) from exc
+
+
+def _raise_card_limit(exc: CardLimitExceededError) -> None:
+    _raise_entitlement(exc)
+
+
+def _require_contacts_access(user: dict[str, Any]) -> None:
+    try:
+        assert_can_access_contacts(resolve_company_id_for_user(user))
+    except ContactsFrozenError as exc:
+        _raise_entitlement(exc)
 
 
 def _raise_storage_limit(exc: StorageLimitExceededError) -> None:
@@ -178,6 +206,12 @@ async def check_duplicates(
     request: DuplicateCheckRequest,
     user: dict = Depends(get_current_user),
 ):
+    # After Freemium exhaustion do not leak stored contacts. Empty list lets
+    # Capture continue (IndexedDB save) without exposing PostgreSQL rows.
+    try:
+        assert_can_access_contacts(resolve_company_id_for_user(user))
+    except ContactsFrozenError:
+        return {"duplicates": []}
     return {"duplicates": find_duplicate_contacts(request.model_dump(), user=user)}
 
 
@@ -187,6 +221,7 @@ async def update_existing_contact(
     request: ContactUpdateRequest,
     user: dict = Depends(get_current_user),
 ):
+    _require_contacts_access(user)
     existing = storage.get_contact(contact_id, user=user)
     require_contact_access(user, existing)
     try:
@@ -228,6 +263,8 @@ async def create_contact(
 
         try:
             result = save_contact(contact_data, image_path=temp_path)
+        except CardLimitExceededError as exc:
+            _raise_card_limit(exc)
         except StorageLimitExceededError as exc:
             _raise_storage_limit(exc)
         except LocalDbError as exc:
@@ -246,6 +283,7 @@ async def create_contact(
             skip_email=bool(contact_data.get("skipEmail")),
             scanner_email=get_receive_email_from_request(request),
             user=user,
+            initial_save=True,
         )
         return {
             **result,
@@ -266,6 +304,7 @@ async def fetch_contacts(
     event: str | None = Query(None, max_length=200),
     eventId: str | None = Query(None, max_length=100),
 ):
+    _require_contacts_access(user)
     if page is not None or limit is not None or q or event or eventId:
         return storage.list_contacts_page(
             user=user,
@@ -353,6 +392,28 @@ async def storage_config(user: dict = Depends(get_current_user)):
 )
 async def storage_usage(user: dict = Depends(get_current_user)):
     """Return plan, used/limit/remaining bytes, can_upload, and warning_level."""
+    from auth.constants import ROLE_SUPER_ADMIN
+    from services.entitlement_service import entitlement_fields_for_usage
+
+    if user.get("role") == ROLE_SUPER_ADMIN:
+        unlimited = {
+            "plan": "UNLIMITED",
+            "plan_name": "Unlimited",
+            "storage_limit_bytes": None,
+            "used_storage_bytes": 0,
+            "remaining_storage_bytes": None,
+            "used_percentage": 0,
+            "used_mb": 0,
+            "limit_mb": None,
+            "remaining_mb": None,
+            "can_upload": True,
+            "warning_level": "NORMAL",
+        }
+        unlimited.update(entitlement_fields_for_usage(None))
+        unlimited["plan"] = "UNLIMITED"
+        unlimited["plan_name"] = "Unlimited"
+        return unlimited
+
     company_id = resolve_company_id_for_user(user)
     if not company_id:
         raise HTTPException(
@@ -386,6 +447,7 @@ async def list_contacts_api(
     event: str | None = Query(None, max_length=200),
     eventId: str | None = Query(None, max_length=100),
 ):
+    _require_contacts_access(user)
     if page is not None or limit is not None or q or event or eventId:
         return storage.list_contacts_page(
             user=user,
@@ -400,6 +462,7 @@ async def list_contacts_api(
 
 @router.get("/api/contacts/{contact_id}")
 async def get_contact_api(contact_id: str, user: dict = Depends(get_current_user)):
+    _require_contacts_access(user)
     contact = storage.get_contact(contact_id, user=user)
     return require_contact_access(user, contact)
 
@@ -407,6 +470,7 @@ async def get_contact_api(contact_id: str, user: dict = Depends(get_current_user
 @router.get("/api/contacts/{contact_id}/card-image", summary="Original card image")
 async def get_contact_card_image(contact_id: str, user: dict = Depends(get_current_user)):
     """Serve the stored business-card image (base64 in PostgreSQL) as a file."""
+    _require_contacts_access(user)
     import base64
 
     from fastapi.responses import Response
@@ -457,6 +521,13 @@ async def create_contact_json(
     user: dict = Depends(get_current_user),
 ):
     try:
+        # Freeze PostgreSQL persist after Freemium exhaustion (IndexedDB still allowed).
+        # Check before duplicate lookup so contact rows are not leaked.
+        try:
+            assert_can_process_card(resolve_company_id_for_user(user))
+        except CardLimitExceededError as exc:
+            _raise_card_limit(exc)
+
         payload = body.model_dump()
         payload["created_by_user_id"] = user["id"]
 
@@ -510,6 +581,8 @@ async def create_contact_json(
             )
 
         return response
+    except CardLimitExceededError as exc:
+        _raise_card_limit(exc)
     except StorageLimitExceededError as exc:
         _raise_storage_limit(exc)
     except ContactStorageError as exc:
@@ -525,6 +598,7 @@ async def update_contact_json(
     user: dict = Depends(get_current_user),
 ):
     try:
+        _require_contacts_access(user)
         existing = storage.get_contact(contact_id, user=user)
         require_contact_access(user, existing)
         payload = body.model_dump()
@@ -548,6 +622,7 @@ async def patch_contact_sync_status(
     body: SyncStatusBody,
     user: dict = Depends(get_current_user),
 ):
+    _require_contacts_access(user)
     existing = storage.get_contact(contact_id, user=user)
     require_contact_access(user, existing)
     storage.patch_sync_status(
@@ -568,6 +643,7 @@ async def delete_contact_api(
     contact_id: str,
     user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN)),
 ):
+    _require_contacts_access(user)
     contact = storage.get_contact(contact_id, user=user)
     require_contact_access(user, contact)
     result = storage.delete_contact(contact_id)
@@ -577,7 +653,8 @@ async def delete_contact_api(
 
 
 @router.post("/contacts/seed-sample")
-async def seed_offline_sample(_user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN))):
+async def seed_offline_sample(user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN))):
+    _require_contacts_access(user)
     return seed_offline_sample_if_empty()
 
 
@@ -589,6 +666,7 @@ def remove_contact(
     contact_id: str,
     user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN)),
 ):
+    _require_contacts_access(user)
     contact = storage.get_contact(contact_id, user=user)
     require_contact_access(user, contact)
     return delete_contact(contact_id)

@@ -18,11 +18,17 @@ class TestAuthPublicPaths(unittest.TestCase):
 
 
 class TestContactOwnership(unittest.TestCase):
-    def test_super_admin_sees_all(self) -> None:
+    def test_super_admin_sees_own_not_tenant(self) -> None:
         self.assertTrue(
             user_can_access_contact(
                 {"id": "sa", "role": "SUPER_ADMIN"},
-                {"created_by_user_id": "other", "owner_company_id": "c1"},
+                {"created_by_user_id": "sa", "owner_company_id": None, "created_by_role": "SUPER_ADMIN"},
+            )
+        )
+        self.assertFalse(
+            user_can_access_contact(
+                {"id": "sa", "role": "SUPER_ADMIN"},
+                {"created_by_user_id": "other", "owner_company_id": "c1", "created_by_role": "ADMIN"},
             )
         )
 

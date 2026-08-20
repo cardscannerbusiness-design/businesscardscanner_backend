@@ -3,9 +3,18 @@ import asyncio
 import logging
 from typing import Any
 
+from fastapi import HTTPException
+
 from services import contact_storage as storage
 from services.admin_runtime_config import resolve_owner_admin_for_outreach, use_admin_env
 from services.email_service import is_test_recipient_mode, schedule_email_for_contact
+from services.entitlement_service import (
+    OUTREACH_BLOCKED_MESSAGE,
+    OutreachFrozenError,
+    assert_can_send_outreach,
+    can_send_outreach,
+)
+from services.storage_service import resolve_company_id_for_user
 from services.whatsapp_service import schedule_whatsapp_for_contact
 
 from api.schemas import LocalContactBody
@@ -22,6 +31,20 @@ def track_background_task(task: asyncio.Task) -> None:
     """Keep a strong ref until the task finishes so the loop cannot drop it."""
     _background_outreach_tasks.add(task)
     task.add_done_callback(_background_outreach_tasks.discard)
+
+
+def require_outreach_entitlement(
+    user: dict[str, Any] | None,
+    *,
+    initial_save: bool = False,
+    channel: str | None = None,
+) -> None:
+    """HTTP 403 when WhatsApp/Email are frozen for this company."""
+    company_id = resolve_company_id_for_user(user)
+    try:
+        assert_can_send_outreach(company_id, initial_save=initial_save, channel=channel)
+    except OutreachFrozenError as exc:
+        raise HTTPException(status_code=403, detail=exc.to_response()) from exc
 
 
 def _delivery_state(result: dict[str, Any]) -> str:
@@ -161,6 +184,7 @@ async def schedule_outreach_for_contact(
     scanner_email: str | None = None,
     user: dict[str, Any] | None = None,
     admin_user_id: str | None = None,
+    initial_save: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     owner_admin_id = resolve_owner_admin_for_outreach(
         user=user,
@@ -177,6 +201,8 @@ async def schedule_outreach_for_contact(
             skip_email=skip_email,
             log_context=log_context,
             scanner_email=scanner_email,
+            user=user,
+            initial_save=initial_save,
         )
 
 
@@ -190,6 +216,8 @@ async def _schedule_outreach_for_contact_inner(
     skip_email: bool = False,
     log_context: str = "outreach",
     scanner_email: str | None = None,
+    user: dict[str, Any] | None = None,
+    initial_save: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     # Contacts "Resend" must actually hit Meta/SMTP again (do not treat marker as success).
     force_resend = "resend" in str(log_context or "").lower()
@@ -199,21 +227,39 @@ async def _schedule_outreach_for_contact_inner(
         "contact_id": contact_id,
         "skip_if_already_sent": not force_resend,
     }
+    company_id = resolve_company_id_for_user(user)
+    outreach_ok = can_send_outreach(company_id, initial_save=initial_save)
+    if not outreach_ok:
+        logger.info(
+            "Outreach blocked by Freemium entitlement company_id=%s context=%s",
+            company_id,
+            log_context,
+        )
+        skip_whatsapp = True
+        skip_email = True
     whatsapp_result: dict[str, Any] = {
         "attempted": False,
         "sent": False,
         "skipped": bool(skip_whatsapp),
-        "error": "Skipped by request (skipWhatsApp=true)." if skip_whatsapp else None,
+        "error": (
+            OUTREACH_BLOCKED_MESSAGE
+            if not outreach_ok
+            else ("Skipped by request (skipWhatsApp=true)." if skip_whatsapp else None)
+        ),
     }
     email_result: dict[str, Any] = {
         "attempted": False,
         "sent": False,
         "skipped": bool(skip_email),
         "error": (
-            "Skipped by request (skipEmail=true). "
-            "Enable Email notifications in Settings, then save again."
-            if skip_email
-            else None
+            OUTREACH_BLOCKED_MESSAGE
+            if not outreach_ok
+            else (
+                "Skipped by request (skipEmail=true). "
+                "Enable Email notifications in Settings, then save again."
+                if skip_email
+                else None
+            )
         ),
     }
 
@@ -309,6 +355,7 @@ async def run_post_save_outreach(
     scanner_email: str | None = None,
     user: dict[str, Any] | None = None,
     admin_user_id: str | None = None,
+    initial_save: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run thank-you WhatsApp/email after a contact is saved to PostgreSQL."""
     skipped_whatsapp: dict[str, Any] = {
@@ -336,6 +383,7 @@ async def run_post_save_outreach(
                 scanner_email=scanner_email,
                 user=user,
                 admin_user_id=admin_user_id,
+                initial_save=initial_save,
             )
 
         if contact:
@@ -349,6 +397,7 @@ async def run_post_save_outreach(
                 scanner_email=scanner_email,
                 user=user,
                 admin_user_id=admin_user_id,
+                initial_save=initial_save,
             )
     except Exception as exc:
         logger.error("Outreach failed: %s", exc, exc_info=True)
@@ -368,6 +417,7 @@ def fire_post_save_outreach(
     scanner_email: str | None = None,
     user: dict[str, Any] | None = None,
     admin_user_id: str | None = None,
+    initial_save: bool = False,
 ) -> None:
     """Fire-and-forget outreach after contact save.
 
@@ -387,6 +437,7 @@ def fire_post_save_outreach(
                 scanner_email=scanner_email,
                 user=user,
                 admin_user_id=admin_user_id,
+                initial_save=initial_save,
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("Background outreach crashed: %s", exc)

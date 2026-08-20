@@ -9,6 +9,8 @@ from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 from typing import Any
 
+import requests
+
 from utils.parser_utils import is_valid_email
 
 from services.email_cc_validation import validate_cc_address_list
@@ -81,14 +83,17 @@ def _normalize_gmail_app_password(value: str | None) -> str:
 GMAIL_USER = _normalize_env(os.getenv("GMAIL_USER"))
 GMAIL_APP_PASSWORD = _normalize_gmail_app_password(os.getenv("GMAIL_APP_PASSWORD"))
 
-# SMTP is the only email transport. GMAIL_USER / GMAIL_APP_PASSWORD are the default
-# credentials; SMTP_USER / SMTP_PASSWORD / SMTP_HOST / SMTP_PORT override them for any
-# other SMTP provider without touching code.
+# Active transport is Brevo REST. SMTP_* below is retained for CMS Admin override
+# and Amazon SES rollback (see _deliver_email).
 SMTP_HOST = _normalize_env(os.getenv("SMTP_HOST")) or DEFAULT_SMTP_HOST
 SMTP_PORT = int(_normalize_env(os.getenv("SMTP_PORT")) or str(DEFAULT_SMTP_PORT))
 SMTP_USER = _normalize_env(os.getenv("SMTP_USER")) or GMAIL_USER
 SMTP_PASSWORD = _normalize_gmail_app_password(os.getenv("SMTP_PASSWORD")) or GMAIL_APP_PASSWORD
 SMTP_FROM = _normalize_env(os.getenv("SMTP_FROM"))
+
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
+BREVO_API_KEY = _normalize_env(os.getenv("BREVO_API_KEY"))
+BREVO_SENDER_EMAIL = _normalize_env(os.getenv("BREVO_SENDER_EMAIL"))
 
 BUSINESS_COMPANY_NAME = _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan"
 BUSINESS_PHONE = _normalize_env(os.getenv("BUSINESS_PHONE")) or ""
@@ -96,6 +101,7 @@ BUSINESS_WEBSITE = _normalize_env(os.getenv("BUSINESS_WEBSITE")) or ""
 # Prefer a real mailbox identity. Never fall back to SES SMTP usernames (AKIA...).
 BUSINESS_EMAIL = (
     _normalize_env(os.getenv("BUSINESS_EMAIL"))
+    or BREVO_SENDER_EMAIL
     or SMTP_FROM
     or (SMTP_USER if "@" in (SMTP_USER or "") else "")
 )
@@ -115,6 +121,21 @@ _SMTP_AUTH_HELP = (
     "(e.g. noreply@namecardscan.com). For Gmail fallback, use a Google App Password."
 )
 
+_EMAIL_NOT_CONFIGURED = (
+    "Email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL "
+    "(verified sender in the Brevo dashboard) in .env."
+)
+
+
+def log_email_startup() -> None:
+    """One-line boot status: email is ready or not."""
+    if is_brevo_configured() or _cms_smtp_override_configured():
+        print("[EMAIL] ready", flush=True)
+        logger.info("[EMAIL] ready")
+        return
+    print("[EMAIL] not ready", flush=True)
+    logger.warning("[EMAIL] not ready")
+
 
 def _auto_send_enabled() -> bool:
     return _normalize_env(os.getenv("EMAIL_AUTO_SEND_ON_SCAN")).lower() not in {
@@ -125,15 +146,26 @@ def _auto_send_enabled() -> bool:
     }
 
 
-def is_smtp_configured() -> bool:
+def _cms_smtp_override_configured() -> bool:
+    """True when CMS Admin Email env has a complete SMTP username + password."""
     from services.admin_runtime_config import runtime_email
 
     em = runtime_email()
-    if em:
-        user = str(em.get("smtp_user") or em.get("smtp_username") or "").strip()
-        password = str(em.get("smtp_password") or "").strip()
-        if user and password:
-            return True
+    if not em:
+        return False
+    user = str(em.get("smtp_user") or em.get("smtp_username") or "").strip()
+    password = str(em.get("smtp_password") or "").strip()
+    return bool(user and password)
+
+
+def is_brevo_configured() -> bool:
+    sender = BREVO_SENDER_EMAIL or BUSINESS_EMAIL
+    return bool(BREVO_API_KEY and _looks_like_email(sender))
+
+
+def is_smtp_configured() -> bool:
+    if _cms_smtp_override_configured():
+        return True
     return bool(SMTP_USER and SMTP_PASSWORD)
 
 
@@ -194,16 +226,26 @@ def _looks_like_email(value: str | None) -> bool:
 def smtp_sender_email() -> str:
     """Address used for From / MAIL FROM.
 
-    Gmail SMTP: SMTP_USER is the mailbox and must be the From address.
-    Amazon SES SMTP: SMTP_USER is an IAM access key (AKIA...) — From must be a
-    verified identity from SMTP_FROM / BUSINESS_EMAIL.
-    CMS Admin email env overrides when active.
+    Brevo REST: BREVO_SENDER_EMAIL (verified sender), else BUSINESS_EMAIL.
+    CMS Admin email env overrides when a complete SMTP block is active.
+    Amazon SES SMTP (rollback): SMTP_USER is an IAM access key (AKIA...) — From
+    must be a verified identity from SMTP_FROM / BUSINESS_EMAIL.
     """
-    return str(_active_smtp().get("from") or "")
+    if _cms_smtp_override_configured():
+        return str(_active_smtp().get("from") or "")
+    if is_brevo_configured():
+        return BREVO_SENDER_EMAIL or BUSINESS_EMAIL or ""
+    # SES SMTP (disabled — restore by using _active_smtp() From):
+    # return str(_active_smtp().get("from") or "")
+    return BREVO_SENDER_EMAIL or BUSINESS_EMAIL or str(_active_smtp().get("from") or "")
 
 
 def smtp_reply_to_email() -> str:
     """Public reply address; may differ from the authenticated From mailbox."""
+    if _cms_smtp_override_configured():
+        return str(_active_smtp().get("reply") or "") or smtp_sender_email()
+    if is_brevo_configured():
+        return BUSINESS_EMAIL or smtp_sender_email()
     return str(_active_smtp().get("reply") or "") or smtp_sender_email()
 
 
@@ -224,7 +266,7 @@ def _cc_recipients_for_scan(receive_email: str | None = None) -> list[str]:
 
 
 def is_email_configured() -> bool:
-    return is_smtp_configured()
+    return is_brevo_configured() or _cms_smtp_override_configured()
 
 
 def is_email_test_recipient_configured() -> bool:
@@ -238,9 +280,14 @@ def is_test_recipient_mode() -> bool:
 
 
 def get_email_provider() -> str | None:
-    """SMTP (smtplib) is the only email transport."""
-    if is_smtp_configured():
+    """Active transport: Brevo REST, or CMS Admin SMTP override when complete."""
+    if _cms_smtp_override_configured():
         return "smtp"
+    if is_brevo_configured():
+        return "brevo"
+    # SES SMTP (disabled — restore by returning "smtp" when is_smtp_configured()):
+    # if is_smtp_configured():
+    #     return "smtp"
     return None
 
 
@@ -500,6 +547,8 @@ def _send_via_smtp_relay(
     return result
 
 
+# Amazon SES / Gmail SMTP retained for CMS Admin override and later rollback.
+# Global SES send is disabled in _deliver_email; restore by uncommenting that call.
 def _send_via_smtp(
     to_address: str,
     *,
@@ -561,6 +610,102 @@ def _send_via_smtp(
     return result
 
 
+def _brevo_error_detail(response: requests.Response) -> str:
+    detail = (response.text or "").strip() or response.reason
+    try:
+        data = response.json()
+    except ValueError:
+        return detail
+    if isinstance(data, dict):
+        return str(data.get("message") or data.get("error") or detail)
+    return detail
+
+
+def _send_via_brevo(
+    to_address: str,
+    *,
+    subject: str,
+    plain_body: str,
+    html_body: str,
+    cc_addresses: list[str] | None = None,
+) -> dict[str, Any]:
+    """Send an email via the Brevo transactional REST API."""
+    result: dict[str, Any] = {
+        "success": False,
+        "recipient_email": to_address,
+        "cc_emails": [],
+        "error": None,
+    }
+    sender_email = BREVO_SENDER_EMAIL or BUSINESS_EMAIL
+    if not BREVO_API_KEY or not _looks_like_email(sender_email):
+        result["error"] = _EMAIL_NOT_CONFIGURED
+        return result
+
+    mx_ok, mx_error = _check_recipient_mx(to_address)
+    if not mx_ok:
+        logger.error("Recipient MX check failed for %s: %s", to_address, mx_error)
+        return {
+            "success": False,
+            "recipient_email": to_address,
+            "error": mx_error,
+            "error_code": "EMAIL_RECIPIENT_MX_MISSING",
+        }
+
+    cc_list, cc_invalid = _prepare_cc_addresses(cc_addresses, to_address=to_address)
+    result["cc_emails"] = cc_list
+    if cc_invalid:
+        result["cc_invalid"] = cc_invalid
+
+    payload: dict[str, Any] = {
+        "sender": {
+            "name": BUSINESS_COMPANY_NAME,
+            "email": sender_email,
+        },
+        "to": [{"email": to_address}],
+        "subject": subject,
+        "htmlContent": html_body,
+        "textContent": plain_body,
+    }
+    reply_to = smtp_reply_to_email()
+    if _looks_like_email(reply_to):
+        payload["replyTo"] = {"email": reply_to}
+    if cc_list:
+        payload["cc"] = [{"email": addr} for addr in cc_list]
+
+    try:
+        response = requests.post(
+            BREVO_API_URL,
+            headers={
+                "accept": "application/json",
+                "api-key": BREVO_API_KEY,
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        result["error"] = f"Network error connecting to Brevo: {exc}"
+        logger.error("Brevo network error: %s", result["error"], exc_info=True)
+        return result
+
+    if response.status_code in (200, 201, 202):
+        logger.info("SUCCESS: Thank-you email sent via Brevo to %s", to_address)
+        result["success"] = True
+        try:
+            data = response.json()
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and data.get("messageId"):
+            result["message_id"] = data["messageId"]
+        return result
+
+    result["error"] = (
+        f"Brevo rejected the send ({response.status_code}): {_brevo_error_detail(response)}"
+    )
+    logger.error("Brevo send failed for %s: %s", to_address, result["error"])
+    return result
+
+
 def _deliver_email(
     to_address: str,
     *,
@@ -569,7 +714,8 @@ def _deliver_email(
     html_body: str,
     cc_addresses: list[str] | None = None,
 ) -> dict[str, Any]:
-    if is_smtp_configured():
+    # CMS Admin SMTP override still takes precedence when complete.
+    if _cms_smtp_override_configured():
         return _send_via_smtp(
             to_address,
             subject=subject,
@@ -577,13 +723,27 @@ def _deliver_email(
             html_body=html_body,
             cc_addresses=cc_addresses,
         )
+    if is_brevo_configured():
+        return _send_via_brevo(
+            to_address,
+            subject=subject,
+            plain_body=plain_body,
+            html_body=html_body,
+            cc_addresses=cc_addresses,
+        )
+    # SES SMTP (disabled — restore by calling _send_via_smtp):
+    # if is_smtp_configured():
+    #     return _send_via_smtp(
+    #         to_address,
+    #         subject=subject,
+    #         plain_body=plain_body,
+    #         html_body=html_body,
+    #         cc_addresses=cc_addresses,
+    #     )
     return {
         "success": False,
         "recipient_email": to_address,
-        "error": (
-            "Email is not configured. Set GMAIL_USER + GMAIL_APP_PASSWORD "
-            "(or SMTP_USER + SMTP_PASSWORD) in .env."
-        ),
+        "error": _EMAIL_NOT_CONFIGURED,
     }
 
 
@@ -956,9 +1116,9 @@ def _send_cc_scanned_details_emails(
     *,
     contact: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Send the CC-only scanned-details template as separate emails (SMTP)."""
+    """Send the CC-only scanned-details template as separate emails."""
     provider = get_email_provider()
-    if provider != "smtp" or not cc_addresses:
+    if provider not in {"smtp", "brevo"} or not cc_addresses:
         return []
 
     plain_body, html_body = build_cc_scanned_contact_body(contact)
@@ -996,6 +1156,21 @@ def _attach_multipart_body(message: EmailMessage, plain: str, html_body: str) ->
     message.add_alternative(html_body, subtype="html")
 
 
+def _log_email_console(
+    *,
+    success: bool,
+    to_address: str | None,
+    provider: str | None = None,
+    error: str | None = None,
+) -> str:
+    """Swagger/API message only — terminal shows ready/not-ready at startup."""
+    via = provider or "brevo"
+    if success:
+        return f"Email working properly. Sent via {via} to {to_address}."
+    reason = error or "unknown error"
+    return f"Email not sent via {via} to {to_address or '(none)'}: {reason}"
+
+
 def _resolve_recipient(extracted_email: str, *, test_override: str | None = None) -> str:
     """Resolve the final recipient, applying test override when configured."""
     override = test_override or EMAIL_TEST_RECIPIENT
@@ -1029,32 +1204,36 @@ def send_business_thank_you_email(
         "extracted_email": recipient_email,
         "subject": SUBJECT,
         "error": None,
+        "message": None,
     }
 
     is_valid, validated_or_error = validate_email_address(recipient_email)
     if not is_valid:
-        logger.warning("Email send aborted: %s", validated_or_error)
         result["error"] = validated_or_error
+        result["message"] = _log_email_console(
+            success=False, to_address=recipient_email, error=validated_or_error
+        )
         return result
 
     validated_email: str = validated_or_error
     to_address = _resolve_recipient(validated_email, test_override=test_override)
     is_valid_to, to_validated_or_error = validate_email_address(to_address)
     if not is_valid_to:
-        logger.warning("Email send aborted: %s", to_validated_or_error)
         result["error"] = to_validated_or_error
+        result["message"] = _log_email_console(
+            success=False, to_address=to_address, error=to_validated_or_error
+        )
         return result
 
     to_address = to_validated_or_error
     result["recipient_email"] = to_address
 
     if not is_email_configured():
-        error = (
-            "Email is not configured. Set GMAIL_USER + GMAIL_APP_PASSWORD "
-            "(or SMTP_USER + SMTP_PASSWORD) in .env."
-        )
-        logger.error("Email send failed: %s", error)
+        error = _EMAIL_NOT_CONFIGURED
         result["error"] = error
+        result["message"] = _log_email_console(
+            success=False, to_address=to_address, error=error
+        )
         return result
 
     plain_body, html_body = build_thank_you_email_body(
@@ -1086,12 +1265,14 @@ def send_business_thank_you_email(
     )
 
     result["success"] = delivery.get("success", False)
-    result["cc_emails"] = cc_list if provider == "smtp" else []
+    result["cc_emails"] = cc_list if provider in {"smtp", "brevo"} else []
     if cc_invalid and "cc_invalid" not in result:
         result["cc_invalid"] = cc_invalid
     result["error"] = delivery.get("error")
+    if delivery.get("message_id"):
+        result["message_id"] = delivery.get("message_id")
 
-    if result["success"] and cc_list and contact and provider == "smtp":
+    if result["success"] and cc_list and contact and provider in {"smtp", "brevo"}:
         cc_results = _send_cc_scanned_details_emails(cc_list, contact=contact)
         result["cc_delivery"] = cc_results
         cc_failures = [r for r in cc_results if not r.get("success")]
@@ -1102,20 +1283,12 @@ def send_business_thank_you_email(
                 len(cc_failures),
             )
 
-    if result["success"]:
-        logger.info(
-            "Email delivery confirmed via %s to=%s cc=%s",
-            provider,
-            _redact_email(to_address),
-            [_redact_email(e) for e in result["cc_emails"]],
-        )
-    else:
-        logger.error(
-            "Email delivery failed via %s to=%s: %s",
-            provider,
-            _redact_email(to_address),
-            result["error"],
-        )
+    result["message"] = _log_email_console(
+        success=bool(result["success"]),
+        to_address=to_address,
+        provider=provider,
+        error=result.get("error"),
+    )
     return result
 
 
@@ -1201,10 +1374,9 @@ async def schedule_email_for_contact(
         return skipped
 
     if not is_email_configured():
-        logger.warning("Email auto-send skipped: SMTP is not configured.")
+        logger.warning("Email auto-send skipped: Brevo is not configured.")
         skipped["error"] = (
-            "Email is not configured. Set GMAIL_USER + GMAIL_APP_PASSWORD "
-            "(or SMTP_USER + SMTP_PASSWORD) in .env, or configure CMS Admin Email env."
+            f"{_EMAIL_NOT_CONFIGURED} Or configure CMS Admin Email env."
         )
         return skipped
 
@@ -1418,10 +1590,7 @@ def _send_custom_email(
     result["recipient_email"] = to_address
 
     if not is_email_configured():
-        result["error"] = (
-            "Email is not configured. Set GMAIL_USER + GMAIL_APP_PASSWORD "
-            "(or SMTP_USER + SMTP_PASSWORD) in .env."
-        )
+        result["error"] = _EMAIL_NOT_CONFIGURED
         return result
 
     delivery = _deliver_email(

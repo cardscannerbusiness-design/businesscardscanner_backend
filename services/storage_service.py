@@ -209,6 +209,9 @@ def get_storage_usage(company_id: str) -> dict[str, Any]:
         warning_level=info["warning_level"],
         can_upload=info["can_upload"],
     )
+    from services.entitlement_service import entitlement_fields_for_usage
+
+    info.update(entitlement_fields_for_usage(company_id))
     return info
 
 
@@ -452,8 +455,16 @@ def release_storage_after_delete(
 
 
 def resolve_company_id_for_user(user: dict[str, Any] | None) -> str | None:
-    """Best-effort company id from the authenticated user dict."""
+    """Best-effort company id from the authenticated user dict.
+
+    SuperAdmin is never billed/capped via company entitlement, even if a
+    company_id is present on the user row.
+    """
     if not user:
+        return None
+    from auth.constants import ROLE_SUPER_ADMIN
+
+    if str(user.get("role") or "") == ROLE_SUPER_ADMIN:
         return None
     raw = user.get("company_id")
     if raw:

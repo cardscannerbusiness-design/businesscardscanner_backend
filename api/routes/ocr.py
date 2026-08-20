@@ -39,11 +39,14 @@ async def ocr_card(
     req_started = time.perf_counter()
     logger.info("[OCR] Request Received")
 
-    # Enforce authentication (raises 401 if not logged in)
-    get_current_user(request)
+    # Enforce authentication (raises 401 if not logged in).
+    # Do not gate OCR on Freemium card count — scanning continues after
+    # exhaustion; PostgreSQL persist + outreach are enforced elsewhere.
+    user = get_current_user(request)
     logger.info(
-        "[OCR] Auth OK duration_ms=%.1f",
+        "[OCR] Auth OK duration_ms=%.1f user_id=%s",
         (time.perf_counter() - req_started) * 1000,
+        user.get("id"),
     )
 
     if not is_textract_configured():

@@ -4,6 +4,7 @@ from api.routes.admin import router as admin_router
 from api.routes.auth_password_reset import router as auth_password_reset_router
 from api.routes.auth_routes import router as auth_router
 from api.routes.audit_routes import router as audit_router
+from api.routes.billing_routes import router as billing_router
 from api.routes.cms_admin_env_routes import router as cms_admin_env_router
 from api.routes.company_routes import router as company_router
 from api.routes.contacts import router as contacts_router
@@ -12,6 +13,7 @@ from api.routes.google_oauth_routes import router as google_oauth_router
 from api.routes.integrations import router as integrations_router
 from api.routes.invitation_routes import router as invitation_router
 from api.routes.ocr import router as ocr_router
+from api.routes.registration_routes import router as registration_router
 from api.routes.offline_queue_routes import router as offline_queue_router
 from api.routes.profile_routes import router as profile_router
 from api.routes.session_routes import router as session_router
@@ -32,7 +34,9 @@ def build_api_router() -> APIRouter:
     root.include_router(session_router)
     root.include_router(profile_router)
     root.include_router(audit_router)
+    root.include_router(billing_router)
     root.include_router(invitation_router)
+    root.include_router(registration_router)
     root.include_router(offline_queue_router)
     root.include_router(google_oauth_router)
     root.include_router(cms_admin_env_router)

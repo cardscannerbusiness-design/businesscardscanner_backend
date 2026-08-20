@@ -24,6 +24,8 @@ from auth.constants import (
     AUDIT_USER_CREATED,
     ERR_ACCOUNT_INACTIVE,
     ERR_ACCOUNT_LOCKED,
+    ERR_ACCOUNT_PENDING_APPROVAL,
+    ERR_ACCOUNT_REGISTRATION_REJECTED,
     ERR_DUPLICATE_EMAIL,
     ERR_DUPLICATE_USERNAME,
     ERR_INVALID_CREDENTIALS,
@@ -143,6 +145,34 @@ def login(
         user = cur.fetchone()
 
         if not user:
+            from auth.registration_service import (
+                MSG_PENDING_APPROVAL,
+                MSG_REGISTRATION_REJECTED,
+                STATUS_PENDING,
+                STATUS_REJECTED,
+            )
+
+            cur.execute(
+                """
+                SELECT status, password_hash, rejection_reason
+                FROM admin_registration_requests
+                WHERE LOWER(email) = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (identifier,),
+            )
+            req = cur.fetchone()
+            if req and verify_password(password, str(req.get("password_hash") or "")):
+                status = str(req.get("status") or "").lower()
+                if status == STATUS_PENDING:
+                    raise AuthError(ERR_ACCOUNT_PENDING_APPROVAL, MSG_PENDING_APPROVAL, 403)
+                if status == STATUS_REJECTED:
+                    reason = str(req.get("rejection_reason") or "").strip()
+                    message = MSG_REGISTRATION_REJECTED
+                    if reason:
+                        message = f"{MSG_REGISTRATION_REJECTED} Reason: {reason}"
+                    raise AuthError(ERR_ACCOUNT_REGISTRATION_REJECTED, message, 403)
             audit_service.log_action(None, AUDIT_LOGIN_FAILED, ip=ip, user_agent=user_agent,
                                      new_value={"identifier": identifier})
             raise AuthError(ERR_INVALID_CREDENTIALS, "Invalid email/username or password.", 401)

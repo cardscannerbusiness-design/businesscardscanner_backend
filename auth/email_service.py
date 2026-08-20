@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import logging
 import os
-import smtplib
-from email.message import EmailMessage
+import smtplib  # noqa: F401  # retained for commented SES SMTP rollback
+from email.message import EmailMessage  # noqa: F401
+
+import requests
 
 from config.urls import get_frontend_base_url
 
 logger = logging.getLogger(__name__)
+
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 _SMTP_AUTH_HELP = (
     "SMTP authentication failed. For Amazon SES: open SES console → SMTP settings → "
@@ -63,44 +67,106 @@ def _smtp_config() -> dict[str, str]:
     }
 
 
+def _brevo_config() -> dict[str, str]:
+    sender = (
+        _normalize_env(os.getenv("BREVO_SENDER_EMAIL"))
+        or _normalize_env(os.getenv("BUSINESS_EMAIL"))
+    )
+    reply_to = _normalize_env(os.getenv("BUSINESS_EMAIL")) or sender
+    return {
+        "api_key": _normalize_env(os.getenv("BREVO_API_KEY")),
+        "sender": sender,
+        "company": _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan",
+        "reply_to": reply_to,
+    }
+
+
 def _send_email(to: str, subject: str, html_body: str) -> dict:
-    cfg = _smtp_config()
-    if not cfg["user"] or not cfg["password"]:
-        logger.warning("SMTP not configured — skipping email to %s", to)
-        return {"sent": False, "reason": "SMTP not configured"}
-
-    company = _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan"
-    from_header = f"{company} <{cfg['from']}>" if cfg["from"] else company
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = from_header
-    msg["To"] = to
-    if cfg.get("reply_to") and cfg["reply_to"].lower() != cfg["from"].lower():
-        msg["Reply-To"] = cfg["reply_to"]
-    msg.set_content(html_body, subtype="html")
-
-    try:
-        with smtplib.SMTP(cfg["host"], int(cfg["port"]), timeout=30) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(cfg["user"], cfg["password"])
-            server.send_message(msg, from_addr=cfg["from"], to_addrs=[to])
-        logger.info("Auth email sent to %s (%s)", to, subject)
-        return {"sent": True}
-    except smtplib.SMTPAuthenticationError as exc:
-        logger.error("Failed to send email to %s: %s", to, exc)
-        return {"sent": False, "error": _SMTP_AUTH_HELP}
-    except OSError as exc:
-        logger.error("Failed to send email to %s: %s", to, exc)
+    brevo = _brevo_config()
+    if not brevo["api_key"] or "@" not in brevo["sender"]:
+        logger.warning("Brevo not configured — skipping email to %s", to)
         return {
             "sent": False,
-            "error": f"Network error connecting to SMTP: {exc}. {_SMTP_NETWORK_HINT}",
+            "reason": "Brevo is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL in .env.",
         }
-    except Exception as exc:
+
+    payload: dict = {
+        "sender": {"name": brevo["company"], "email": brevo["sender"]},
+        "to": [{"email": to}],
+        "subject": subject,
+        "htmlContent": html_body,
+    }
+    if brevo["reply_to"]:
+        payload["replyTo"] = {"email": brevo["reply_to"]}
+
+    try:
+        response = requests.post(
+            BREVO_API_URL,
+            headers={
+                "accept": "application/json",
+                "api-key": brevo["api_key"],
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+    except requests.RequestException as exc:
         logger.error("Failed to send email to %s: %s", to, exc)
-        return {"sent": False, "error": str(exc)}
+        return {"sent": False, "error": f"Network error connecting to Brevo: {exc}"}
+
+    if response.status_code in (200, 201, 202):
+        logger.info("Auth email sent via Brevo to %s (%s)", to, subject)
+        return {"sent": True}
+
+    detail = (response.text or "").strip() or response.reason
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            detail = str(data.get("message") or data.get("error") or detail)
+    except ValueError:
+        pass
+    logger.error("Failed to send email to %s: %s", to, detail)
+    return {"sent": False, "error": f"Brevo rejected the send ({response.status_code}): {detail}"}
+
+    # SES / Gmail SMTP (disabled — restore by uncommenting this block and
+    # removing the Brevo send above):
+    # cfg = _smtp_config()
+    # if not cfg["user"] or not cfg["password"]:
+    #     logger.warning("SMTP not configured — skipping email to %s", to)
+    #     return {"sent": False, "reason": "SMTP not configured"}
+    #
+    # company = _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan"
+    # from_header = f"{company} <{cfg['from']}>" if cfg["from"] else company
+    #
+    # msg = EmailMessage()
+    # msg["Subject"] = subject
+    # msg["From"] = from_header
+    # msg["To"] = to
+    # if cfg.get("reply_to") and cfg["reply_to"].lower() != cfg["from"].lower():
+    #     msg["Reply-To"] = cfg["reply_to"]
+    # msg.set_content(html_body, subtype="html")
+    #
+    # try:
+    #     with smtplib.SMTP(cfg["host"], int(cfg["port"]), timeout=30) as server:
+    #         server.ehlo()
+    #         server.starttls()
+    #         server.ehlo()
+    #         server.login(cfg["user"], cfg["password"])
+    #         server.send_message(msg, from_addr=cfg["from"], to_addrs=[to])
+    #     logger.info("Auth email sent to %s (%s)", to, subject)
+    #     return {"sent": True}
+    # except smtplib.SMTPAuthenticationError as exc:
+    #     logger.error("Failed to send email to %s: %s", to, exc)
+    #     return {"sent": False, "error": _SMTP_AUTH_HELP}
+    # except OSError as exc:
+    #     logger.error("Failed to send email to %s: %s", to, exc)
+    #     return {
+    #         "sent": False,
+    #         "error": f"Network error connecting to SMTP: {exc}. {_SMTP_NETWORK_HINT}",
+    #     }
+    # except Exception as exc:
+    #     logger.error("Failed to send email to %s: %s", to, exc)
+    #     return {"sent": False, "error": str(exc)}
 
 
 def _frontend_base(explicit: str | None = None) -> str:
@@ -239,6 +305,196 @@ def send_mobile_verification_otp(to_email: str, otp_code: str, phone: str) -> di
     </div>
     """
     return _send_email(to_email, subject, html)
+
+
+def send_registration_received_email(
+    *,
+    to_email: str,
+    applicant_name: str,
+    applicant_email: str,
+    company_name: str,
+    role: str = "ADMIN",
+    phone: str = "",
+    designation: str = "",
+    company_code: str = "",
+) -> dict:
+    """Notify SuperAdmin that a client completed signup and is awaiting approval."""
+    role_label = "Admin" if role == "ADMIN" else "User" if role == "USER" else role
+    try:
+        base = _frontend_base()
+    except RuntimeError:
+        base = ""
+    review_link = f"{base}/companies" if base else "/companies"
+
+    rows = [
+        ("Name", applicant_name or "—"),
+        ("Email", applicant_email or "—"),
+        ("Role", role_label),
+        ("Company", company_name or "—"),
+    ]
+    if company_code:
+        rows.append(("Company code", company_code))
+    if phone:
+        rows.append(("Mobile", phone))
+    if designation:
+        rows.append(("Designation", designation))
+    details = "".join(
+        f"<tr><td style='padding:6px 12px 6px 0;color:#64748b;vertical-align:top;'>{label}</td>"
+        f"<td style='padding:6px 0;font-weight:600;'>{value}</td></tr>"
+        for label, value in rows
+    )
+
+    subject = f"New {role_label} signup pending your approval"
+    html = f"""
+    <div style="font-family: sans-serif; max-width: 520px; margin: auto; color: #1e293b;">
+      <h2 style="color: #0891b2;">New {role_label} registration</h2>
+      <p>A client completed signup and is waiting for Super Admin approval.</p>
+      <table style="width:100%;border-collapse:collapse;margin:16px 0;">{details}</table>
+      <p>Review and approve or reject this request in NameCardScan.</p>
+      <p style="margin: 24px 0;">
+        <a href="{review_link}"
+           style="display: inline-block; padding: 12px 24px; background: #0891b2; color: white;
+                  border-radius: 8px; text-decoration: none; font-weight: bold;">
+          Review &amp; approve
+        </a>
+      </p>
+      <p style="color: #64748b; font-size: 13px;">
+        The applicant cannot sign in until you approve this request.
+      </p>
+    </div>
+    """
+    return _send_email(to_email, subject, html)
+
+
+def send_invitation_accepted_email(
+    *,
+    to_email: str,
+    invitee_name: str,
+    invitee_email: str,
+    role: str,
+    company_name: str,
+    inviter_name: str = "",
+) -> dict:
+    """Notify SuperAdmin that an invited client finished registration."""
+    role_label = "Admin" if role == "ADMIN" else "User" if role == "USER" else role
+    try:
+        base = _frontend_base()
+    except RuntimeError:
+        base = ""
+    review_link = f"{base}/companies" if base else "/companies"
+    inviter_line = (
+        f"<p>Originally invited by <strong>{inviter_name}</strong>.</p>"
+        if (inviter_name or "").strip()
+        else ""
+    )
+    subject = f"Invitation accepted — {role_label} account created"
+    html = f"""
+    <div style="font-family: sans-serif; max-width: 520px; margin: auto; color: #1e293b;">
+      <h2 style="color: #0891b2;">Invitation accepted</h2>
+      <p><strong>{invitee_name or invitee_email}</strong> ({invitee_email}) completed
+         signup as a <strong>{role_label}</strong> for
+         <strong>{company_name or "the workspace"}</strong>.</p>
+      {inviter_line}
+      <p>The account is active and they can sign in.</p>
+      <p style="margin: 24px 0;">
+        <a href="{review_link}"
+           style="display: inline-block; padding: 12px 24px; background: #0891b2; color: white;
+                  border-radius: 8px; text-decoration: none; font-weight: bold;">
+          Open Manage Team
+        </a>
+      </p>
+    </div>
+    """
+    return _send_email(to_email, subject, html)
+
+
+def send_registration_approved_email(*, to_email: str, full_name: str, role: str = "ADMIN") -> dict:
+    try:
+        base = _frontend_base()
+    except RuntimeError:
+        base = ""
+    sign_in = f"{base}/auth/sign-in" if base else "/auth/sign-in"
+    role_label = "Admin" if role == "ADMIN" else "User" if role == "USER" else role
+    subject = "Your NameCardScan registration has been approved"
+    html = f"""
+    <div style="font-family: sans-serif; max-width: 520px; margin: auto; color: #1e293b;">
+      <h2 style="color: #0891b2;">Registration approved</h2>
+      <p>Hi {full_name or "there"},</p>
+      <p>Your NameCardScan {role_label} registration has been approved. You can now sign in.</p>
+      <p style="margin: 24px 0;">
+        <a href="{sign_in}"
+           style="display: inline-block; padding: 12px 24px; background: #0891b2; color: white;
+                  border-radius: 8px; text-decoration: none; font-weight: bold;">
+          Sign in
+        </a>
+      </p>
+    </div>
+    """
+    return _send_email(to_email, subject, html)
+
+
+def send_registration_rejected_email(
+    *,
+    to_email: str,
+    full_name: str,
+    reason: str = "",
+    role: str = "ADMIN",
+) -> dict:
+    reason_html = (
+        f"<p><strong>Reason:</strong> {reason}</p>"
+        if (reason or "").strip()
+        else ""
+    )
+    role_label = "Admin" if role == "ADMIN" else "User" if role == "USER" else role
+    subject = "Your NameCardScan registration request was rejected"
+    html = f"""
+    <div style="font-family: sans-serif; max-width: 520px; margin: auto; color: #1e293b;">
+      <h2 style="color: #0891b2;">Registration not approved</h2>
+      <p>Hi {full_name or "there"},</p>
+      <p>Your NameCardScan {role_label} registration request was rejected.</p>
+      {reason_html}
+      <p>You cannot sign in with this account. You may submit a new registration if appropriate.</p>
+    </div>
+    """
+    return _send_email(to_email, subject, html)
+
+
+def send_admin_registration_received_email(
+    *,
+    to_email: str,
+    applicant_name: str,
+    applicant_email: str,
+    company_name: str,
+    role: str = "ADMIN",
+    phone: str = "",
+    designation: str = "",
+    company_code: str = "",
+) -> dict:
+    return send_registration_received_email(
+        to_email=to_email,
+        applicant_name=applicant_name,
+        applicant_email=applicant_email,
+        company_name=company_name,
+        role=role,
+        phone=phone,
+        designation=designation,
+        company_code=company_code,
+    )
+
+
+def send_admin_registration_approved_email(*, to_email: str, full_name: str) -> dict:
+    return send_registration_approved_email(to_email=to_email, full_name=full_name, role="ADMIN")
+
+
+def send_admin_registration_rejected_email(
+    *,
+    to_email: str,
+    full_name: str,
+    reason: str = "",
+) -> dict:
+    return send_registration_rejected_email(
+        to_email=to_email, full_name=full_name, reason=reason, role="ADMIN"
+    )
 
 
 def send_data_deletion_confirmation(to_email: str, kind: str) -> dict:

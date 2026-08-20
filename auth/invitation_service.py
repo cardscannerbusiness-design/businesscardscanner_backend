@@ -26,7 +26,7 @@ from auth.constants import (
     ROLE_SUPER_ADMIN,
     ROLE_USER,
 )
-from auth.email_service import send_invitation_email
+from auth.email_service import send_invitation_accepted_email, send_invitation_email
 from auth.password_utils import hash_password, validate_password_policy
 from db.pool import db_cursor
 from services.storage_service import DEFAULT_PLAN_NAME, DEFAULT_STORAGE_LIMIT_BYTES
@@ -724,6 +724,42 @@ def accept_invitation(
         user_agent=user_agent,
         new_value={"invitation_id": str(row["id"]), "email": email, "role": role},
     )
+
+    try:
+        from auth.registration_service import _superadmin_emails
+
+        with db_cursor(commit=False) as cur:
+            sa_emails = _superadmin_emails(cur)
+            cur.execute(
+                "SELECT first_name, last_name, email FROM users WHERE id = %s",
+                (row.get("invited_by"),),
+            )
+            inviter_row = cur.fetchone() or {}
+        inviter_name = (
+            f"{inviter_row.get('first_name') or ''} {inviter_row.get('last_name') or ''}".strip()
+            or str(inviter_row.get("email") or "")
+        )
+        invitee_name = f"{first_name} {last_name}".strip()
+        accepted_company = (
+            final_company_name if role == ROLE_ADMIN else (row.get("company_name") or "")
+        )
+        for sa_email in sa_emails:
+            result = send_invitation_accepted_email(
+                to_email=sa_email,
+                invitee_name=invitee_name,
+                invitee_email=email,
+                role=role,
+                company_name=accepted_company,
+                inviter_name=inviter_name,
+            )
+            if not result.get("sent"):
+                logger.warning(
+                    "SuperAdmin invitation-accepted notify to %s did not send: %s",
+                    sa_email,
+                    result.get("error") or result.get("reason") or "unknown",
+                )
+    except Exception as exc:
+        logger.warning("Could not email SuperAdmin about invitation accept for %s: %s", email, exc)
 
     # Secondary: create/share company Google Sheet (never blocks accept).
     # ADMIN → create sheet + Editor shares; USER → refresh Viewer share for company Users.
