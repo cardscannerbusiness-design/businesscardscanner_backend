@@ -122,8 +122,8 @@ _SMTP_AUTH_HELP = (
 )
 
 _EMAIL_NOT_CONFIGURED = (
-    "Email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL "
-    "(verified sender in the Brevo dashboard) in .env."
+    "Email is not configured on the server. "
+    "Set BREVO_API_KEY and BREVO_SENDER_EMAIL in the backend .env, then restart."
 )
 
 
@@ -581,7 +581,10 @@ def _send_via_smtp(
         return {
             "success": False,
             "recipient_email": to_address,
-            "error": "SMTP is not configured. Set GMAIL_USER + GMAIL_APP_PASSWORD (or SMTP_USER + SMTP_PASSWORD) in .env.",
+            "error": (
+                "SMTP override is incomplete. "
+                "Client email uses Brevo — set BREVO_API_KEY and BREVO_SENDER_EMAIL in .env."
+            ),
         }
     # Prefer verified From identity (SES) or Gmail mailbox when SMTP_USER is an email.
     from_mailbox = smtp_sender_email()
@@ -1386,9 +1389,7 @@ async def schedule_email_for_contact(
 
     if not is_email_configured():
         logger.warning("Email auto-send skipped: Brevo is not configured.")
-        skipped["error"] = (
-            f"{_EMAIL_NOT_CONFIGURED} Or configure CMS Admin Email env."
-        )
+        skipped["error"] = _EMAIL_NOT_CONFIGURED
         return skipped
 
     if contact_id and skip_if_already_sent:
