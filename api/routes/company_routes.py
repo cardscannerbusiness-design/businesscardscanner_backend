@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 def list_companies(page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le=200)):
     offset = (page - 1) * limit
     with db_cursor(commit=False) as cur:
-        cur.execute("SELECT COUNT(*) AS total FROM companies")
+        cur.execute("SELECT COUNT(*) AS total FROM companies WHERE status <> 'deleted'")
         total = cur.fetchone()["total"]
         cur.execute(
             """
@@ -55,6 +55,7 @@ def list_companies(page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le=2
                    ) AS user_count
             FROM companies c
             LEFT JOIN users a ON a.id = c.admin_id AND a.deleted_at IS NULL
+            WHERE c.status <> 'deleted'
             ORDER BY c.created_at DESC
             LIMIT %s OFFSET %s
             """,
@@ -236,12 +237,18 @@ def delete_company(company_id: str, request: Request):
     user = get_current_user(request)
     meta = {"ip": request.client.host if request.client else "", "user_agent": request.headers.get("user-agent", "")}
 
-    with db_cursor() as cur:
-        cur.execute("UPDATE companies SET status = 'deleted', updated_at = %s WHERE id = %s AND status != 'deleted'",
-                    (datetime.now(timezone.utc), company_id))
-        if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Company not found or already deleted.")
+    from services.company_lifecycle import CompanyNotFoundError, soft_delete_company_cascade
 
-    audit_service.log_action(user["id"], AUDIT_COMPANY_DELETED, ip=meta["ip"], user_agent=meta["user_agent"],
-                             new_value={"company_id": company_id})
-    return {"success": True, "message": "Company deleted (soft)."}
+    try:
+        purged = soft_delete_company_cascade(company_id)
+    except CompanyNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    audit_service.log_action(
+        user["id"],
+        AUDIT_COMPANY_DELETED,
+        ip=meta["ip"],
+        user_agent=meta["user_agent"],
+        new_value={"company_id": company_id, **purged},
+    )
+    return {"success": True, "message": "Company deleted.", **purged}

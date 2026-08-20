@@ -254,6 +254,7 @@ def delete_user(user_id: str, request: Request):
 
         cur.execute("UPDATE users SET deleted_at = %s, is_active = FALSE WHERE id = %s",
                     (datetime.now(timezone.utc), user_id))
+        cur.execute("DELETE FROM admin_env_settings WHERE admin_user_id = %s", (user_id,))
 
     return {"success": True, "message": "User deleted (soft)."}
 

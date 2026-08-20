@@ -112,12 +112,12 @@ def delete_contact(contact_id: str) -> dict[str, Any]:
     return local_db.delete_contact(contact_id)
 
 
-def delete_all_contacts() -> dict[str, Any]:
+def delete_all_contacts(user: dict | None = None) -> dict[str, Any]:
     if is_client_side_storage():
         return {"deleted": 0, "note": "PostgreSQL not configured"}
     from services import local_db_service as local_db
 
-    return local_db.delete_all_local_db_contacts()
+    return local_db.delete_all_local_db_contacts(user=user)
 
 
 def patch_sync_status(

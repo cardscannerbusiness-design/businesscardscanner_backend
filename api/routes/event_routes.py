@@ -42,7 +42,7 @@ def _parse_date(value: str | None, field: str) -> date | None:
 
 def _serialize_event(row: dict) -> dict:
     out = dict(row)
-    for key in ("id", "created_by", "updated_by"):
+    for key in ("id", "created_by", "updated_by", "company_id"):
         if out.get(key) is not None:
             out[key] = str(out[key])
     for key in ("start_date", "end_date"):
@@ -59,8 +59,38 @@ def _validate_date_range(start: date | None, end: date | None) -> None:
         raise HTTPException(status_code=422, detail="end_date cannot be before start_date.")
 
 
-def _deactivate_other_active_events(cur, keep_id: str, now: datetime) -> None:
-    """Ensure only one managed event is active for scanning/extraction."""
+def _tenant_company_id(user: dict) -> str | None:
+    if user.get("role") == ROLE_SUPER_ADMIN:
+        return None
+    raw = user.get("company_id")
+    return str(raw) if raw else None
+
+
+def _event_scope_sql(user: dict) -> tuple[str, list]:
+    """Tenant filter: SuperAdmin sees only SuperAdmin-owned events (company_id IS NULL)."""
+    if user.get("role") == ROLE_SUPER_ADMIN:
+        return "company_id IS NULL", []
+    company_id = _tenant_company_id(user)
+    if company_id:
+        return "company_id = %s", [company_id]
+    return "created_by = %s", [user["id"]]
+
+
+def _deactivate_other_active_events(cur, keep_id: str, now: datetime, company_id: str | None) -> None:
+    """Ensure only one managed event is active per tenant (or SuperAdmin-owned set)."""
+    if company_id:
+        cur.execute(
+            """
+            UPDATE managed_events
+            SET status = 'inactive', updated_at = %s
+            WHERE deleted_at IS NULL
+              AND status = 'active'
+              AND id <> %s
+              AND company_id = %s
+            """,
+            (now, keep_id, company_id),
+        )
+        return
     cur.execute(
         """
         UPDATE managed_events
@@ -68,6 +98,7 @@ def _deactivate_other_active_events(cur, keep_id: str, now: datetime) -> None:
         WHERE deleted_at IS NULL
           AND status = 'active'
           AND id <> %s
+          AND company_id IS NULL
         """,
         (now, keep_id),
     )
@@ -75,20 +106,21 @@ def _deactivate_other_active_events(cur, keep_id: str, now: datetime) -> None:
 
 @router.get(
     "",
-    summary="List managed events",
-    # Read parity: every authenticated role sees the same event list.
-    # Mutations (POST/PUT/DELETE) remain restricted below.
-    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER))],
+    summary="List managed events for the caller's company (SuperAdmin: own events only)",
 )
 def list_events(
+    request: Request,
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
     q: str = Query("", max_length=200),
     status: str = Query("", max_length=32),
+    user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER)),
 ):
+    del request
     offset = (page - 1) * limit
-    clauses = ["deleted_at IS NULL"]
-    params: list = []
+    scope_sql, scope_params = _event_scope_sql(user)
+    clauses = ["deleted_at IS NULL", scope_sql]
+    params: list = [*scope_params]
 
     if q.strip():
         clauses.append("(name ILIKE %s OR description ILIKE %s OR location ILIKE %s)")
@@ -107,7 +139,7 @@ def list_events(
         cur.execute(
             f"""
             SELECT id, name, description, location, start_date, end_date, status,
-                   created_by, updated_by, created_at, updated_at
+                   created_by, updated_by, company_id, created_at, updated_at
             FROM managed_events
             WHERE {where}
             ORDER BY created_at DESC
@@ -127,20 +159,22 @@ def list_events(
 
 @router.get(
     "/active",
-    summary="Get the currently active managed event (any authenticated role)",
+    summary="Get the currently active managed event for this company",
 )
-def get_active_event(_user: dict = Depends(get_current_user)):
-    """Return the single platform-active event used to tag scans on Extraction."""
+def get_active_event(user: dict = Depends(get_current_user)):
+    """Return the tenant-active event used to tag scans on Extraction."""
+    scope_sql, scope_params = _event_scope_sql(user)
     with db_cursor(commit=False) as cur:
         cur.execute(
-            """
+            f"""
             SELECT id, name, description, location, start_date, end_date, status,
-                   created_by, updated_by, created_at, updated_at
+                   created_by, updated_by, company_id, created_at, updated_at
             FROM managed_events
-            WHERE deleted_at IS NULL AND status = 'active'
+            WHERE deleted_at IS NULL AND status = 'active' AND {scope_sql}
             ORDER BY updated_at DESC NULLS LAST, created_at DESC
             LIMIT 1
-            """
+            """,
+            scope_params,
         )
         row = cur.fetchone()
     if not row:
@@ -151,18 +185,21 @@ def get_active_event(_user: dict = Depends(get_current_user)):
 @router.get(
     "/{event_id}",
     summary="Get managed event",
-    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER))],
 )
-def get_event(event_id: str):
+def get_event(
+    event_id: str,
+    user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER)),
+):
+    scope_sql, scope_params = _event_scope_sql(user)
     with db_cursor(commit=False) as cur:
         cur.execute(
-            """
+            f"""
             SELECT id, name, description, location, start_date, end_date, status,
-                   created_by, updated_by, created_at, updated_at
+                   created_by, updated_by, company_id, created_at, updated_at
             FROM managed_events
-            WHERE id = %s AND deleted_at IS NULL
+            WHERE id = %s AND deleted_at IS NULL AND {scope_sql}
             """,
-            (event_id,),
+            (event_id, *scope_params),
         )
         row = cur.fetchone()
     if not row:
@@ -173,13 +210,12 @@ def get_event(event_id: str):
 @router.post(
     "",
     summary="Create managed event",
-    # Add-event parity: any authenticated role can create events (same "Add"
-    # affordance as SuperAdmin). Update/Delete remain admin-scoped below so
-    # Users cannot mutate events created by others.
-    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER))],
 )
-def create_event(body: CreateManagedEventRequest, request: Request):
-    user = get_current_user(request)
+def create_event(
+    body: CreateManagedEventRequest,
+    request: Request,
+    user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER)),
+):
     name = body.name.strip()
     if not name:
         raise HTTPException(status_code=422, detail="Event name is required.")
@@ -191,15 +227,25 @@ def create_event(body: CreateManagedEventRequest, request: Request):
     if status not in _ALLOWED_STATUS:
         raise HTTPException(status_code=422, detail="Invalid status.")
 
+    company_id = _tenant_company_id(user)
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
-        cur.execute(
-            """
-            SELECT 1 FROM managed_events
-            WHERE deleted_at IS NULL AND LOWER(name) = LOWER(%s)
-            """,
-            (name,),
-        )
+        if company_id:
+            cur.execute(
+                """
+                SELECT 1 FROM managed_events
+                WHERE deleted_at IS NULL AND company_id = %s AND LOWER(name) = LOWER(%s)
+                """,
+                (company_id, name),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT 1 FROM managed_events
+                WHERE deleted_at IS NULL AND company_id IS NULL AND LOWER(name) = LOWER(%s)
+                """,
+                (name,),
+            )
         if cur.fetchone():
             raise HTTPException(status_code=409, detail="An event with this name already exists.")
 
@@ -207,11 +253,11 @@ def create_event(body: CreateManagedEventRequest, request: Request):
             """
             INSERT INTO managed_events (
                 name, description, location, start_date, end_date, status,
-                created_by, updated_by, created_at, updated_at
+                created_by, updated_by, company_id, created_at, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id, name, description, location, start_date, end_date, status,
-                      created_by, updated_by, created_at, updated_at
+                      created_by, updated_by, company_id, created_at, updated_at
             """,
             (
                 name,
@@ -222,20 +268,21 @@ def create_event(body: CreateManagedEventRequest, request: Request):
                 status,
                 user["id"],
                 user["id"],
+                company_id,
                 now,
                 now,
             ),
         )
         row = cur.fetchone()
         if status == "active" and row:
-            _deactivate_other_active_events(cur, str(row["id"]), now)
+            _deactivate_other_active_events(cur, str(row["id"]), now, company_id)
 
     audit_service.log_action(
         user["id"],
         AUDIT_EVENT_CREATED,
         ip=request.client.host if request.client else "",
         user_agent=request.headers.get("user-agent", ""),
-        new_value={"event_id": str(row["id"]), "name": name},
+        new_value={"event_id": str(row["id"]), "name": name, "company_id": company_id},
     )
     logger.info("Managed event created: %s by %s", row["id"], user["id"])
     return _serialize_event(dict(row))
@@ -244,23 +291,29 @@ def create_event(body: CreateManagedEventRequest, request: Request):
 @router.put(
     "/{event_id}",
     summary="Update managed event",
-    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN))],
 )
-def update_event(event_id: str, body: UpdateManagedEventRequest, request: Request):
-    user = get_current_user(request)
+def update_event(
+    event_id: str,
+    body: UpdateManagedEventRequest,
+    request: Request,
+    user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN)),
+):
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update.")
 
+    scope_sql, scope_params = _event_scope_sql(user)
     with db_cursor(commit=False) as cur:
         cur.execute(
-            "SELECT * FROM managed_events WHERE id = %s AND deleted_at IS NULL",
-            (event_id,),
+            f"SELECT * FROM managed_events WHERE id = %s AND deleted_at IS NULL AND {scope_sql}",
+            (event_id, *scope_params),
         )
         existing = cur.fetchone()
     if not existing:
         raise HTTPException(status_code=404, detail="Event not found.")
     existing = dict(existing)
+    company_id = existing.get("company_id")
+    company_id = str(company_id) if company_id else None
 
     name = updates.get("name", existing["name"])
     if isinstance(name, str):
@@ -301,13 +354,22 @@ def update_event(event_id: str, body: UpdateManagedEventRequest, request: Reques
 
     with db_cursor() as cur:
         if "name" in updates:
-            cur.execute(
-                """
-                SELECT 1 FROM managed_events
-                WHERE deleted_at IS NULL AND LOWER(name) = LOWER(%s) AND id <> %s
-                """,
-                (updates["name"], event_id),
-            )
+            if company_id:
+                cur.execute(
+                    """
+                    SELECT 1 FROM managed_events
+                    WHERE deleted_at IS NULL AND LOWER(name) = LOWER(%s) AND id <> %s AND company_id = %s
+                    """,
+                    (updates["name"], event_id, company_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT 1 FROM managed_events
+                    WHERE deleted_at IS NULL AND LOWER(name) = LOWER(%s) AND id <> %s AND company_id IS NULL
+                    """,
+                    (updates["name"], event_id),
+                )
             if cur.fetchone():
                 raise HTTPException(status_code=409, detail="An event with this name already exists.")
 
@@ -317,7 +379,7 @@ def update_event(event_id: str, body: UpdateManagedEventRequest, request: Reques
             SET {', '.join(set_parts)}
             WHERE id = %s AND deleted_at IS NULL
             RETURNING id, name, description, location, start_date, end_date, status,
-                      created_by, updated_by, created_at, updated_at
+                      created_by, updated_by, company_id, created_at, updated_at
             """,
             params,
         )
@@ -325,7 +387,7 @@ def update_event(event_id: str, body: UpdateManagedEventRequest, request: Reques
         if not row:
             raise HTTPException(status_code=404, detail="Event not found.")
         if str(row.get("status") or "").lower() == "active":
-            _deactivate_other_active_events(cur, str(row["id"]), updates["updated_at"])
+            _deactivate_other_active_events(cur, str(row["id"]), updates["updated_at"], company_id)
 
     audit_service.log_action(
         user["id"],
@@ -340,20 +402,23 @@ def update_event(event_id: str, body: UpdateManagedEventRequest, request: Reques
 @router.delete(
     "/{event_id}",
     summary="Soft delete managed event",
-    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN))],
 )
-def delete_event(event_id: str, request: Request):
-    user = get_current_user(request)
+def delete_event(
+    event_id: str,
+    request: Request,
+    user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN)),
+):
     now = datetime.now(timezone.utc)
+    scope_sql, scope_params = _event_scope_sql(user)
     with db_cursor() as cur:
         cur.execute(
-            """
+            f"""
             UPDATE managed_events
             SET deleted_at = %s, updated_at = %s, updated_by = %s, status = 'inactive'
-            WHERE id = %s AND deleted_at IS NULL
+            WHERE id = %s AND deleted_at IS NULL AND {scope_sql}
             RETURNING id, name
             """,
-            (now, now, user["id"], event_id),
+            (now, now, user["id"], event_id, *scope_params),
         )
         row = cur.fetchone()
     if not row:

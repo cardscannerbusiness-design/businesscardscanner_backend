@@ -483,6 +483,15 @@ def _contacts_list_sql(
             elif user_id:
                 base_query += " AND c.created_by_user_id = %s"
                 params.append(user_id)
+        elif role == "SUPER_ADMIN" and user_id:
+            # SuperAdmin: own / SuperAdmin-owned rows only — never Admin/User tenants.
+            base_query += """
+                AND (
+                    c.created_by_user_id = %s
+                    OR UPPER(COALESCE(c.created_by_role, '')) = 'SUPER_ADMIN'
+                )
+            """
+            params.append(user_id)
 
     search = (q or "").strip()
     if search:
@@ -575,7 +584,14 @@ def get_contact(contact_id: str, user: dict[str, Any] | None = None) -> dict[str
                         elif user_id:
                             query += " AND c.created_by_user_id = %s"
                             params.append(user_id)
-                    # SUPER_ADMIN: no extra filter
+                    elif role == "SUPER_ADMIN" and user_id:
+                        query += """
+                            AND (
+                                c.created_by_user_id = %s
+                                OR UPPER(COALESCE(c.created_by_role, '')) = 'SUPER_ADMIN'
+                            )
+                        """
+                        params.append(user_id)
 
                 cur.execute(query, params)
                 row = cur.fetchone()
@@ -621,7 +637,7 @@ def create_contact(
 ) -> dict[str, Any]:
     import time
 
-    from services import storage_service
+    from services import entitlement_service, storage_service
 
     upload_started = time.perf_counter()
     logger.info("[UPLOAD] Request Received")
@@ -652,8 +668,12 @@ def create_contact(
             # RealDictCursor required: storage_service._lock_company / _row_as_dict
             # and callers expect mapping rows (plain cursor tuples broke quota checks).
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Atomic quota check + insert + used_storage increment
-                if owner_company_id:
+                # Atomic card entitlement + storage quota + insert + counters.
+                skip_quota = str(created_by_role or "").upper() == "SUPER_ADMIN"
+                if owner_company_id and not skip_quota:
+                    entitlement_service.assert_can_process_card_locked(
+                        cur, owner_company_id
+                    )
                     storage_service.assert_can_upload_locked(
                         cur, owner_company_id, image_size_bytes
                     )
@@ -715,7 +735,14 @@ def create_contact(
                     (time.perf_counter() - save_started) * 1000,
                     contact_id,
                 )
-                if owner_company_id and image_size_bytes > 0:
+                if owner_company_id and not skip_quota:
+                    entitlement_service.consume_card_locked(
+                        cur,
+                        owner_company_id,
+                        contact_id=contact_id,
+                        user_id=str(created_by_user_id) if created_by_user_id else None,
+                    )
+                if owner_company_id and image_size_bytes > 0 and not skip_quota:
                     storage_service.update_storage_after_upload(
                         owner_company_id,
                         image_size_bytes,
@@ -728,6 +755,18 @@ def create_contact(
                 "[DATABASE] Commit Transaction Completed duration_ms=%.1f",
                 (time.perf_counter() - commit_started) * 1000,
             )
+    except entitlement_service.CardLimitExceededError:
+        logger.warning(
+            "[ENTITLEMENT] Upload rejected (card limit) company_id=%s",
+            owner_company_id,
+        )
+        raise
+    except entitlement_service.ContactsFrozenError:
+        logger.warning(
+            "[ENTITLEMENT] Upload rejected (contacts frozen) company_id=%s",
+            owner_company_id,
+        )
+        raise
     except storage_service.StorageLimitExceededError:
         logger.warning(
             "[STORAGE] Upload rejected (limit) company_id=%s size=%s",
@@ -953,19 +992,36 @@ def patch_sync_status(
         logger.warning("Failed to patch sync status for %s: %s", contact_id, exc)
 
 
-def delete_all_local_db_contacts() -> dict:
-    """Soft-delete all contacts (never permanently removes rows)."""
+def delete_all_local_db_contacts(user: dict | None = None) -> dict:
+    """Soft-delete contacts in the caller's RBAC scope (never permanently removes rows)."""
     now = datetime.utcnow()
     try:
         with _connect() as conn:
             with conn.cursor() as cur:
+                clauses = ["(is_deleted = FALSE OR is_deleted IS NULL)"]
+                filter_params: list = []
+                if user:
+                    role = str(user.get("role") or "")
+                    user_id = user.get("id")
+                    company_id = user.get("company_id")
+                    if role == "SUPER_ADMIN" and user_id:
+                        clauses.append(
+                            "(created_by_user_id = %s OR UPPER(COALESCE(created_by_role, '')) = 'SUPER_ADMIN')"
+                        )
+                        filter_params.append(user_id)
+                    elif role == "ADMIN" and company_id:
+                        clauses.append("owner_company_id = %s")
+                        filter_params.append(company_id)
+                    elif user_id:
+                        clauses.append("created_by_user_id = %s")
+                        filter_params.append(user_id)
                 cur.execute(
-                    """
+                    f"""
                     UPDATE contacts
                     SET is_deleted = TRUE, deleted_at = %s, "updatedAt" = %s
-                    WHERE (is_deleted = FALSE OR is_deleted IS NULL)
+                    WHERE {' AND '.join(clauses)}
                     """,
-                    (now, now),
+                    [now, now, *filter_params],
                 )
                 deleted = cur.rowcount
             conn.commit()

@@ -323,5 +323,13 @@ class TestFailureScenario(unittest.TestCase):
         sheets._pending_retry.clear()
 
 
+class TestProbe(unittest.TestCase):
+    def test_probe_reports_missing_config(self) -> None:
+        with patch.dict("os.environ", {"GOOGLE_SERVICE_ACCOUNT_JSON": "", "GOOGLE_SHEET_ID": ""}, clear=False):
+            result = sheets.probe_spreadsheet(spreadsheet_id="", worksheet="Day 1")
+        self.assertFalse(result["success"])
+        self.assertFalse(result["checks"]["configuration"])
+
+
 if __name__ == "__main__":
     unittest.main()

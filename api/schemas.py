@@ -57,12 +57,15 @@ class EmailMessageRequest(BaseModel):
 
 
 class EmailTestRequest(BaseModel):
-    contact_email: str = Field(..., description="Email parsed from a scanned contact (simulated).")
-    test_override: str = Field(
+    contact_email: str = Field(
         ...,
+        description="Inbox that receives the test thank-you email. Type your own address here.",
+    )
+    test_override: str = Field(
+        default="",
         description=(
-            "Optional inbox that receives the mail instead of contact_email. "
-            "Use empty string to send to contact_email."
+            "Optional. Leave empty to send to contact_email. "
+            "Only set this if you want a different inbox than contact_email."
         ),
     )
 

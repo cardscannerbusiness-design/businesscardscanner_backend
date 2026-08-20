@@ -38,8 +38,8 @@ def get_all_contacts(user: dict | None = None):
         return []
 
 
-def delete_all_contacts():
-    return storage.delete_all_contacts()
+def delete_all_contacts(user: dict | None = None):
+    return storage.delete_all_contacts(user=user)
 
 
 def delete_contact(contact_id: str):

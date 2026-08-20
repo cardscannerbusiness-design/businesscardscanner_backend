@@ -327,8 +327,8 @@ def run_deliverability_health_check() -> dict[str, Any]:
         "brevo_hints": {
             "verify_domain": "Brevo → Senders, domains → Domains → Add domain",
             "dns": "Publish Brevo SPF include + DKIM + DMARC as shown in the Brevo console",
-            "env": "Set SMTP_HOST=smtp-relay.brevo.com, SMTP_PORT=587, SMTP_USER/SMTP_PASSWORD "
-            "from Brevo SMTP & API keys; BUSINESS_EMAIL must be a verified sender.",
+            "env": "Set BREVO_API_KEY and BREVO_SENDER_EMAIL (verified sender in Brevo). "
+            "Amazon SES SMTP_* remains commented in .env for rollback.",
         },
     }
 

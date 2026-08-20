@@ -36,6 +36,8 @@ def _configure_logging() -> None:
     ):
         logging.getLogger(name).setLevel(logging.WARNING)
     logging.getLogger("services.whatsapp_service").setLevel(logging.INFO)
+    logging.getLogger("services.email_service").setLevel(logging.INFO)
+    logging.getLogger("auth.email_service").setLevel(logging.INFO)
 
 
 _configure_logging()
@@ -54,6 +56,7 @@ from config.settings import (  # noqa: E402
 from auth.middleware import RBACMiddleware  # noqa: E402
 from auth.constants import ROLE_ADMIN, ROLE_SUPER_ADMIN  # noqa: E402
 from auth.dependencies import require_role  # noqa: E402
+from api.outreach import require_outreach_entitlement  # noqa: E402
 from api.schemas import EmailTestRequest  # noqa: E402
 from services.email_service import email_queue  # noqa: E402
 from services.whatsapp_service import whatsapp_queue  # noqa: E402
@@ -81,6 +84,9 @@ async def lifespan(app: FastAPI):
     # ── Background queues ─────────────────────────────────────────────
     await whatsapp_queue.start()
     await email_queue.start()
+    from services.email_service import log_email_startup
+
+    log_email_startup()
     try:
         from services.google_oauth_service import warn_if_oauth_not_configured
 
@@ -233,16 +239,18 @@ def root_head():
     tags=["Health"],
     summary="Health check",
     description=(
-        "Reports PostgreSQL storage, email (SMTP), WhatsApp, and OCR status. "
+        "Reports PostgreSQL storage, email (Brevo), WhatsApp, and OCR status. "
         "OCR: Textract (online, POST /api/ocr) + PaddleOCR (offline, browser)."
     ),
 )
 def health_check():
     from services.contact_storage import check_storage, storage_label
     from services.email_service import (
+        BREVO_SENDER_EMAIL,
         SMTP_HOST,
         SMTP_USER,
         get_email_provider,
+        is_brevo_configured,
         is_email_configured,
         is_email_test_recipient_configured,
         is_smtp_configured,
@@ -266,10 +274,11 @@ def health_check():
         "email": {
             "configured": is_email_configured(),
             "provider": provider,
+            "brevo_configured": is_brevo_configured(),
             "smtp_configured": is_smtp_configured(),
             "smtp_host": SMTP_HOST,
             "test_recipient_env_set": is_email_test_recipient_configured(),
-            "from": smtp_sender_email() or SMTP_USER or None,
+            "from": smtp_sender_email() or BREVO_SENDER_EMAIL or SMTP_USER or None,
         },
         "whatsapp": {
             "configured": is_whatsapp_configured(),
@@ -285,23 +294,26 @@ def health_check():
 
 def _email_health_payload() -> dict:
     from services.email_service import (
+        BREVO_SENDER_EMAIL,
         BUSINESS_COMPANY_NAME,
         BUSINESS_EMAIL,
         SMTP_HOST,
         SMTP_PORT,
         SMTP_USER,
         get_email_provider,
+        is_brevo_configured,
         is_email_configured,
         is_email_test_recipient_configured,
         is_smtp_configured,
         smtp_sender_email,
     )
 
-    from_addr = smtp_sender_email() or SMTP_USER or None
+    from_addr = smtp_sender_email() or BREVO_SENDER_EMAIL or SMTP_USER or None
     return {
         "ok": is_email_configured() and bool(from_addr),
         "configured": is_email_configured(),
         "provider": get_email_provider(),
+        "brevo_configured": is_brevo_configured(),
         "smtp_configured": is_smtp_configured(),
         "smtp_host": SMTP_HOST,
         "smtp_port": SMTP_PORT,
@@ -313,7 +325,7 @@ def _email_health_payload() -> dict:
         "hint": (
             None
             if is_email_configured() and from_addr
-            else "Set SMTP_USER/SMTP_PASSWORD and BUSINESS_EMAIL (verified SES From) then restart."
+            else "Set BREVO_API_KEY and BREVO_SENDER_EMAIL (verified Brevo sender) then restart."
         ),
     }
 
@@ -321,10 +333,10 @@ def _email_health_payload() -> dict:
 @app.get(
     "/health/email",
     tags=["Health"],
-    summary="Email / SMTP status (authorized)",
+    summary="Email / Brevo status (authorized)",
     description=(
-        "Returns live SMTP/SES configuration used by the running process "
-        "(host, From address, company name). Requires Bearer JWT. "
+        "Returns live Brevo configuration used by the running process "
+        "(provider, From address, company name). Requires Bearer JWT. "
         "Roles: ADMIN, SUPER_ADMIN."
     ),
 )
@@ -339,25 +351,27 @@ def health_email_status(
     tags=["Health"],
     summary="Send test thank-you email (authorized)",
     description=(
-        "Sends a real thank-you email via the configured SMTP/SES transport. "
-        "Use this in Swagger to verify production email after Authorize. "
+        "Sends a real thank-you email via Brevo to contact_email. "
+        "There is no hardcoded test inbox — type the address you want in the body. "
         "Requires Bearer JWT. Roles: ADMIN, SUPER_ADMIN."
     ),
 )
 async def health_email_test(
     body: EmailTestRequest,
-    _user: dict = Depends(require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)),
+    user: dict = Depends(require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)),
 ):
     import asyncio
 
     from services.email_service import is_email_configured, send_business_thank_you_email
 
+    require_outreach_entitlement(user, channel="email")
+
     if not is_email_configured():
         raise HTTPException(
             status_code=503,
             detail=(
-                "Email is not configured. Set SMTP_USER + SMTP_PASSWORD "
-                "(and BUSINESS_EMAIL / SMTP_FROM for SES From) in .env, then restart."
+                "Email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL "
+                "(verified sender in the Brevo dashboard) in .env, then restart."
             ),
         )
 
@@ -374,11 +388,14 @@ async def health_email_test(
     if not result.get("success"):
         raise HTTPException(
             status_code=502,
-            detail=result.get("error") or "Email send failed.",
+            detail=result.get("message") or result.get("error") or "Email send failed.",
         )
 
+    to = result.get("recipient_email") or body.contact_email
     return {
         "success": True,
+        "message": result.get("message")
+        or f"Email working properly. Sent via Brevo to {to}.",
         "email": _email_health_payload(),
         "result": result,
     }

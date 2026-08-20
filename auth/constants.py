@@ -74,6 +74,10 @@ PUBLIC_PATHS: set[str] = {
     "/api/auth/password-reset/confirm",
     "/api/invitations/validate",
     "/api/invitations/accept",
+    "/api/registrations/admin",
+    "/api/registrations/user",
+    "/api/registrations/phone/send-otp",
+    "/api/registrations/phone/confirm",
     "/api/google/oauth/callback",
 }
 
@@ -122,12 +126,17 @@ AUDIT_INVITE_REVOKED = "invite_revoked"
 AUDIT_INVITE_ACCEPTED = "invite_accepted"
 AUDIT_ACCOUNT_DISABLED = "account_disabled"
 AUDIT_ACCOUNT_ENABLED = "account_enabled"
+AUDIT_ADMIN_REG_SUBMITTED = "admin_registration_submitted"
+AUDIT_ADMIN_REG_APPROVED = "admin_registration_approved"
+AUDIT_ADMIN_REG_REJECTED = "admin_registration_rejected"
+AUDIT_ADMIN_REG_DELETED = "admin_registration_deleted"
 
 # ---------------------------------------------------------------------------
 # Invitation settings
 # ---------------------------------------------------------------------------
 INVITATION_EXPIRE_HOURS = int(os.getenv("INVITATION_EXPIRE_HOURS", "48"))
 INVITATION_RATE_LIMIT_PER_HOUR = int(os.getenv("INVITATION_RATE_LIMIT_PER_HOUR", "20"))
+REGISTRATION_RATE_LIMIT_PER_HOUR = int(os.getenv("REGISTRATION_RATE_LIMIT_PER_HOUR", "10"))
 
 # ---------------------------------------------------------------------------
 # Error codes (returned in API error responses)
@@ -144,3 +153,5 @@ ERR_DUPLICATE_EMAIL = "DUPLICATE_EMAIL"
 ERR_DUPLICATE_USERNAME = "DUPLICATE_USERNAME"
 ERR_WEAK_PASSWORD = "WEAK_PASSWORD"
 ERR_COMPANY_INACTIVE = "COMPANY_INACTIVE"
+ERR_ACCOUNT_PENDING_APPROVAL = "ACCOUNT_PENDING_APPROVAL"
+ERR_ACCOUNT_REGISTRATION_REJECTED = "ACCOUNT_REGISTRATION_REJECTED"

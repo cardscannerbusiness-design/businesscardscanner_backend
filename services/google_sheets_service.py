@@ -203,6 +203,106 @@ def is_sheets_configured() -> bool:
     return _resolve_service_account_path(raw) is not None
 
 
+def probe_spreadsheet(*, spreadsheet_id: str, worksheet: str | None = None) -> dict[str, Any]:
+    """Read-only health check used by CMS. Never writes dummy contact rows."""
+    sheet_id = (spreadsheet_id or "").strip() or _sheet_id()
+    tab = _sanitize_sheet_title(worksheet or _sheet_name())
+    checks: dict[str, bool | None] = {
+        "configuration": is_sheets_configured(),
+        "authentication": None,
+        "spreadsheetAccess": None,
+        "sheetAccess": None,
+        "readAccess": None,
+        "writeAccess": None,
+    }
+    result: dict[str, Any] = {
+        "success": False,
+        "status": "failed",
+        "checks": checks,
+        "message": "",
+        "reason": "",
+        "spreadsheetName": None,
+        "sheet_id": sheet_id or None,
+        "sheet_title": tab,
+        "writeVerified": None,
+        "worksheet_titles": None,
+    }
+    if not checks["configuration"]:
+        result["reason"] = "GOOGLE_SERVICE_ACCOUNT_JSON is missing or the credentials file was not found."
+        result["message"] = "Google Sheets is not configured on the server."
+        return result
+    if not sheet_id:
+        checks["authentication"] = True
+        result["reason"] = "No spreadsheet ID. Save a Sheet ID in CMS or set GOOGLE_SHEET_ID."
+        result["message"] = "Spreadsheet ID is required."
+        return result
+
+    auth = _auth_headers()
+    if not auth:
+        checks["authentication"] = False
+        result["reason"] = "Service account could not obtain a Google access token."
+        result["message"] = "Google authentication failed."
+        return result
+    checks["authentication"] = True
+
+    try:
+        url = f"{_SHEETS_API}/{sheet_id}?fields=properties.title,spreadsheetId,sheets.properties.title"
+        response = requests.get(url, headers=auth, timeout=20)
+        if response.status_code == 404:
+            checks["spreadsheetAccess"] = False
+            result["reason"] = "Spreadsheet does not exist or the service account cannot see it."
+            result["message"] = "Spreadsheet access failed."
+            return result
+        if response.status_code in (401, 403):
+            checks["spreadsheetAccess"] = False
+            result["reason"] = "Service account lacks permission on this spreadsheet. Share it as Editor."
+            result["message"] = "Spreadsheet access failed."
+            return result
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        checks["spreadsheetAccess"] = False
+        result["reason"] = "Google Sheets API request failed."
+        result["message"] = "Spreadsheet access failed."
+        logger.warning("Google Sheets probe failed for %s: %s", sheet_id, exc)
+        return result
+
+    checks["spreadsheetAccess"] = True
+    result["spreadsheetName"] = str((payload.get("properties") or {}).get("title") or "") or None
+    titles = [
+        str((sheet.get("properties") or {}).get("title") or "").strip()
+        for sheet in (payload.get("sheets") or [])
+    ]
+    titles = [t for t in titles if t]
+    result["worksheet_titles"] = titles
+    matched = next((t for t in titles if t.casefold() == tab.casefold()), None)
+    checks["sheetAccess"] = bool(matched)
+    if matched:
+        tab = matched
+        result["sheet_title"] = tab
+        try:
+            _values_get(auth, sheet_id, f"'{tab}'!A1:A1")
+            checks["readAccess"] = True
+        except Exception:
+            checks["readAccess"] = False
+            result["reason"] = "Spreadsheet opened but the worksheet could not be read."
+            result["message"] = "Read access failed."
+            return result
+    else:
+        checks["readAccess"] = False
+        result["reason"] = f"Worksheet {tab!r} was not found. Existing tabs: {', '.join(titles) or '(none)'}."
+        result["message"] = "Worksheet not found."
+        return result
+
+    # Spreadsheets scope includes write; we do not append a dummy row.
+    checks["writeAccess"] = True
+    result["writeVerified"] = False
+    result["success"] = True
+    result["status"] = "connected"
+    result["message"] = "Google Sheets connected."
+    return result
+
+
 def _superadmin_share_email() -> str | None:
     """Email used for Drive Editor share on Admin company sheets."""
     email = (os.getenv("SUPERADMIN_EMAIL") or "").strip().lower()

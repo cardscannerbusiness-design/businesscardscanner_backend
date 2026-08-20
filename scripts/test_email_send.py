@@ -1,4 +1,8 @@
-"""Send a test business thank-you email using Gmail SMTP credentials from .env."""
+"""Send a test business thank-you email using Brevo credentials from .env.
+
+Prefer Swagger: POST /health/email/test with your own contact_email.
+This CLI is optional and has no hardcoded inbox.
+"""
 from __future__ import annotations
 
 import argparse
@@ -22,15 +26,13 @@ from services.email_service import (  # noqa: E402
     validate_email_address,
 )
 
-DEFAULT_TEST_RECIPIENT = "saligantisandeepzzz6@gmail.com"
-
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Send a business thank-you email via Gmail SMTP.")
+    parser = argparse.ArgumentParser(description="Send a business thank-you email via Brevo.")
     parser.add_argument(
         "--email",
-        default=DEFAULT_TEST_RECIPIENT,
-        help=f"Recipient email address (default: {DEFAULT_TEST_RECIPIENT}).",
+        required=True,
+        help="Recipient email address (no default — pass the inbox you want to test).",
     )
     parser.add_argument(
         "--from-contact",
@@ -39,34 +41,35 @@ def main() -> int:
     )
     parser.add_argument(
         "--override",
-        default=DEFAULT_TEST_RECIPIENT,
-        help="Force delivery to this address regardless of extracted email.",
+        default="",
+        help="Optional. Force delivery to this address instead of --email.",
     )
     args = parser.parse_args()
 
     if not is_email_configured():
         print(
-            "Email not configured. Set GMAIL_USER + GMAIL_APP_PASSWORD "
-            "(or SMTP_USER + SMTP_PASSWORD) in .env",
+            "Email not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL in .env",
             file=sys.stderr,
         )
         return 1
 
+    override = args.override or None
     try:
         if args.from_contact:
             contact = {"email": args.email, "name": "Test Contact", "company": "Test Co"}
             extracted = extract_primary_email(contact)
             ok, detail = validate_email_address(extracted)
             print(f"Extracted email: {extracted!r} (valid={ok}, detail={detail!r})")
-            result = send_thank_you_to_contact(contact, test_override=args.override)
+            result = send_thank_you_to_contact(contact, test_override=override)
         else:
             ok, detail = validate_email_address(args.email)
             print(f"Recipient email: {args.email!r} (valid={ok}, detail={detail!r})")
-            result = send_business_thank_you_email(args.email, test_override=args.override)
+            result = send_business_thank_you_email(args.email, test_override=override)
     except Exception as exc:
         print(f"FAILED: {exc}", file=sys.stderr)
         return 1
 
+    print(result.get("message") or ("SUCCESS" if result.get("success") else "FAILED"))
     print(json.dumps(result, indent=2))
     return 0 if result.get("success") else 1
 

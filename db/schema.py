@@ -8,7 +8,8 @@ from db.pool import db_cursor
 
 logger = logging.getLogger(__name__)
 
-# Keep DDL defaults aligned with StorageService seed constants (single source).
+# Keep DDL defaults aligned with StorageService / entitlement seed constants.
+from services.entitlement_service import DEFAULT_FREEMIUM_CARD_LIMIT
 from services.storage_service import DEFAULT_PLAN_NAME, DEFAULT_STORAGE_LIMIT_BYTES
 
 # ---------------------------------------------------------------------------
@@ -99,6 +100,17 @@ SCHEMA_STATEMENTS: list[str] = [
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS plan_name VARCHAR(64) NOT NULL DEFAULT '{DEFAULT_PLAN_NAME}';",
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS storage_limit_bytes BIGINT NOT NULL DEFAULT {int(DEFAULT_STORAGE_LIMIT_BYTES)};",
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS used_storage_bytes BIGINT NOT NULL DEFAULT 0;",
+    # Freemium card allowance (test default = 2). Existing rows pick up DEFAULT 2
+    # when the column is first added; cards_used starts at 0 so the next 2 saves count.
+    f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS card_limit INTEGER NOT NULL DEFAULT {int(DEFAULT_FREEMIUM_CARD_LIMIT)};",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS cards_used INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS entitlement_started_at TIMESTAMPTZ;",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS entitlement_exhausted_at TIMESTAMPTZ;",
+    """
+    UPDATE companies
+    SET entitlement_started_at = COALESCE(entitlement_started_at, created_at, NOW())
+    WHERE entitlement_started_at IS NULL;
+    """,
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
     # Admin / Super Admin Google OAuth (create sheets in their own Drive — free)
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_refresh_token TEXT;",
@@ -223,6 +235,26 @@ SCHEMA_STATEMENTS: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_managed_events_status ON managed_events(status) WHERE deleted_at IS NULL;",
     "CREATE INDEX IF NOT EXISTS idx_managed_events_name ON managed_events(name) WHERE deleted_at IS NULL;",
+    "ALTER TABLE managed_events ADD COLUMN IF NOT EXISTS company_id UUID REFERENCES companies(id) ON DELETE SET NULL;",
+    "CREATE INDEX IF NOT EXISTS idx_managed_events_company ON managed_events(company_id) WHERE deleted_at IS NULL;",
+    """
+    UPDATE managed_events e
+    SET company_id = u.company_id
+    FROM users u
+    WHERE e.company_id IS NULL
+      AND e.created_by = u.id
+      AND u.company_id IS NOT NULL;
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_events_company_name
+        ON managed_events (company_id, LOWER(name))
+        WHERE deleted_at IS NULL AND company_id IS NOT NULL;
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_events_superadmin_name
+        ON managed_events (LOWER(name))
+        WHERE deleted_at IS NULL AND company_id IS NULL;
+    """,
     # ── Indexes ────────────────────────────────────────────────────────────
     "CREATE INDEX IF NOT EXISTS idx_users_email        ON users(email);",
     "CREATE INDEX IF NOT EXISTS idx_users_username     ON users(username);",
@@ -375,6 +407,37 @@ SCHEMA_STATEMENTS: list[str] = [
     # the review-page classifier. Kept nullable/blank so historical rows survive.
     "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS prospect_status VARCHAR(64) NOT NULL DEFAULT '';",
     "CREATE INDEX IF NOT EXISTS idx_contacts_prospect_status ON contacts(prospect_status);",
+    # Usage ledger — Freemium card consume now; PAYG / Prepaid later.
+    """
+    CREATE TABLE IF NOT EXISTS usage_events (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id  UUID REFERENCES companies(id) ON DELETE SET NULL,
+        user_id     UUID REFERENCES users(id) ON DELETE SET NULL,
+        contact_id  UUID REFERENCES contacts(id) ON DELETE SET NULL,
+        usage_type  VARCHAR(32) NOT NULL DEFAULT 'CARD_PROCESS',
+        quantity    INTEGER NOT NULL DEFAULT 1,
+        plan_name   VARCHAR(64) NOT NULL DEFAULT '',
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_contact_type ON usage_events (contact_id, usage_type);",
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_company ON usage_events(company_id);",
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'usage_events_contact_type_key'
+        ) THEN
+            ALTER TABLE usage_events
+                ADD CONSTRAINT usage_events_contact_type_key
+                UNIQUE (contact_id, usage_type);
+        END IF;
+    EXCEPTION
+        WHEN duplicate_object THEN NULL;
+        WHEN unique_violation THEN NULL;
+    END $$;
+    """,
     # ── Invitations (secure invite-based onboarding) ───────────────────────
     """
     CREATE TABLE IF NOT EXISTS invitations (
@@ -421,6 +484,88 @@ SCHEMA_STATEMENTS: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_admin_env_settings_admin ON admin_env_settings(admin_user_id);",
     "ALTER TABLE admin_env_settings ADD COLUMN IF NOT EXISTS templates JSONB NOT NULL DEFAULT '{}'::jsonb;",
+    "ALTER TABLE admin_env_settings ADD COLUMN IF NOT EXISTS google_sheets JSONB NOT NULL DEFAULT '{}'::jsonb;",
+    # ── Admin self-registration requests (SuperAdmin approve/reject) ────────
+    """
+    CREATE TABLE IF NOT EXISTS admin_registration_requests (
+        id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        first_name           VARCHAR(128) NOT NULL DEFAULT '',
+        last_name            VARCHAR(128) NOT NULL DEFAULT '',
+        email                VARCHAR(255) NOT NULL,
+        phone                VARCHAR(64)  NOT NULL DEFAULT '',
+        designation          VARCHAR(255) NOT NULL DEFAULT '',
+        department           VARCHAR(255) NOT NULL DEFAULT '',
+        username             VARCHAR(128) NOT NULL DEFAULT '',
+        password_hash        VARCHAR(255) NOT NULL,
+        role                 VARCHAR(64)  NOT NULL DEFAULT 'ADMIN',
+        company_name         VARCHAR(255) NOT NULL,
+        company_code         VARCHAR(64)  NOT NULL DEFAULT '',
+        company_address      TEXT         NOT NULL DEFAULT '',
+        company_phone        VARCHAR(64)  NOT NULL DEFAULT '',
+        company_email        VARCHAR(255) NOT NULL DEFAULT '',
+        company_website      VARCHAR(255) NOT NULL DEFAULT '',
+        status               VARCHAR(32)  NOT NULL DEFAULT 'pending',
+        rejection_reason     TEXT         NOT NULL DEFAULT '',
+        reviewed_by          UUID         REFERENCES users(id) ON DELETE SET NULL,
+        reviewed_at          TIMESTAMPTZ,
+        created_user_id      UUID         REFERENCES users(id) ON DELETE SET NULL,
+        created_company_id   UUID         REFERENCES companies(id) ON DELETE SET NULL,
+        created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        updated_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_admin_reg_email ON admin_registration_requests(email);",
+    "CREATE INDEX IF NOT EXISTS idx_admin_reg_status ON admin_registration_requests(status);",
+    "CREATE INDEX IF NOT EXISTS idx_admin_reg_created_at ON admin_registration_requests(created_at);",
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_admin_reg_pending_email
+        ON admin_registration_requests (LOWER(email))
+        WHERE status = 'pending';
+    """,
+    "ALTER TABLE admin_registration_requests ADD COLUMN IF NOT EXISTS phone_verified_at TIMESTAMPTZ;",
+    "ALTER TABLE admin_registration_requests ADD COLUMN IF NOT EXISTS phone_normalized VARCHAR(64) NOT NULL DEFAULT '';",
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_admin_reg_pending_phone
+        ON admin_registration_requests (phone_normalized)
+        WHERE status = 'pending' AND phone_normalized <> '';
+    """,
+    # Phone OTP for Admin self-registration (unauthenticated; hashed; short-lived)
+    """
+    CREATE TABLE IF NOT EXISTS phone_verification_otps (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        phone           VARCHAR(64)  NOT NULL,
+        email           VARCHAR(255) NOT NULL DEFAULT '',
+        purpose         VARCHAR(32)  NOT NULL DEFAULT 'admin_signup',
+        otp_hash        VARCHAR(255) NOT NULL,
+        verify_token_hash VARCHAR(255) NOT NULL DEFAULT '',
+        verified_at     TIMESTAMPTZ,
+        expires_at      TIMESTAMPTZ  NOT NULL,
+        attempt_count   INTEGER      NOT NULL DEFAULT 0,
+        send_count      INTEGER      NOT NULL DEFAULT 1,
+        ip              VARCHAR(45)  NOT NULL DEFAULT '',
+        created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_phone_otp_phone ON phone_verification_otps(phone, purpose);",
+    """
+    CREATE TABLE IF NOT EXISTS payment_intents (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id      UUID REFERENCES companies(id) ON DELETE SET NULL,
+        user_id         UUID REFERENCES users(id) ON DELETE SET NULL,
+        package_id      VARCHAR(64)  NOT NULL DEFAULT '',
+        provider        VARCHAR(32)  NOT NULL DEFAULT 'manual',
+        status          VARCHAR(32)  NOT NULL DEFAULT 'created',
+        amount_inr      INTEGER      NOT NULL DEFAULT 0,
+        scan_capacity   INTEGER      NOT NULL DEFAULT 0,
+        validity_days   INTEGER      NOT NULL DEFAULT 0,
+        provider_ref    VARCHAR(255) NOT NULL DEFAULT '',
+        checkout_url    TEXT         NOT NULL DEFAULT '',
+        error_message   TEXT         NOT NULL DEFAULT '',
+        created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_payment_intents_company ON payment_intents(company_id);",
 ]
 
 

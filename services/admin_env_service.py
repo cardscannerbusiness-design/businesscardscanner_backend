@@ -11,7 +11,7 @@ from typing import Any
 
 from psycopg2.extras import Json
 
-from auth.constants import ROLE_ADMIN
+from auth.constants import ROLE_ADMIN, ROLE_USER
 from db.pool import db_cursor
 
 logger = logging.getLogger(__name__)
@@ -60,11 +60,24 @@ TEMPLATE_KEYS = (
     "preview_signoff",
 )
 
+GOOGLE_SHEETS_KEYS = (
+    "google_sheet_id",
+    "google_sheet_name",
+    "google_service_account_json",
+    "google_drive_folder_id",
+    "google_oauth_client_id",
+    "google_oauth_client_secret",
+    "google_oauth_redirect_uri",
+    "enabled",
+)
+
 SECRET_KEYS = frozenset(
     {
         "access_token",
         "app_secret",
         "smtp_password",
+        "google_service_account_json",
+        "google_oauth_client_secret",
     }
 )
 
@@ -116,6 +129,10 @@ def _empty_whatsapp() -> dict[str, Any]:
 
 def _empty_email() -> dict[str, Any]:
     return {k: (False if k == "enabled" else "") for k in EMAIL_KEYS}
+
+
+def _empty_google_sheets() -> dict[str, Any]:
+    return {k: (False if k == "enabled" else "") for k in GOOGLE_SHEETS_KEYS}
 
 
 def _empty_templates() -> dict[str, Any]:
@@ -233,6 +250,7 @@ def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
     whatsapp_raw = _apply_legacy(_as_dict(row.get("whatsapp")), _WA_LEGACY)
     email_raw = _apply_legacy(_as_dict(row.get("email")), _EMAIL_LEGACY)
     templates_raw = _as_dict(row.get("templates"))
+    sheets_raw = _as_dict(row.get("google_sheets"))
     return {
         "admin_id": str(row["id"]),
         "email": row.get("email_addr") or row.get("user_email") or "",
@@ -241,6 +259,7 @@ def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
         "phone": row.get("phone") or "",
         "is_active": bool(row.get("is_active")),
         "company_id": str(row["company_id"]) if row.get("company_id") else None,
+        "tenant_id": str(row["company_id"]) if row.get("company_id") else str(row["id"]),
         "company_name": row.get("company_name") or "",
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
         "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
@@ -254,6 +273,14 @@ def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
             EMAIL_KEYS,
         ),
         "templates": _public_templates(templates_raw),
+        "google_sheets": _mask_section(
+            {
+                **_empty_google_sheets(),
+                **{k: sheets_raw.get(k, "") for k in GOOGLE_SHEETS_KEYS if k != "enabled"},
+                "enabled": bool(sheets_raw.get("enabled")),
+            },
+            GOOGLE_SHEETS_KEYS,
+        ),
         "settings_updated_at": (
             row["settings_updated_at"].isoformat() if row.get("settings_updated_at") else None
         ),
@@ -279,10 +306,11 @@ def list_admin_env_settings() -> list[dict[str, Any]]:
                 s.whatsapp,
                 s.email,
                 s.templates,
+                s.google_sheets,
                 s.updated_at AS settings_updated_at
             FROM users u
             JOIN roles r ON r.id = u.role_id
-            LEFT JOIN companies c ON c.id = u.company_id
+            INNER JOIN companies c ON c.id = u.company_id AND COALESCE(c.status, 'active') <> 'deleted'
             LEFT JOIN admin_env_settings s ON s.admin_user_id = u.id
             WHERE u.deleted_at IS NULL
               AND r.name = %s
@@ -313,6 +341,7 @@ def get_admin_env_settings(admin_user_id: str) -> dict[str, Any] | None:
                 s.whatsapp,
                 s.email,
                 s.templates,
+                s.google_sheets,
                 s.updated_at AS settings_updated_at
             FROM users u
             JOIN roles r ON r.id = u.role_id
@@ -321,6 +350,7 @@ def get_admin_env_settings(admin_user_id: str) -> dict[str, Any] | None:
             WHERE u.id = %s
               AND u.deleted_at IS NULL
               AND r.name = %s
+              AND (c.id IS NULL OR COALESCE(c.status, 'active') <> 'deleted')
             """,
             (admin_user_id, ROLE_ADMIN),
         )
@@ -354,6 +384,7 @@ def upsert_admin_env_settings(
     whatsapp: dict[str, Any] | None = None,
     email: dict[str, Any] | None = None,
     templates: dict[str, Any] | None = None,
+    google_sheets: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     existing = get_admin_env_settings(admin_user_id)
     if not existing:
@@ -361,7 +392,7 @@ def upsert_admin_env_settings(
 
     with db_cursor(commit=False) as cur:
         cur.execute(
-            "SELECT whatsapp, email, templates FROM admin_env_settings WHERE admin_user_id = %s",
+            "SELECT whatsapp, email, templates, google_sheets FROM admin_env_settings WHERE admin_user_id = %s",
             (admin_user_id,),
         )
         prev = cur.fetchone() or {}
@@ -369,20 +400,23 @@ def upsert_admin_env_settings(
     prev_wa = _apply_legacy(_as_dict(prev.get("whatsapp")), _WA_LEGACY)
     prev_em = _apply_legacy(_as_dict(prev.get("email")), _EMAIL_LEGACY)
     prev_tpl = _as_dict(prev.get("templates"))
+    prev_gs = _as_dict(prev.get("google_sheets"))
 
     merged_wa = _merge_section(prev_wa, whatsapp, WHATSAPP_KEYS)
     merged_em = _merge_section(prev_em, email, EMAIL_KEYS)
     merged_tpl = _merge_templates(prev_tpl, templates)
+    merged_gs = _merge_section(prev_gs, google_sheets, GOOGLE_SHEETS_KEYS)
 
     with db_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO admin_env_settings (admin_user_id, whatsapp, email, templates, updated_at)
-            VALUES (%s, %s, %s, %s, NOW())
+            INSERT INTO admin_env_settings (admin_user_id, whatsapp, email, templates, google_sheets, updated_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
             ON CONFLICT (admin_user_id) DO UPDATE SET
                 whatsapp = EXCLUDED.whatsapp,
                 email = EXCLUDED.email,
                 templates = EXCLUDED.templates,
+                google_sheets = EXCLUDED.google_sheets,
                 updated_at = NOW()
             """,
             (
@@ -390,8 +424,21 @@ def upsert_admin_env_settings(
                 Json(merged_wa),
                 Json(merged_em),
                 Json(merged_tpl),
+                Json(merged_gs),
             ),
         )
+
+        sheet_id = str(merged_gs.get("google_sheet_id") or "").strip()
+        company_id = existing.get("company_id")
+        if sheet_id and company_id:
+            cur.execute(
+                """
+                UPDATE companies
+                SET google_sheet_id = %s, updated_at = NOW()
+                WHERE id = %s AND COALESCE(status, 'active') <> 'deleted'
+                """,
+                (sheet_id, company_id),
+            )
 
     result = get_admin_env_settings(admin_user_id)
     if not result:
@@ -427,4 +474,117 @@ def merge_admin_env_for_test(
         "whatsapp": _merge_section(prev_wa, whatsapp, WHATSAPP_KEYS),
         "email": _merge_section(prev_em, email, EMAIL_KEYS),
         "templates": _merge_templates(prev_tpl, templates),
+    }
+
+
+def list_cms_tenant_users(admin_user_id: str) -> dict[str, Any]:
+    """Admin + Users for this CMS client, with active and currently-connected counts."""
+    existing = get_admin_env_settings(admin_user_id)
+    if not existing:
+        raise ValueError("Admin not found")
+
+    company_id = existing.get("company_id")
+    with db_cursor(commit=False) as cur:
+        if company_id:
+            cur.execute(
+                """
+                SELECT
+                    u.id,
+                    u.email,
+                    u.first_name,
+                    u.last_name,
+                    u.is_active,
+                    u.last_login,
+                    u.created_at,
+                    r.name AS role,
+                    EXISTS (
+                        SELECT 1
+                        FROM sessions s
+                        WHERE s.user_id = u.id
+                          AND LOWER(COALESCE(s.status, '')) = 'active'
+                          AND s.expires_at > NOW()
+                    ) AS connected
+                FROM users u
+                JOIN roles r ON r.id = u.role_id
+                WHERE u.deleted_at IS NULL
+                  AND u.company_id = %s
+                  AND r.name IN (%s, %s)
+                ORDER BY
+                    CASE r.name WHEN 'ADMIN' THEN 0 ELSE 1 END,
+                    u.created_at ASC
+                """,
+                (company_id, ROLE_ADMIN, ROLE_USER),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT
+                    u.id,
+                    u.email,
+                    u.first_name,
+                    u.last_name,
+                    u.is_active,
+                    u.last_login,
+                    u.created_at,
+                    r.name AS role,
+                    EXISTS (
+                        SELECT 1
+                        FROM sessions s
+                        WHERE s.user_id = u.id
+                          AND LOWER(COALESCE(s.status, '')) = 'active'
+                          AND s.expires_at > NOW()
+                    ) AS connected
+                FROM users u
+                JOIN roles r ON r.id = u.role_id
+                WHERE u.deleted_at IS NULL
+                  AND u.id = %s
+                """,
+                (admin_user_id,),
+            )
+        rows = cur.fetchall() or []
+
+    users: list[dict[str, Any]] = []
+    for row in rows:
+        first = str(row.get("first_name") or "").strip()
+        last = str(row.get("last_name") or "").strip()
+        name = f"{first} {last}".strip() or str(row.get("email") or "")
+        is_active = bool(row.get("is_active"))
+        connected = bool(row.get("connected")) and is_active
+        last_login = row.get("last_login")
+        created_at = row.get("created_at")
+        users.append(
+            {
+                "id": str(row["id"]),
+                "name": name,
+                "email": str(row.get("email") or ""),
+                "role": str(row.get("role") or ""),
+                "is_active": is_active,
+                "connected": connected,
+                "status": "Active" if is_active else "Inactive",
+                "check_status": "pass" if connected else ("pending" if is_active else "fail"),
+                "last_login": last_login.isoformat() if last_login and hasattr(last_login, "isoformat") else None,
+                "last_test": last_login.isoformat() if last_login and hasattr(last_login, "isoformat") else None,
+                "created_at": created_at.isoformat() if created_at and hasattr(created_at, "isoformat") else None,
+            }
+        )
+
+    total = len(users)
+    active = sum(1 for u in users if u["is_active"])
+    connected = sum(1 for u in users if u["connected"])
+    return {
+        "admin_id": str(existing["admin_id"]),
+        "tenant_id": existing.get("tenant_id") or existing.get("company_id") or existing["admin_id"],
+        "company_name": existing.get("company_name") or "",
+        "total": total,
+        "active": active,
+        "connected": connected,
+        "configured": total,
+        "created": total,
+        "available": active,
+        "remaining": 0,
+        "users": users,
+        "note": (
+            f"Only Google Sheets has access. {active} active · {connected} connected "
+            f"of {total} tenant user{'s' if total != 1 else ''}."
+        ),
     }

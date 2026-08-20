@@ -8,6 +8,7 @@ from api.outreach import (
     body_to_outreach_contact,
     email_response,
     is_online_mode,
+    require_outreach_entitlement,
     run_post_save_outreach,
     schedule_outreach_for_contact,
     whatsapp_response,
@@ -130,13 +131,21 @@ def body_to_outreach_contact_from_chat_register(body: WhatsAppChatReplyRegisterR
 
 
 @router.post("/integrations/whatsapp/queue")
-async def queue_whatsapp_message(request: WhatsAppMessageRequest):
+async def queue_whatsapp_message(
+    request: WhatsAppMessageRequest,
+    user: dict = Depends(get_current_user),
+):
+    require_outreach_entitlement(user, channel="whatsapp")
     await whatsapp_queue.enqueue_message(request.contact_phone, request.message)
     return {"success": True, "message": "Message enqueued successfully"}
 
 
 @router.post("/integrations/whatsapp/test")
-async def test_whatsapp_message(request: WhatsAppTestRequest):
+async def test_whatsapp_message(
+    request: WhatsAppTestRequest,
+    user: dict = Depends(get_current_user),
+):
+    require_outreach_entitlement(user, channel="whatsapp")
     if not is_whatsapp_configured():
         raise HTTPException(
             status_code=503,
@@ -172,7 +181,11 @@ async def test_whatsapp_message(request: WhatsAppTestRequest):
         "to the provided phone number. Useful for Swagger testing."
     ),
 )
-async def send_card_received_template(request: WhatsAppCardReceivedRequest):
+async def send_card_received_template(
+    request: WhatsAppCardReceivedRequest,
+    user: dict = Depends(get_current_user),
+):
+    require_outreach_entitlement(user, channel="whatsapp")
     if not is_whatsapp_configured():
         raise HTTPException(
             status_code=503,
@@ -196,7 +209,11 @@ async def send_card_received_template(request: WhatsAppCardReceivedRequest):
 
 
 @router.post("/integrations/email/queue")
-async def queue_email_message(request: EmailMessageRequest):
+async def queue_email_message(
+    request: EmailMessageRequest,
+    user: dict = Depends(get_current_user),
+):
+    require_outreach_entitlement(user, channel="email")
     await email_queue.enqueue_message(request.contact_email, request.message)
     return {"success": True, "message": "Message enqueued successfully"}
 
@@ -204,18 +221,23 @@ async def queue_email_message(request: EmailMessageRequest):
 @router.post(
     "/integrations/email/test",
     summary="Send a test thank-you email (Swagger / production check)",
-    description="Requires Bearer JWT (ADMIN or SUPER_ADMIN). Prefer POST /health/email/test under Health.",
+    description=(
+        "Sends a real thank-you email via Brevo to contact_email. "
+        "No hardcoded inbox — pass your address in the body. "
+        "Requires Bearer JWT (ADMIN or SUPER_ADMIN). Prefer POST /health/email/test under Health."
+    ),
 )
 async def test_email_message(
     request: EmailTestRequest,
-    _user: dict = Depends(require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)),
+    user: dict = Depends(require_role(ROLE_ADMIN, ROLE_SUPER_ADMIN)),
 ):
+    require_outreach_entitlement(user, channel="email")
     if not is_email_configured():
         raise HTTPException(
             status_code=503,
             detail=(
-                "Email is not configured. Set SMTP_USER + SMTP_PASSWORD "
-                "(and BUSINESS_EMAIL / SMTP_FROM for SES From) in .env."
+                "Email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL "
+                "(verified sender in the Brevo dashboard) in .env."
             ),
         )
 
@@ -230,9 +252,18 @@ async def test_email_message(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     if not result.get("success"):
-        raise HTTPException(status_code=502, detail=result.get("error") or "Email send failed.")
+        raise HTTPException(
+            status_code=502,
+            detail=result.get("message") or result.get("error") or "Email send failed.",
+        )
 
-    return {"success": True, "result": result}
+    to = result.get("recipient_email") or request.contact_email
+    return {
+        "success": True,
+        "message": result.get("message")
+        or f"Email working properly. Sent via Brevo to {to}.",
+        "result": result,
+    }
 
 
 @router.post("/api/outreach/thank-you", summary="Send thank-you after review save")
@@ -242,6 +273,7 @@ async def send_thank_you_outreach(
     user: dict = Depends(get_current_user),
 ):
     try:
+        require_outreach_entitlement(user)
         contact_id = str(body.contactId or "").strip() or None
         scanner_email = get_receive_email_from_request(request)
 
@@ -271,6 +303,8 @@ async def send_thank_you_outreach(
             **whatsapp_response(whatsapp_result),
             **email_response(email_result),
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("Thank-you outreach failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc

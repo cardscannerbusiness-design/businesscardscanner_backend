@@ -8,6 +8,7 @@ from auth.dependencies import require_role
 from auth.email_service import send_data_deletion_confirmation
 from services import contact_storage as storage
 from services.contact_service import delete_all_contacts
+from auth.registration_service import wipe_registration_requests
 
 router = APIRouter(tags=["Admin"])
 logger = logging.getLogger(__name__)
@@ -29,9 +30,15 @@ def wipe_all_data(
         )
 
     result = {
-        "contacts": delete_all_contacts(),
+        "contacts": delete_all_contacts(user=user),
         "storage": storage.storage_label(),
     }
+    if user.get("role") == ROLE_SUPER_ADMIN:
+        try:
+            result["registration_requests"] = {"deleted": wipe_registration_requests()}
+        except Exception:
+            logger.exception("Failed to wipe registration requests")
+            result["registration_requests"] = {"deleted": 0, "error": "failed"}
     email = str(user.get("email") or "").strip()
     email_sent = False
     if email:

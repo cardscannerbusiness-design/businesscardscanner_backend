@@ -101,7 +101,18 @@ def list_offline_queue(
     params: list[Any] = []
 
     if role == "SUPER_ADMIN":
-        pass
+        conditions.append(
+            "(oq.created_by_user_id = %s OR oq.owner_company_id IS NULL)"
+        )
+        params.append(user["id"])
+        # Restrict further: only rows created by SuperAdmin accounts.
+        conditions.append(
+            """EXISTS (
+                SELECT 1 FROM users su
+                JOIN roles sr ON sr.id = su.role_id
+                WHERE su.id = oq.created_by_user_id AND sr.name = 'SUPER_ADMIN'
+            )"""
+        )
     elif role == "USER":
         conditions.append("oq.created_by_user_id = %s")
         params.append(user["id"])
