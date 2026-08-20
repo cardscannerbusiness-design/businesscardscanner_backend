@@ -130,9 +130,17 @@ def update_outreach_delivery(
                     """
                     UPDATE contacts
                     SET email_delivery_status = COALESCE(%s, email_delivery_status),
-                        email_delivery_error = CASE WHEN %s IS NULL THEN email_delivery_error ELSE %s END,
+                        email_delivery_error = CASE
+                            WHEN %s = 'Sent' THEN NULL
+                            WHEN %s IS NULL THEN email_delivery_error
+                            ELSE %s
+                        END,
                         whatsapp_delivery_status = COALESCE(%s, whatsapp_delivery_status),
-                        whatsapp_delivery_error = CASE WHEN %s IS NULL THEN whatsapp_delivery_error ELSE %s END,
+                        whatsapp_delivery_error = CASE
+                            WHEN %s = 'Sent' THEN NULL
+                            WHEN %s IS NULL THEN whatsapp_delivery_error
+                            ELSE %s
+                        END,
                         "updatedAt" = %s
                     WHERE id = %s
                     """,
@@ -140,8 +148,10 @@ def update_outreach_delivery(
                         email_status,
                         email_status,
                         email_error,
+                        email_error,
                         whatsapp_status,
                         whatsapp_status,
+                        whatsapp_error,
                         whatsapp_error,
                         datetime.utcnow(),
                         contact_id,

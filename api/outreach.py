@@ -76,9 +76,17 @@ async def _persist_delivery(
         storage.update_outreach_delivery,
         contact_id,
         email_status=_delivery_state(email_result),
-        email_error=email_result.get("error"),
+        email_error=(
+            None
+            if email_result.get("sent") is True
+            else email_result.get("error")
+        ),
         whatsapp_status=_delivery_state(whatsapp_result),
-        whatsapp_error=whatsapp_result.get("error"),
+        whatsapp_error=(
+            None
+            if whatsapp_result.get("sent") is True
+            else whatsapp_result.get("error")
+        ),
     )
 
 
