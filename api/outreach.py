@@ -293,6 +293,7 @@ async def _schedule_outreach_for_contact_inner(
                     contact,
                     **outreach_kwargs,
                     scanner_email=scanner_email,
+                    user=user,
                 ),
             )
         )
