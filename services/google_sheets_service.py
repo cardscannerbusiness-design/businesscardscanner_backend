@@ -1119,6 +1119,24 @@ def sync_contact_to_sheet(
         logger.debug("Google Sheets sync skipped: not configured.")
         return False
 
+    company_id = str(contact.get("owner_company_id") or contact.get("company_id") or "").strip()
+    if company_id:
+        try:
+            from services.entitlement_service import get_entitlement
+
+            if not get_entitlement(company_id).get("google_sheets_allowed", True):
+                logger.info(
+                    "Google Sheets sync skipped: CMS locked company_id=%s contact=%s",
+                    company_id,
+                    contact.get("id"),
+                )
+                return False
+        except Exception:
+            logger.exception(
+                "Google Sheets lock check failed company_id=%s — continuing sync",
+                company_id,
+            )
+
     contact_id = str(contact.get("id") or "")
     last_error: Exception | None = None
     for attempt in range(1, _MAX_ATTEMPTS + 1):

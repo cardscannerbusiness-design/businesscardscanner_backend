@@ -43,6 +43,7 @@ _COMPANY_LOCK_COLUMNS = (
     "cards_used",
     "entitlement_started_at",
     "entitlement_exhausted_at",
+    "cms_channel_locks",
 )
 
 def _limit_label() -> str:
@@ -69,6 +70,9 @@ OUTREACH_BLOCKED_MESSAGE = (
     f"WhatsApp and Email are locked because your {_limit_label()} Freemium limit "
     "has been reached. Complete payment to unlock them."
 )
+CMS_WHATSAPP_LOCKED_MESSAGE = "WhatsApp is locked in the main app."
+CMS_EMAIL_LOCKED_MESSAGE = "Email is locked in the main app."
+CMS_SHEETS_LOCKED_MESSAGE = "Google Sheets is locked in the main app."
 
 
 class EntitlementDeniedError(Exception):
@@ -208,6 +212,13 @@ def _normalize(row: dict[str, Any] | None, company_id: str) -> dict[str, Any]:
     exhausted = bool(enforced and remaining == 0)
     outreach_ok = (not enforced) or (remaining is not None and remaining > 0)
     contacts_ok = outreach_ok
+    from services.cms_app_access import effective_channel_locks, payment_snapshot
+
+    pay = payment_snapshot(
+        plan_name=plan,
+        intent_status=(row or {}).get("payment_intent_status"),
+    )
+    locks = effective_channel_locks((row or {}).get("cms_channel_locks"), pay["payment_done"])
 
     return {
         "company_id": resolved_id,
@@ -219,9 +230,11 @@ def _normalize(row: dict[str, Any] | None, company_id: str) -> dict[str, Any]:
         "freemium_exhausted": exhausted,
         "card_quota_enforced": enforced,
         "can_process_card": (not enforced) or (remaining is not None and remaining > 0),
-        "whatsapp_allowed": outreach_ok,
-        "email_allowed": outreach_ok,
+        "whatsapp_allowed": outreach_ok and not locks["whatsapp"],
+        "email_allowed": outreach_ok and not locks["email"],
         "contacts_allowed": contacts_ok,
+        "google_sheets_allowed": not locks["google_sheets"],
+        "cms_channel_locks": locks,
         "entitlement_started_at": started,
         "entitlement_exhausted_at": exhausted_at,
     }
@@ -243,6 +256,8 @@ def get_entitlement(company_id: str | None) -> dict[str, Any]:
             "whatsapp_allowed": True,
             "email_allowed": True,
             "contacts_allowed": True,
+            "google_sheets_allowed": True,
+            "cms_channel_locks": {"whatsapp": False, "email": False, "google_sheets": False},
             "entitlement_started_at": None,
             "entitlement_exhausted_at": None,
         }
@@ -253,7 +268,15 @@ def get_entitlement(company_id: str | None) -> dict[str, Any]:
         cur.execute(
             """
             SELECT id, plan_name, card_limit, cards_used,
-                   entitlement_started_at, entitlement_exhausted_at
+                   entitlement_started_at, entitlement_exhausted_at,
+                   cms_channel_locks,
+                   (
+                     SELECT status
+                     FROM payment_intents
+                     WHERE company_id = companies.id
+                     ORDER BY updated_at DESC NULLS LAST
+                     LIMIT 1
+                   ) AS payment_intent_status
             FROM companies
             WHERE id = %s
             """,
@@ -273,7 +296,15 @@ def _lock_company(cur: Any, company_id: str) -> dict[str, Any]:
     cur.execute(
         """
         SELECT id, plan_name, card_limit, cards_used,
-               entitlement_started_at, entitlement_exhausted_at
+               entitlement_started_at, entitlement_exhausted_at,
+               cms_channel_locks,
+               (
+                 SELECT status
+                 FROM payment_intents
+                 WHERE company_id = companies.id
+                 ORDER BY updated_at DESC NULLS LAST
+                 LIMIT 1
+               ) AS payment_intent_status
         FROM companies
         WHERE id = %s
         FOR UPDATE
@@ -324,6 +355,24 @@ def assert_can_send_outreach(
     channel: str | None = None,
 ) -> None:
     """Reject WhatsApp/Email send after Freemium exhaustion (except the just-consumed final card)."""
+    info = get_entitlement(company_id) if company_id else get_entitlement(None)
+    locks = info.get("cms_channel_locks") or {}
+    if channel == "whatsapp" and locks.get("whatsapp"):
+        raise OutreachFrozenError(
+            CMS_WHATSAPP_LOCKED_MESSAGE,
+            company_id=company_id,
+            cards_used=info.get("cards_used"),
+            card_limit=info.get("card_limit"),
+            channel=channel,
+        )
+    if channel == "email" and locks.get("email"):
+        raise OutreachFrozenError(
+            CMS_EMAIL_LOCKED_MESSAGE,
+            company_id=company_id,
+            cards_used=info.get("cards_used"),
+            card_limit=info.get("card_limit"),
+            channel=channel,
+        )
     if can_send_outreach(company_id, initial_save=initial_save):
         return
     info = get_entitlement(company_id) if company_id else get_entitlement(None)
@@ -458,6 +507,9 @@ def entitlement_fields_for_usage(company_id: str | None) -> dict[str, Any]:
         "whatsapp_allowed": info["whatsapp_allowed"],
         "email_allowed": info["email_allowed"],
         "contacts_allowed": info["contacts_allowed"],
+        "google_sheets_allowed": info.get("google_sheets_allowed", True),
+        "cms_channel_locks": info.get("cms_channel_locks")
+        or {"whatsapp": False, "email": False, "google_sheets": False},
         "entitlement_started_at": info["entitlement_started_at"],
         "entitlement_exhausted_at": info["entitlement_exhausted_at"],
     }

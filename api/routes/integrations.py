@@ -222,7 +222,7 @@ async def queue_email_message(
     "/integrations/email/test",
     summary="Send a test thank-you email (Swagger / production check)",
     description=(
-        "Sends a real thank-you email via Brevo to contact_email. "
+        "Sends a real thank-you email via SMTP/SES to contact_email. "
         "No hardcoded inbox — pass your address in the body. "
         "Requires Bearer JWT (ADMIN or SUPER_ADMIN). Prefer POST /health/email/test under Health."
     ),
@@ -236,8 +236,8 @@ async def test_email_message(
         raise HTTPException(
             status_code=503,
             detail=(
-                "Email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL "
-                "(verified sender in the Brevo dashboard) in .env."
+                "Email is not configured. Set SMTP_USER + SMTP_PASSWORD "
+                "(and BUSINESS_EMAIL / SMTP_FROM for SES From) in .env."
             ),
         )
 
@@ -261,7 +261,7 @@ async def test_email_message(
     return {
         "success": True,
         "message": result.get("message")
-        or f"Email working properly. Sent via Brevo to {to}.",
+        or f"Email working properly. Sent via SMTP/SES to {to}.",
         "result": result,
     }
 

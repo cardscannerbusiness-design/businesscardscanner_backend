@@ -13,6 +13,7 @@ from services.entitlement_service import (
     OutreachFrozenError,
     assert_can_send_outreach,
     can_send_outreach,
+    get_entitlement,
 )
 from services.storage_service import resolve_company_id_for_user
 from services.whatsapp_service import schedule_whatsapp_for_contact
@@ -237,6 +238,12 @@ async def _schedule_outreach_for_contact_inner(
     }
     company_id = resolve_company_id_for_user(user)
     outreach_ok = can_send_outreach(company_id, initial_save=initial_save)
+    if company_id:
+        locks = get_entitlement(company_id).get("cms_channel_locks") or {}
+        if locks.get("whatsapp"):
+            skip_whatsapp = True
+        if locks.get("email"):
+            skip_email = True
     if not outreach_ok:
         logger.info(
             "Outreach blocked by Freemium entitlement company_id=%s context=%s",

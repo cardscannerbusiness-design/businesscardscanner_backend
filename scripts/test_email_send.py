@@ -1,4 +1,4 @@
-"""Send a test business thank-you email using Brevo credentials from .env.
+"""Send a test business thank-you email using credentials from .env.
 
 Prefer Swagger: POST /health/email/test with your own contact_email.
 This CLI is optional and has no hardcoded inbox.
@@ -28,7 +28,7 @@ from services.email_service import (  # noqa: E402
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Send a business thank-you email via Brevo.")
+    parser = argparse.ArgumentParser(description="Send a business thank-you email via SMTP/SES.")
     parser.add_argument(
         "--email",
         required=True,
@@ -48,7 +48,8 @@ def main() -> int:
 
     if not is_email_configured():
         print(
-            "Email not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL in .env",
+            "Email not configured. Set SMTP_USER + SMTP_PASSWORD "
+            "(and BUSINESS_EMAIL / SMTP_FROM for SES From) in .env",
             file=sys.stderr,
         )
         return 1

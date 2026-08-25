@@ -108,6 +108,11 @@ SCHEMA_STATEMENTS: list[str] = [
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS cards_used INTEGER NOT NULL DEFAULT 0;",
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS entitlement_started_at TIMESTAMPTZ;",
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS entitlement_exhausted_at TIMESTAMPTZ;",
+    # CMS Super Admin can lock a channel in the main app without changing CMS internals.
+    # true = locked outside; missing keys default to unlocked.
+    """
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS cms_channel_locks JSONB NOT NULL DEFAULT '{}'::jsonb;
+    """,
     f"""
     UPDATE companies
     SET card_limit = {int(DEFAULT_FREEMIUM_CARD_LIMIT)},

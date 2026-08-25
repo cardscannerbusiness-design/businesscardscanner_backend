@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import logging
 import os
-import smtplib  # noqa: F401  # retained for commented SES SMTP rollback
-from email.message import EmailMessage  # noqa: F401
+import smtplib
+from email.message import EmailMessage
 
-import requests
+# import requests  # Brevo REST client — commented out
 
 from config.urls import get_frontend_base_url
 
 logger = logging.getLogger(__name__)
 
-BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
+# BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
+BREVO_API_URL = ""
 
 _SMTP_AUTH_HELP = (
     "SMTP authentication failed. For Amazon SES: open SES console → SMTP settings → "
@@ -67,106 +68,105 @@ def _smtp_config() -> dict[str, str]:
     }
 
 
-def _brevo_config() -> dict[str, str]:
-    sender = (
-        _normalize_env(os.getenv("BREVO_SENDER_EMAIL"))
-        or _normalize_env(os.getenv("BUSINESS_EMAIL"))
-    )
-    reply_to = _normalize_env(os.getenv("BUSINESS_EMAIL")) or sender
-    return {
-        "api_key": _normalize_env(os.getenv("BREVO_API_KEY")),
-        "sender": sender,
-        "company": _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan",
-        "reply_to": reply_to,
-    }
+# def _brevo_config() -> dict[str, str]:
+#     sender = (
+#         _normalize_env(os.getenv("BREVO_SENDER_EMAIL"))
+#         or _normalize_env(os.getenv("BUSINESS_EMAIL"))
+#     )
+#     reply_to = _normalize_env(os.getenv("BUSINESS_EMAIL")) or sender
+#     return {
+#         "api_key": _normalize_env(os.getenv("BREVO_API_KEY")),
+#         "sender": sender,
+#         "company": _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan",
+#         "reply_to": reply_to,
+#     }
 
 
 def _send_email(to: str, subject: str, html_body: str) -> dict:
-    brevo = _brevo_config()
-    if not brevo["api_key"] or "@" not in brevo["sender"]:
-        logger.warning("Brevo not configured — skipping email to %s", to)
-        return {
-            "sent": False,
-            "reason": "Brevo is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL in .env.",
-        }
-
-    payload: dict = {
-        "sender": {"name": brevo["company"], "email": brevo["sender"]},
-        "to": [{"email": to}],
-        "subject": subject,
-        "htmlContent": html_body,
-    }
-    if brevo["reply_to"]:
-        payload["replyTo"] = {"email": brevo["reply_to"]}
-
-    try:
-        response = requests.post(
-            BREVO_API_URL,
-            headers={
-                "accept": "application/json",
-                "api-key": brevo["api_key"],
-                "content-type": "application/json",
-            },
-            json=payload,
-            timeout=30,
-        )
-    except requests.RequestException as exc:
-        logger.error("Failed to send email to %s: %s", to, exc)
-        return {"sent": False, "error": f"Network error connecting to Brevo: {exc}"}
-
-    if response.status_code in (200, 201, 202):
-        logger.info("Auth email sent via Brevo to %s (%s)", to, subject)
-        return {"sent": True}
-
-    detail = (response.text or "").strip() or response.reason
-    try:
-        data = response.json()
-        if isinstance(data, dict):
-            detail = str(data.get("message") or data.get("error") or detail)
-    except ValueError:
-        pass
-    logger.error("Failed to send email to %s: %s", to, detail)
-    return {"sent": False, "error": f"Brevo rejected the send ({response.status_code}): {detail}"}
-
-    # SES / Gmail SMTP (disabled — restore by uncommenting this block and
-    # removing the Brevo send above):
-    # cfg = _smtp_config()
-    # if not cfg["user"] or not cfg["password"]:
-    #     logger.warning("SMTP not configured — skipping email to %s", to)
-    #     return {"sent": False, "reason": "SMTP not configured"}
-    #
-    # company = _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan"
-    # from_header = f"{company} <{cfg['from']}>" if cfg["from"] else company
-    #
-    # msg = EmailMessage()
-    # msg["Subject"] = subject
-    # msg["From"] = from_header
-    # msg["To"] = to
-    # if cfg.get("reply_to") and cfg["reply_to"].lower() != cfg["from"].lower():
-    #     msg["Reply-To"] = cfg["reply_to"]
-    # msg.set_content(html_body, subtype="html")
-    #
-    # try:
-    #     with smtplib.SMTP(cfg["host"], int(cfg["port"]), timeout=30) as server:
-    #         server.ehlo()
-    #         server.starttls()
-    #         server.ehlo()
-    #         server.login(cfg["user"], cfg["password"])
-    #         server.send_message(msg, from_addr=cfg["from"], to_addrs=[to])
-    #     logger.info("Auth email sent to %s (%s)", to, subject)
-    #     return {"sent": True}
-    # except smtplib.SMTPAuthenticationError as exc:
-    #     logger.error("Failed to send email to %s: %s", to, exc)
-    #     return {"sent": False, "error": _SMTP_AUTH_HELP}
-    # except OSError as exc:
-    #     logger.error("Failed to send email to %s: %s", to, exc)
+    # --- Brevo email send (commented out) ---
+    # brevo = _brevo_config()
+    # if not brevo["api_key"] or "@" not in brevo["sender"]:
+    #     logger.warning("Brevo not configured — skipping email to %s", to)
     #     return {
     #         "sent": False,
-    #         "error": f"Network error connecting to SMTP: {exc}. {_SMTP_NETWORK_HINT}",
+    #         "reason": "Brevo is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL in .env.",
     #     }
-    # except Exception as exc:
+    #
+    # payload: dict = {
+    #     "sender": {"name": brevo["company"], "email": brevo["sender"]},
+    #     "to": [{"email": to}],
+    #     "subject": subject,
+    #     "htmlContent": html_body,
+    # }
+    # if brevo["reply_to"]:
+    #     payload["replyTo"] = {"email": brevo["reply_to"]}
+    #
+    # try:
+    #     response = requests.post(
+    #         BREVO_API_URL,
+    #         headers={
+    #             "accept": "application/json",
+    #             "api-key": brevo["api_key"],
+    #             "content-type": "application/json",
+    #         },
+    #         json=payload,
+    #         timeout=30,
+    #     )
+    # except requests.RequestException as exc:
     #     logger.error("Failed to send email to %s: %s", to, exc)
-    #     return {"sent": False, "error": str(exc)}
+    #     return {"sent": False, "error": f"Network error connecting to Brevo: {exc}"}
+    #
+    # if response.status_code in (200, 201, 202):
+    #     logger.info("Auth email sent via Brevo to %s (%s)", to, subject)
+    #     return {"sent": True}
+    #
+    # detail = (response.text or "").strip() or response.reason
+    # try:
+    #     data = response.json()
+    #     if isinstance(data, dict):
+    #         detail = str(data.get("message") or data.get("error") or detail)
+    # except ValueError:
+    #     pass
+    # logger.error("Failed to send email to %s: %s", to, detail)
+    # return {"sent": False, "error": f"Brevo rejected the send ({response.status_code}): {detail}"}
+
+    cfg = _smtp_config()
+    if not cfg["user"] or not cfg["password"]:
+        logger.warning("SMTP not configured — skipping email to %s", to)
+        return {"sent": False, "reason": "SMTP not configured"}
+
+    company = _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan"
+    from_header = f"{company} <{cfg['from']}>" if cfg["from"] else company
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_header
+    msg["To"] = to
+    if cfg.get("reply_to") and cfg["reply_to"].lower() != cfg["from"].lower():
+        msg["Reply-To"] = cfg["reply_to"]
+    msg.set_content(html_body, subtype="html")
+
+    try:
+        with smtplib.SMTP(cfg["host"], int(cfg["port"]), timeout=30) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(cfg["user"], cfg["password"])
+            server.send_message(msg, from_addr=cfg["from"], to_addrs=[to])
+        logger.info("Auth email sent to %s (%s)", to, subject)
+        return {"sent": True}
+    except smtplib.SMTPAuthenticationError as exc:
+        logger.error("Failed to send email to %s: %s", to, exc)
+        return {"sent": False, "error": _SMTP_AUTH_HELP}
+    except OSError as exc:
+        logger.error("Failed to send email to %s: %s", to, exc)
+        return {
+            "sent": False,
+            "error": f"Network error connecting to SMTP: {exc}. {_SMTP_NETWORK_HINT}",
+        }
+    except Exception as exc:
+        logger.error("Failed to send email to %s: %s", to, exc)
+        return {"sent": False, "error": str(exc)}
 
 
 def _frontend_base(explicit: str | None = None) -> str:

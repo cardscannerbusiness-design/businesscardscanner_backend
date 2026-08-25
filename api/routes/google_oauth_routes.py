@@ -38,9 +38,24 @@ def oauth_status(request: Request):
     return oauth.get_oauth_status(str(user["id"]))
 
 
+def _assert_google_sheets_unlocked(user: dict) -> None:
+    from services.entitlement_service import CMS_SHEETS_LOCKED_MESSAGE, get_entitlement
+    from services.storage_service import resolve_company_id_for_user
+
+    company_id = resolve_company_id_for_user(user)
+    if not company_id:
+        return
+    if not get_entitlement(company_id).get("google_sheets_allowed", True):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "CMS_CHANNEL_LOCKED", "message": CMS_SHEETS_LOCKED_MESSAGE},
+        )
+
+
 @router.get("/oauth/start", summary="Start Google OAuth (Connect Google Drive)")
 def oauth_start(request: Request):
     user = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER)(request)
+    _assert_google_sheets_unlocked(user)
     try:
         url = oauth.build_authorize_url(
             user_id=str(user["id"]),
@@ -122,6 +137,7 @@ def oauth_disconnect(request: Request):
 @router.post("/sheets/ensure", summary="Create / refresh company or Super Admin sheet")
 def ensure_sheet(request: Request):
     user = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER)(request)
+    _assert_google_sheets_unlocked(user)
     role = str(user.get("role") or "").upper()
     try:
         if role == ROLE_SUPER_ADMIN:

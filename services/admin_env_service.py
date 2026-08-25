@@ -247,10 +247,19 @@ def _merge_section(
 
 
 def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
+    from services.cms_app_access import effective_channel_locks, payment_snapshot
+
     whatsapp_raw = _apply_legacy(_as_dict(row.get("whatsapp")), _WA_LEGACY)
     email_raw = _apply_legacy(_as_dict(row.get("email")), _EMAIL_LEGACY)
     templates_raw = _as_dict(row.get("templates"))
     sheets_raw = _as_dict(row.get("google_sheets"))
+    payment = payment_snapshot(
+        plan_name=row.get("plan_name"),
+        intent_status=row.get("payment_intent_status"),
+        intent_at=row.get("payment_intent_at"),
+        package_id=row.get("payment_package_id"),
+    )
+    locks = effective_channel_locks(row.get("cms_channel_locks"), payment["payment_done"])
     return {
         "admin_id": str(row["id"]),
         "email": row.get("email_addr") or row.get("user_email") or "",
@@ -284,6 +293,8 @@ def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
         "settings_updated_at": (
             row["settings_updated_at"].isoformat() if row.get("settings_updated_at") else None
         ),
+        "channel_locks": locks,
+        "payment": payment,
     }
 
 
@@ -300,6 +311,11 @@ def list_admin_env_settings() -> list[dict[str, Any]]:
                 u.is_active,
                 u.company_id,
                 c.company_name AS company_name,
+                c.plan_name,
+                c.cms_channel_locks,
+                pi.status AS payment_intent_status,
+                pi.updated_at AS payment_intent_at,
+                pi.package_id AS payment_package_id,
                 u.created_at,
                 u.updated_at,
                 s.id AS settings_id,
@@ -312,6 +328,13 @@ def list_admin_env_settings() -> list[dict[str, Any]]:
             JOIN roles r ON r.id = u.role_id
             INNER JOIN companies c ON c.id = u.company_id AND COALESCE(c.status, 'active') <> 'deleted'
             LEFT JOIN admin_env_settings s ON s.admin_user_id = u.id
+            LEFT JOIN LATERAL (
+                SELECT status, updated_at, package_id
+                FROM payment_intents
+                WHERE company_id = c.id
+                ORDER BY updated_at DESC NULLS LAST
+                LIMIT 1
+            ) pi ON TRUE
             WHERE u.deleted_at IS NULL
               AND r.name = %s
             ORDER BY LOWER(u.first_name), LOWER(u.last_name), LOWER(u.email)
@@ -335,6 +358,11 @@ def get_admin_env_settings(admin_user_id: str) -> dict[str, Any] | None:
                 u.is_active,
                 u.company_id,
                 c.company_name AS company_name,
+                c.plan_name,
+                c.cms_channel_locks,
+                pi.status AS payment_intent_status,
+                pi.updated_at AS payment_intent_at,
+                pi.package_id AS payment_package_id,
                 u.created_at,
                 u.updated_at,
                 s.id AS settings_id,
@@ -347,6 +375,13 @@ def get_admin_env_settings(admin_user_id: str) -> dict[str, Any] | None:
             JOIN roles r ON r.id = u.role_id
             LEFT JOIN companies c ON c.id = u.company_id
             LEFT JOIN admin_env_settings s ON s.admin_user_id = u.id
+            LEFT JOIN LATERAL (
+                SELECT status, updated_at, package_id
+                FROM payment_intents
+                WHERE company_id = c.id
+                ORDER BY updated_at DESC NULLS LAST
+                LIMIT 1
+            ) pi ON TRUE
             WHERE u.id = %s
               AND u.deleted_at IS NULL
               AND r.name = %s

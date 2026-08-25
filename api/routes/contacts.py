@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
 
 from api.auth_context import get_receive_email_from_request
 from api.outreach import (
@@ -390,10 +390,12 @@ async def storage_config(user: dict = Depends(get_current_user)):
         },
     },
 )
-async def storage_usage(user: dict = Depends(get_current_user)):
+async def storage_usage(response: Response, user: dict = Depends(get_current_user)):
     """Return plan, used/limit/remaining bytes, can_upload, and warning_level."""
     from auth.constants import ROLE_SUPER_ADMIN
     from services.entitlement_service import entitlement_fields_for_usage
+
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
 
     if user.get("role") == ROLE_SUPER_ADMIN:
         unlimited = {

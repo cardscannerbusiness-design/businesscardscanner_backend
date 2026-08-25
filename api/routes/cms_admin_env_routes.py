@@ -23,6 +23,7 @@ from services.admin_env_service import (
     merge_admin_env_for_test,
     upsert_admin_env_settings as upsert_admin_env,
 )
+from services.cms_app_access import update_channel_locks
 from services.company_lifecycle import CompanyNotFoundError, remove_cms_client
 from services.admin_runtime_config import use_admin_env_payload
 from services.email_service import is_email_configured, send_business_thank_you_email
@@ -46,6 +47,12 @@ class AdminEnvUpdateRequest(BaseModel):
     email: dict[str, Any] | None = Field(default=None)
     templates: dict[str, Any] | None = Field(default=None)
     google_sheets: dict[str, Any] | None = Field(default=None)
+
+
+class CmsChannelLocksRequest(BaseModel):
+    whatsapp: bool | None = None
+    email: bool | None = None
+    google_sheets: bool | None = None
 
 
 class CmsWhatsAppTestRequest(BaseModel):
@@ -131,6 +138,40 @@ def put_admin_env(admin_id: str, body: AdminEnvUpdateRequest, request: Request):
             "email_keys": list((body.email or {}).keys()),
             "template_keys": list((body.templates or {}).keys()),
         },
+    )
+    return {"success": True, "item": item}
+
+
+@router.put(
+    "/admin-env/{admin_id}/channel-locks",
+    summary="Lock or unlock main-app channels for this Admin without changing CMS internals",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+@router.patch(
+    "/admin-env/{admin_id}/channel-locks",
+    summary="Lock or unlock main-app channels for this Admin without changing CMS internals",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def patch_admin_channel_locks(admin_id: str, body: CmsChannelLocksRequest, request: Request):
+    actor = get_current_user(request)
+    try:
+        update_channel_locks(
+            admin_id,
+            {
+                "whatsapp": body.whatsapp,
+                "email": body.email,
+                "google_sheets": body.google_sheets,
+            },
+        )
+        item = get_admin_env(admin_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    log_action(
+        str(actor["id"]),
+        "cms_channel_locks_updated",
+        ip=request.client.host if request.client else "",
+        new_value={"admin_id": admin_id, **body.model_dump()},
     )
     return {"success": True, "item": item}
 
@@ -324,7 +365,10 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
         if not is_email_configured():
             raise HTTPException(
                 status_code=400,
-                detail="Email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL in .env, then try again.",
+                detail=(
+                    "Email is not configured. Set SMTP_USER + SMTP_PASSWORD "
+                    "(and BUSINESS_EMAIL / SMTP_FROM for SES From) in .env, then try again."
+                ),
             )
         try:
             result = await asyncio.to_thread(
