@@ -4,16 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
-import smtplib  # noqa: F401  # retained for commented SES SMTP rollback
-from email.message import EmailMessage  # noqa: F401
-
-import requests
+import smtplib
+from email.message import EmailMessage
 
 from config.urls import get_frontend_base_url
 
 logger = logging.getLogger(__name__)
-
-BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 _SMTP_AUTH_HELP = (
     "SMTP authentication failed. For Amazon SES: open SES console → SMTP settings → "
@@ -39,134 +35,152 @@ def _normalize_smtp_password(value: str | None) -> str:
     return _normalize_env(value).replace(" ", "")
 
 
-def _smtp_config() -> dict[str, str]:
-    user = _normalize_env(os.getenv("SMTP_USER")) or _normalize_env(os.getenv("GMAIL_USER"))
-    password = _normalize_smtp_password(os.getenv("SMTP_PASSWORD")) or _normalize_smtp_password(
-        os.getenv("GMAIL_APP_PASSWORD")
+def _smtp_lane_config(lane: str) -> dict[str, str] | None:
+    """Build INTERNAL or EXTERNAL SES profile from env."""
+    key = "INTERNAL" if lane == "internal" else "EXTERNAL"
+    user = _normalize_env(os.getenv(f"SMTP_{key}_USER")) or (
+        _normalize_env(os.getenv("SMTP_USER")) if key == "INTERNAL" else ""
     )
-    smtp_from = _normalize_env(os.getenv("SMTP_FROM"))
-    business = _normalize_env(os.getenv("BUSINESS_EMAIL"))
-    # Gmail: SMTP_USER is the mailbox email and must be From.
-    # SES: SMTP_USER is an IAM access key — From must be a verified identity.
+    password = _normalize_smtp_password(os.getenv(f"SMTP_{key}_PASSWORD")) or (
+        _normalize_smtp_password(os.getenv("SMTP_PASSWORD")) if key == "INTERNAL" else ""
+    )
+    if not user or not password:
+        return None
+    smtp_from = (
+        _normalize_env(os.getenv(f"SMTP_{key}_FROM"))
+        or _normalize_env(os.getenv("SMTP_FROM"))
+        or _normalize_env(os.getenv("BUSINESS_EMAIL"))
+    )
     if user and "@" in user:
         from_addr = user
     else:
-        from_addr = smtp_from or business or "noreply@cardsync.ai"
-    reply_to = business or smtp_from or from_addr
+        from_addr = smtp_from
+    if not from_addr or "@" not in from_addr:
+        return None
+    business = _normalize_env(os.getenv("BUSINESS_EMAIL"))
     return {
-        "host": _normalize_env(os.getenv("SMTP_HOST"))
+        "host": _normalize_env(os.getenv(f"SMTP_{key}_HOST"))
+        or _normalize_env(os.getenv("SMTP_HOST"))
         or _normalize_env(os.getenv("GMAIL_SMTP_HOST"))
         or "smtp.gmail.com",
-        "port": _normalize_env(os.getenv("SMTP_PORT"))
+        "port": _normalize_env(os.getenv(f"SMTP_{key}_PORT"))
+        or _normalize_env(os.getenv("SMTP_PORT"))
         or _normalize_env(os.getenv("GMAIL_SMTP_PORT"))
         or "587",
         "user": user,
         "password": password,
         "from": from_addr,
-        "reply_to": reply_to,
+        "reply_to": business or from_addr,
+        "label": lane,
     }
 
 
-def _brevo_config() -> dict[str, str]:
-    sender = (
-        _normalize_env(os.getenv("BREVO_SENDER_EMAIL"))
-        or _normalize_env(os.getenv("BUSINESS_EMAIL"))
+def _smtp_lane_configs(lane: str) -> list[dict[str, str]]:
+    """Primary lane, then the other lane as fallback."""
+    configs: list[dict[str, str]] = []
+    fallback_lane = "external" if lane == "internal" else "internal"
+    primary = _smtp_lane_config(lane)
+    fallback = _smtp_lane_config(fallback_lane)
+    if primary:
+        configs.append(primary)
+    if fallback and (
+        not primary
+        or fallback["user"] != primary["user"]
+        or fallback["password"] != primary["password"]
+    ):
+        configs.append(fallback)
+    return configs
+
+
+def resolve_auth_smtp_lane(sender_role: str | None = None, smtp_lane: str | None = None) -> str:
+    explicit = str(smtp_lane or "").strip().lower()
+    if explicit in {"internal", "external"}:
+        return explicit
+    if str(sender_role or "").strip().upper() == "SUPER_ADMIN":
+        return "internal"
+    return "external"
+
+
+def _send_with_cfg(to: str, subject: str, html_body: str, cfg: dict[str, str]) -> dict:
+    company = _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan"
+    from_header = f"{company} <{cfg['from']}>" if cfg["from"] else company
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_header
+    msg["To"] = to
+    if cfg.get("reply_to") and cfg["reply_to"].lower() != cfg["from"].lower():
+        msg["Reply-To"] = cfg["reply_to"]
+    msg.set_content(html_body, subtype="html")
+
+    with smtplib.SMTP(cfg["host"], int(cfg["port"]), timeout=30) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(cfg["user"], cfg["password"])
+        server.send_message(msg, from_addr=cfg["from"], to_addrs=[to])
+    logger.info(
+        "Auth email sent via SMTP (%s) to %s (%s)",
+        cfg.get("label") or "smtp",
+        to,
+        subject,
     )
-    reply_to = _normalize_env(os.getenv("BUSINESS_EMAIL")) or sender
-    return {
-        "api_key": _normalize_env(os.getenv("BREVO_API_KEY")),
-        "sender": sender,
-        "company": _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan",
-        "reply_to": reply_to,
-    }
+    return {"sent": True, "smtp_profile": cfg.get("label") or "external"}
 
 
-def _send_email(to: str, subject: str, html_body: str) -> dict:
-    brevo = _brevo_config()
-    if not brevo["api_key"] or "@" not in brevo["sender"]:
-        logger.warning("Brevo not configured — skipping email to %s", to)
+def _send_email(
+    to: str,
+    subject: str,
+    html_body: str,
+    *,
+    sender_role: str | None = None,
+    smtp_lane: str | None = None,
+) -> dict:
+    lane = resolve_auth_smtp_lane(sender_role=sender_role, smtp_lane=smtp_lane)
+    configs = _smtp_lane_configs(lane)
+    if not configs:
+        logger.warning(
+            "SMTP lane %s not configured — skipping email to %s",
+            lane,
+            to,
+        )
         return {
             "sent": False,
-            "reason": "Brevo is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL in .env.",
+            "reason": f"SMTP not configured for lane '{lane}'",
+            "smtp_lane": lane,
         }
 
-    payload: dict = {
-        "sender": {"name": brevo["company"], "email": brevo["sender"]},
-        "to": [{"email": to}],
-        "subject": subject,
-        "htmlContent": html_body,
-    }
-    if brevo["reply_to"]:
-        payload["replyTo"] = {"email": brevo["reply_to"]}
+    last_error: str | None = None
+    for index, cfg in enumerate(configs):
+        try:
+            result = _send_with_cfg(to, subject, html_body, cfg)
+            result["smtp_lane"] = lane
+            return result
+        except smtplib.SMTPAuthenticationError as exc:
+            last_error = _SMTP_AUTH_HELP
+            logger.warning("Auth SMTP profile %s failed for %s: %s", cfg.get("label"), to, exc)
+        except OSError as exc:
+            last_error = f"Network error connecting to SMTP: {exc}. {_SMTP_NETWORK_HINT}"
+            logger.warning(
+                "Auth SMTP profile %s network error for %s: %s",
+                cfg.get("label"),
+                to,
+                exc,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning(
+                "Auth SMTP profile %s error for %s: %s",
+                cfg.get("label"),
+                to,
+                exc,
+            )
+        if index < len(configs) - 1:
+            logger.warning("Trying %s lane fallback credentials for auth email to %s", lane, to)
+            continue
 
-    try:
-        response = requests.post(
-            BREVO_API_URL,
-            headers={
-                "accept": "application/json",
-                "api-key": brevo["api_key"],
-                "content-type": "application/json",
-            },
-            json=payload,
-            timeout=30,
-        )
-    except requests.RequestException as exc:
-        logger.error("Failed to send email to %s: %s", to, exc)
-        return {"sent": False, "error": f"Network error connecting to Brevo: {exc}"}
-
-    if response.status_code in (200, 201, 202):
-        logger.info("Auth email sent via Brevo to %s (%s)", to, subject)
-        return {"sent": True}
-
-    detail = (response.text or "").strip() or response.reason
-    try:
-        data = response.json()
-        if isinstance(data, dict):
-            detail = str(data.get("message") or data.get("error") or detail)
-    except ValueError:
-        pass
-    logger.error("Failed to send email to %s: %s", to, detail)
-    return {"sent": False, "error": f"Brevo rejected the send ({response.status_code}): {detail}"}
-
-    # SES / Gmail SMTP (disabled — restore by uncommenting this block and
-    # removing the Brevo send above):
-    # cfg = _smtp_config()
-    # if not cfg["user"] or not cfg["password"]:
-    #     logger.warning("SMTP not configured — skipping email to %s", to)
-    #     return {"sent": False, "reason": "SMTP not configured"}
-    #
-    # company = _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan"
-    # from_header = f"{company} <{cfg['from']}>" if cfg["from"] else company
-    #
-    # msg = EmailMessage()
-    # msg["Subject"] = subject
-    # msg["From"] = from_header
-    # msg["To"] = to
-    # if cfg.get("reply_to") and cfg["reply_to"].lower() != cfg["from"].lower():
-    #     msg["Reply-To"] = cfg["reply_to"]
-    # msg.set_content(html_body, subtype="html")
-    #
-    # try:
-    #     with smtplib.SMTP(cfg["host"], int(cfg["port"]), timeout=30) as server:
-    #         server.ehlo()
-    #         server.starttls()
-    #         server.ehlo()
-    #         server.login(cfg["user"], cfg["password"])
-    #         server.send_message(msg, from_addr=cfg["from"], to_addrs=[to])
-    #     logger.info("Auth email sent to %s (%s)", to, subject)
-    #     return {"sent": True}
-    # except smtplib.SMTPAuthenticationError as exc:
-    #     logger.error("Failed to send email to %s: %s", to, exc)
-    #     return {"sent": False, "error": _SMTP_AUTH_HELP}
-    # except OSError as exc:
-    #     logger.error("Failed to send email to %s: %s", to, exc)
-    #     return {
-    #         "sent": False,
-    #         "error": f"Network error connecting to SMTP: {exc}. {_SMTP_NETWORK_HINT}",
-    #     }
-    # except Exception as exc:
-    #     logger.error("Failed to send email to %s: %s", to, exc)
-    #     return {"sent": False, "error": str(exc)}
+    logger.error("Failed to send email to %s: %s", to, last_error)
+    return {"sent": False, "error": last_error or _SMTP_AUTH_HELP, "smtp_lane": lane}
 
 
 def _frontend_base(explicit: str | None = None) -> str:

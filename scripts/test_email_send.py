@@ -1,4 +1,4 @@
-"""Send a test business thank-you email using Brevo credentials from .env.
+"""Send a test business thank-you email using SES SMTP credentials from .env.
 
 Prefer Swagger: POST /health/email/test with your own contact_email.
 This CLI is optional and has no hardcoded inbox.
@@ -28,7 +28,7 @@ from services.email_service import (  # noqa: E402
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Send a business thank-you email via Brevo.")
+    parser = argparse.ArgumentParser(description="Send a business thank-you email via Amazon SES SMTP.")
     parser.add_argument(
         "--email",
         required=True,
@@ -44,11 +44,25 @@ def main() -> int:
         default="",
         help="Optional. Force delivery to this address instead of --email.",
     )
+    parser.add_argument(
+        "--lane",
+        choices=("internal", "external"),
+        default="",
+        help="Force SMTP lane (internal=SUPER_ADMIN SES, external=ADMIN/USER SES).",
+    )
+    parser.add_argument(
+        "--role",
+        default="",
+        help="Optional role hint (SUPER_ADMIN, ADMIN, USER). Overrides --lane when set.",
+    )
     args = parser.parse_args()
+
+    sender_role = args.role or None
+    smtp_lane = args.lane or None
 
     if not is_email_configured():
         print(
-            "Email not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL in .env",
+            "Email not configured. Set SMTP_INTERNAL_* and SMTP_EXTERNAL_* in .env",
             file=sys.stderr,
         )
         return 1
@@ -60,11 +74,21 @@ def main() -> int:
             extracted = extract_primary_email(contact)
             ok, detail = validate_email_address(extracted)
             print(f"Extracted email: {extracted!r} (valid={ok}, detail={detail!r})")
-            result = send_thank_you_to_contact(contact, test_override=override)
+            result = send_thank_you_to_contact(
+                contact,
+                test_override=override,
+                sender_role=sender_role,
+                smtp_lane=smtp_lane,
+            )
         else:
             ok, detail = validate_email_address(args.email)
             print(f"Recipient email: {args.email!r} (valid={ok}, detail={detail!r})")
-            result = send_business_thank_you_email(args.email, test_override=override)
+            result = send_business_thank_you_email(
+                args.email,
+                test_override=override,
+                sender_role=sender_role,
+                smtp_lane=smtp_lane,
+            )
     except Exception as exc:
         print(f"FAILED: {exc}", file=sys.stderr)
         return 1

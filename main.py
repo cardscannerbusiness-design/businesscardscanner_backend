@@ -239,14 +239,13 @@ def root_head():
     tags=["Health"],
     summary="Health check",
     description=(
-        "Reports PostgreSQL storage, email (Brevo), WhatsApp, and OCR status. "
+        "Reports PostgreSQL storage, email (Amazon SES SMTP), WhatsApp, and OCR status. "
         "OCR: Textract (online, POST /api/ocr) + PaddleOCR (offline, browser)."
     ),
 )
 def health_check():
     from services.contact_storage import check_storage, storage_label
     from services.email_service import (
-        BREVO_SENDER_EMAIL,
         SMTP_HOST,
         SMTP_USER,
         get_email_provider,
@@ -278,7 +277,7 @@ def health_check():
             "smtp_configured": is_smtp_configured(),
             "smtp_host": SMTP_HOST,
             "test_recipient_env_set": is_email_test_recipient_configured(),
-            "from": smtp_sender_email() or BREVO_SENDER_EMAIL or SMTP_USER or None,
+            "from": smtp_sender_email() or SMTP_USER or None,
         },
         "whatsapp": {
             "configured": is_whatsapp_configured(),
@@ -294,7 +293,6 @@ def health_check():
 
 def _email_health_payload() -> dict:
     from services.email_service import (
-        BREVO_SENDER_EMAIL,
         BUSINESS_COMPANY_NAME,
         BUSINESS_EMAIL,
         SMTP_HOST,
@@ -308,7 +306,7 @@ def _email_health_payload() -> dict:
         smtp_sender_email,
     )
 
-    from_addr = smtp_sender_email() or BREVO_SENDER_EMAIL or SMTP_USER or None
+    from_addr = smtp_sender_email() or None
     return {
         "ok": is_email_configured() and bool(from_addr),
         "configured": is_email_configured(),
@@ -325,7 +323,7 @@ def _email_health_payload() -> dict:
         "hint": (
             None
             if is_email_configured() and from_addr
-            else "Set BREVO_API_KEY and BREVO_SENDER_EMAIL (verified Brevo sender) then restart."
+            else "Set SMTP_HOST, SMTP_USER, SMTP_PASSWORD, and SMTP_FROM (verified SES identity) then restart."
         ),
     }
 
@@ -333,9 +331,9 @@ def _email_health_payload() -> dict:
 @app.get(
     "/health/email",
     tags=["Health"],
-    summary="Email / Brevo status (authorized)",
+    summary="Email / SES SMTP status (authorized)",
     description=(
-        "Returns live Brevo configuration used by the running process "
+        "Returns live SMTP/SES configuration used by the running process "
         "(provider, From address, company name). Requires Bearer JWT. "
         "Roles: ADMIN, SUPER_ADMIN."
     ),
@@ -351,7 +349,7 @@ def health_email_status(
     tags=["Health"],
     summary="Send test thank-you email (authorized)",
     description=(
-        "Sends a real thank-you email via Brevo to contact_email. "
+        "Sends a real thank-you email via Amazon SES SMTP to contact_email. "
         "There is no hardcoded test inbox — type the address you want in the body. "
         "Requires Bearer JWT. Roles: ADMIN, SUPER_ADMIN."
     ),
@@ -370,8 +368,8 @@ async def health_email_test(
         raise HTTPException(
             status_code=503,
             detail=(
-                "Email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL "
-                "(verified sender in the Brevo dashboard) in .env, then restart."
+                "Email is not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASSWORD, and "
+                "SMTP_FROM (verified SES identity) in .env, then restart."
             ),
         )
 
@@ -380,6 +378,7 @@ async def health_email_test(
             send_business_thank_you_email,
             body.contact_email,
             test_override=body.test_override or None,
+            sender_role=str(user.get("role") or "") or None,
         )
     except Exception as exc:
         logger.error("Health email test failed: %s", exc, exc_info=True)
@@ -395,7 +394,7 @@ async def health_email_test(
     return {
         "success": True,
         "message": result.get("message")
-        or f"Email working properly. Sent via Brevo to {to}.",
+        or f"Email working properly. Sent via Amazon SES SMTP to {to}.",
         "email": _email_health_payload(),
         "result": result,
     }

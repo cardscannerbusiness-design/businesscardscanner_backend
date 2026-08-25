@@ -324,7 +324,7 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
         if not is_email_configured():
             raise HTTPException(
                 status_code=400,
-                detail="Email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL in .env, then try again.",
+                detail="Email is not configured. Set SMTP_INTERNAL_* and SMTP_EXTERNAL_* in .env, then try again.",
             )
         try:
             result = await asyncio.to_thread(
@@ -336,6 +336,7 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
                     "email": body.contact_email,
                     "eventName": "CMS Test",
                 },
+                sender_role="ADMIN",
             )
         except Exception as exc:
             logger.error("CMS Email test failed for admin=%s: %s", admin_id, exc, exc_info=True)

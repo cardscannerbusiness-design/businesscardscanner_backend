@@ -95,7 +95,14 @@ class TestEmailSendWithCc(unittest.TestCase):
         deliver.assert_called_once()
         call_kwargs = deliver.call_args.kwargs
         self.assertIsNone(call_kwargs["cc_addresses"])
-        _cc_send.assert_called_once_with(["owner@example.com"], contact=contact)
+        from unittest.mock import ANY
+
+        _cc_send.assert_called_once_with(
+            ["owner@example.com"],
+            contact=contact,
+            sender_role=ANY,
+            smtp_lane=ANY,
+        )
 
     @patch("services.email_service._deliver_email")
     @patch("services.email_service.is_email_configured", return_value=True)

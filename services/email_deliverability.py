@@ -273,7 +273,9 @@ def run_deliverability_health_check() -> dict[str, Any]:
     total = len(checks)
     recommendations: list[str] = []
     if not configured:
-        recommendations.append("Configure BREVO_API_KEY and BREVO_SENDER_EMAIL in .env.")
+        recommendations.append(
+            "Configure SMTP_HOST, SMTP_USER, SMTP_PASSWORD, and SMTP_FROM (verified SES identity) in .env."
+        )
     if domain and not spf.get("ok"):
         recommendations.append(
             f"Add a TXT record on {domain}: v=spf1 include:_spf.google.com ~all "
@@ -323,12 +325,6 @@ def run_deliverability_health_check() -> dict[str, Any]:
             "mail_from": "Optional custom MAIL FROM subdomain (e.g. mail.example.com) + SPF",
             "env": "Set SMTP_HOST to email-smtp.<region>.amazonaws.com with SES SMTP credentials; "
             "set EMAIL_RETURN_PATH to the custom MAIL FROM address.",
-        },
-        "brevo_hints": {
-            "verify_domain": "Brevo → Senders, domains → Domains → Add domain",
-            "dns": "Publish Brevo SPF include + DKIM + DMARC as shown in the Brevo console",
-            "env": "Set BREVO_API_KEY and BREVO_SENDER_EMAIL (verified sender in Brevo). "
-            "Amazon SES SMTP_* remains commented in .env for rollback.",
         },
     }
 
