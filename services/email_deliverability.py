@@ -39,7 +39,7 @@ _DKIM_SELECTORS = (
     "s1",
     "s2",
     "k1",
-    # "brevo",  # Brevo DKIM selector — commented out with Brevo email code
+    "brevo",
     "mail",
     "smtp",
     "dkim",
@@ -177,8 +177,7 @@ def _alignment_checks(from_email: str, smtp_user: str) -> list[dict[str, Any]]:
             "label": "Sending provider suited for transactional mail",
             "detail": (
                 "Gmail SMTP is fine for low-volume personal sends but scores poorly for "
-                "first-time business outreach. Prefer Amazon SES or Workspace with "
-                # "first-time business outreach. Prefer Amazon SES, Brevo, or Workspace with "
+                "first-time business outreach. Prefer Amazon SES, Brevo, or Workspace with "
                 "domain DKIM for production deliverability."
                 if using_gmail_relay and smtp_domain not in {"gmail.com", "googlemail.com"}
                 else (
@@ -264,7 +263,7 @@ def run_deliverability_health_check() -> dict[str, Any]:
             "label": "Return-Path / MAIL FROM",
             "detail": (
                 f"Envelope sender: {return_path}. "
-                "Set EMAIL_RETURN_PATH or SMTP_MAIL_FROM to a domain you control for SES."
+                "Set EMAIL_RETURN_PATH or SMTP_MAIL_FROM to a domain you control for SES/Brevo."
             ),
         },
         *alignment,
@@ -274,9 +273,8 @@ def run_deliverability_health_check() -> dict[str, Any]:
     total = len(checks)
     recommendations: list[str] = []
     if not configured:
-        # recommendations.append("Configure BREVO_API_KEY and BREVO_SENDER_EMAIL in .env.")
         recommendations.append(
-            "Configure SMTP_USER, SMTP_PASSWORD, and BUSINESS_EMAIL / SMTP_FROM in .env."
+            "Configure SMTP_HOST, SMTP_USER, SMTP_PASSWORD, and SMTP_FROM (verified SES identity) in .env."
         )
     if domain and not spf.get("ok"):
         recommendations.append(
@@ -285,8 +283,7 @@ def run_deliverability_health_check() -> dict[str, Any]:
         )
     if domain and not dkim.get("ok"):
         recommendations.append(
-            f"Enable Easy DKIM (SES) or domain DKIM (Workspace) and publish the "
-            # f"Enable Easy DKIM (SES) or domain DKIM (Brevo/Workspace) and publish the "
+            f"Enable Easy DKIM (SES) or domain DKIM (Brevo/Workspace) and publish the "
             f"selector TXT under _domainkey.{domain}."
         )
     if domain and not dmarc.get("ok"):
@@ -329,12 +326,6 @@ def run_deliverability_health_check() -> dict[str, Any]:
             "env": "Set SMTP_HOST to email-smtp.<region>.amazonaws.com with SES SMTP credentials; "
             "set EMAIL_RETURN_PATH to the custom MAIL FROM address.",
         },
-        # "brevo_hints": {
-        #     "verify_domain": "Brevo → Senders, domains → Domains → Add domain",
-        #     "dns": "Publish Brevo SPF include + DKIM + DMARC as shown in the Brevo console",
-        #     "env": "Set BREVO_API_KEY and BREVO_SENDER_EMAIL (verified sender in Brevo). "
-        #     "Amazon SES SMTP_* remains commented in .env for rollback.",
-        # },
     }
 
 

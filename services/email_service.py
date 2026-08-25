@@ -9,8 +9,6 @@ from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 from typing import Any
 
-# import requests  # Brevo REST client — commented out
-
 from utils.parser_utils import is_valid_email
 
 from services.email_cc_validation import validate_cc_address_list
@@ -83,21 +81,36 @@ def _normalize_gmail_app_password(value: str | None) -> str:
 GMAIL_USER = _normalize_env(os.getenv("GMAIL_USER"))
 GMAIL_APP_PASSWORD = _normalize_gmail_app_password(os.getenv("GMAIL_APP_PASSWORD"))
 
-# Active transport is Amazon SES SMTP (smtplib). SMTP_* below is the global .env
-# relay; CMS Admin Email env can override it. Brevo REST remains commented out.
+# Role-based Amazon SES SMTP:
+#   INTERNAL → SUPER_ADMIN (demo)
+#   EXTERNAL → ADMIN / USER
 SMTP_HOST = _normalize_env(os.getenv("SMTP_HOST")) or DEFAULT_SMTP_HOST
 SMTP_PORT = int(_normalize_env(os.getenv("SMTP_PORT")) or str(DEFAULT_SMTP_PORT))
-SMTP_USER = _normalize_env(os.getenv("SMTP_USER")) or GMAIL_USER
-SMTP_PASSWORD = _normalize_gmail_app_password(os.getenv("SMTP_PASSWORD")) or GMAIL_APP_PASSWORD
 SMTP_FROM = _normalize_env(os.getenv("SMTP_FROM"))
 
-# --- Brevo email transport (commented out) ---
-# BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
-# BREVO_API_KEY = _normalize_env(os.getenv("BREVO_API_KEY"))
-# BREVO_SENDER_EMAIL = _normalize_env(os.getenv("BREVO_SENDER_EMAIL"))
-BREVO_API_URL = ""
-BREVO_API_KEY = ""
-BREVO_SENDER_EMAIL = ""
+SMTP_INTERNAL_HOST = _normalize_env(os.getenv("SMTP_INTERNAL_HOST")) or SMTP_HOST
+SMTP_INTERNAL_PORT = int(
+    _normalize_env(os.getenv("SMTP_INTERNAL_PORT")) or str(SMTP_PORT) or str(DEFAULT_SMTP_PORT)
+)
+SMTP_INTERNAL_USER = _normalize_env(os.getenv("SMTP_INTERNAL_USER")) or _normalize_env(
+    os.getenv("SMTP_USER")
+)
+SMTP_INTERNAL_PASSWORD = _normalize_gmail_app_password(
+    os.getenv("SMTP_INTERNAL_PASSWORD")
+) or _normalize_gmail_app_password(os.getenv("SMTP_PASSWORD"))
+SMTP_INTERNAL_FROM = _normalize_env(os.getenv("SMTP_INTERNAL_FROM")) or SMTP_FROM
+
+SMTP_EXTERNAL_HOST = _normalize_env(os.getenv("SMTP_EXTERNAL_HOST")) or SMTP_HOST
+SMTP_EXTERNAL_PORT = int(
+    _normalize_env(os.getenv("SMTP_EXTERNAL_PORT")) or str(SMTP_PORT) or str(DEFAULT_SMTP_PORT)
+)
+SMTP_EXTERNAL_USER = _normalize_env(os.getenv("SMTP_EXTERNAL_USER"))
+SMTP_EXTERNAL_PASSWORD = _normalize_gmail_app_password(os.getenv("SMTP_EXTERNAL_PASSWORD"))
+SMTP_EXTERNAL_FROM = _normalize_env(os.getenv("SMTP_EXTERNAL_FROM")) or SMTP_FROM
+
+# Legacy aliases (health / older callers)
+SMTP_USER = SMTP_INTERNAL_USER or GMAIL_USER
+SMTP_PASSWORD = SMTP_INTERNAL_PASSWORD or GMAIL_APP_PASSWORD
 
 BUSINESS_COMPANY_NAME = _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan"
 BUSINESS_PHONE = _normalize_env(os.getenv("BUSINESS_PHONE")) or ""
@@ -105,8 +118,9 @@ BUSINESS_WEBSITE = _normalize_env(os.getenv("BUSINESS_WEBSITE")) or ""
 # Prefer a real mailbox identity. Never fall back to SES SMTP usernames (AKIA...).
 BUSINESS_EMAIL = (
     _normalize_env(os.getenv("BUSINESS_EMAIL"))
-    # or BREVO_SENDER_EMAIL  # Brevo sender fallback — commented out
     or SMTP_FROM
+    or SMTP_INTERNAL_FROM
+    or SMTP_EXTERNAL_FROM
     or (SMTP_USER if "@" in (SMTP_USER or "") else "")
 )
 BUSINESS_EVENT_NAME = (
@@ -127,14 +141,14 @@ _SMTP_AUTH_HELP = (
 
 _EMAIL_NOT_CONFIGURED = (
     "Email is not configured on the server. "
-    "Set SMTP_USER + SMTP_PASSWORD and BUSINESS_EMAIL / SMTP_FROM "
-    "(verified SES identity) in the backend .env, then restart."
+    "Set SMTP_INTERNAL_* (SUPER_ADMIN) and/or SMTP_EXTERNAL_* (ADMIN/USER) "
+    "with a verified SES From address, then restart."
 )
 
 
 def log_email_startup() -> None:
     """One-line boot status: email is ready or not."""
-    if is_smtp_configured():
+    if is_email_configured():
         print("[EMAIL] ready", flush=True)
         logger.info("[EMAIL] ready")
         return
@@ -163,60 +177,235 @@ def _cms_smtp_override_configured() -> bool:
     return bool(user and password)
 
 
-def is_brevo_configured() -> bool:
-    # Brevo email transport is commented out.
-    # sender = BREVO_SENDER_EMAIL or BUSINESS_EMAIL
-    # return bool(BREVO_API_KEY and _looks_like_email(sender))
-    return False
-
-
 def is_smtp_configured() -> bool:
     if _cms_smtp_override_configured():
         return True
-    return bool(SMTP_USER and SMTP_PASSWORD)
+    if SMTP_INTERNAL_USER and SMTP_INTERNAL_PASSWORD:
+        return True
+    return bool(SMTP_EXTERNAL_USER and SMTP_EXTERNAL_PASSWORD)
 
 
-def _active_smtp() -> dict[str, Any]:
-    """SMTP settings: CMS Admin override when complete, else global .env."""
+def is_brevo_configured() -> bool:
+    """Brevo transport removed — always False (kept for API compatibility)."""
+    return False
+
+
+def _smtp_profile_from_parts(
+    *,
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    from_addr: str,
+    reply: str,
+    label: str,
+) -> dict[str, Any] | None:
+    if not (user and password):
+        return None
+    sender = from_addr
+    if not sender and _looks_like_email(user):
+        sender = user
+    if not _looks_like_email(sender):
+        return None
+    return {
+        "host": host or DEFAULT_SMTP_HOST,
+        "port": port or DEFAULT_SMTP_PORT,
+        "user": user,
+        "password": password,
+        "from": sender,
+        "reply": reply or BUSINESS_EMAIL or sender,
+        "name": BUSINESS_COMPANY_NAME,
+        "label": label,
+    }
+
+
+def _internal_smtp_profile() -> dict[str, Any] | None:
+    from_mailbox = (
+        SMTP_INTERNAL_USER
+        if _looks_like_email(SMTP_INTERNAL_USER)
+        else (SMTP_INTERNAL_FROM or SMTP_FROM or BUSINESS_EMAIL or "")
+    )
+    return _smtp_profile_from_parts(
+        host=SMTP_INTERNAL_HOST,
+        port=SMTP_INTERNAL_PORT,
+        user=SMTP_INTERNAL_USER,
+        password=SMTP_INTERNAL_PASSWORD,
+        from_addr=from_mailbox,
+        reply=BUSINESS_EMAIL or SMTP_INTERNAL_FROM or from_mailbox,
+        label="internal",
+    )
+
+
+def _external_smtp_profile() -> dict[str, Any] | None:
+    from_mailbox = (
+        SMTP_EXTERNAL_USER
+        if _looks_like_email(SMTP_EXTERNAL_USER)
+        else (SMTP_EXTERNAL_FROM or SMTP_FROM or BUSINESS_EMAIL or "")
+    )
+    return _smtp_profile_from_parts(
+        host=SMTP_EXTERNAL_HOST,
+        port=SMTP_EXTERNAL_PORT,
+        user=SMTP_EXTERNAL_USER,
+        password=SMTP_EXTERNAL_PASSWORD,
+        from_addr=from_mailbox,
+        reply=BUSINESS_EMAIL or SMTP_EXTERNAL_FROM or from_mailbox,
+        label="external",
+    )
+
+
+def _append_unique_profile(
+    profiles: list[dict[str, Any]], profile: dict[str, Any] | None
+) -> None:
+    if not profile:
+        return
+    for existing in profiles:
+        if (
+            existing.get("user") == profile.get("user")
+            and existing.get("password") == profile.get("password")
+        ):
+            return
+    profiles.append(profile)
+
+
+def _smtp_profiles_for_lane(lane: str) -> list[dict[str, Any]]:
+    """Primary lane credentials, then the other lane as fallback."""
+    profiles: list[dict[str, Any]] = []
+    if lane == "internal":
+        _append_unique_profile(profiles, _internal_smtp_profile())
+        _append_unique_profile(profiles, _external_smtp_profile())  # internal → external
+    else:
+        _append_unique_profile(profiles, _external_smtp_profile())
+        _append_unique_profile(profiles, _internal_smtp_profile())  # external → internal
+    return profiles
+
+
+def resolve_smtp_lane(
+    *,
+    sender_role: str | None = None,
+    contact: dict[str, Any] | None = None,
+    smtp_lane: str | None = None,
+) -> str:
+    """SUPER_ADMIN → internal; ADMIN/USER (and default) → external."""
+    explicit = str(smtp_lane or "").strip().lower()
+    if explicit in {"internal", "external"}:
+        return explicit
+    role = str(sender_role or "").strip().upper()
+    if not role and contact:
+        role = str(
+            contact.get("created_by_role")
+            or contact.get("createdByRole")
+            or ""
+        ).strip().upper()
+    if role == "SUPER_ADMIN":
+        return "internal"
+    return "external"
+
+
+def _cms_smtp_profile() -> dict[str, Any] | None:
+    """CMS Admin override when complete — takes exclusive precedence."""
     from services.admin_runtime_config import runtime_email
 
     em = runtime_email()
-    if em:
-        user = str(em.get("smtp_user") or em.get("smtp_username") or "").strip()
-        password = str(em.get("smtp_password") or "").strip()
-        if user and password:
-            host = str(em.get("smtp_host") or "").strip() or SMTP_HOST
-            port_raw = str(em.get("smtp_port") or "").strip()
-            try:
-                port = int(port_raw) if port_raw else SMTP_PORT
-            except ValueError:
-                port = SMTP_PORT
-            sender = str(em.get("smtp_from") or em.get("sender_email") or "").strip()
-            if not sender and _looks_like_email(user):
-                sender = user
-            if not sender:
-                sender = SMTP_FROM or BUSINESS_EMAIL or ""
-            reply = sender or BUSINESS_EMAIL or SMTP_FROM or ""
-            name = BUSINESS_COMPANY_NAME
-            return {
-                "host": host,
-                "port": port,
-                "user": user,
-                "password": password,
-                "from": sender,
-                "reply": reply,
-                "name": name,
-            }
+    if not em:
+        return None
+    user = str(em.get("smtp_user") or em.get("smtp_username") or "").strip()
+    password = str(em.get("smtp_password") or "").strip()
+    if not (user and password):
+        return None
+    host = str(em.get("smtp_host") or "").strip() or SMTP_HOST
+    port_raw = str(em.get("smtp_port") or "").strip()
+    try:
+        port = int(port_raw) if port_raw else SMTP_PORT
+    except ValueError:
+        port = SMTP_PORT
+    sender = str(em.get("smtp_from") or em.get("sender_email") or "").strip()
+    if not sender and _looks_like_email(user):
+        sender = user
+    if not sender:
+        sender = SMTP_EXTERNAL_FROM or SMTP_FROM or BUSINESS_EMAIL or ""
+    reply = sender or BUSINESS_EMAIL or SMTP_FROM or ""
+    return _smtp_profile_from_parts(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        from_addr=sender,
+        reply=reply,
+        label="cms",
+    )
 
-    from_mailbox = SMTP_USER if _looks_like_email(SMTP_USER) else (SMTP_FROM or BUSINESS_EMAIL or "")
+
+def _smtp_profiles_for_send(
+    *,
+    sender_role: str | None = None,
+    contact: dict[str, Any] | None = None,
+    smtp_lane: str | None = None,
+) -> list[dict[str, Any]]:
+    """Ordered SMTP profiles: CMS override, else lane primary then lane fallback."""
+    cms = _cms_smtp_profile()
+    if cms:
+        return [cms]
+    lane = resolve_smtp_lane(
+        sender_role=sender_role, contact=contact, smtp_lane=smtp_lane
+    )
+    return _smtp_profiles_for_lane(lane)
+
+
+def _smtp_failure_is_retryable(result: dict[str, Any]) -> bool:
+    """True when lane primary failed and the lane fallback should be tried."""
+    if result.get("success"):
+        return False
+    code = str(result.get("error_code") or "")
+    if code in {"EMAIL_RECIPIENT_MX_MISSING", "EMAIL_BLOCKED_SPAM"}:
+        return False
+    text = str(result.get("error") or "").lower()
+    markers = (
+        "authentication failed",
+        "auth",
+        "535",
+        "credentials",
+        "network error",
+        "connection",
+        "timed out",
+        "timeout",
+        "mail from",
+        "invalid mail from",
+        "from address",
+        "verified identity",
+        "email address is not verified",
+        "message rejected",
+        "sender",
+        "smtp error",
+        "unexpected smtp",
+    )
+    return any(m in text for m in markers)
+
+
+def _active_smtp(
+    *,
+    sender_role: str | None = None,
+    contact: dict[str, Any] | None = None,
+    smtp_lane: str | None = None,
+) -> dict[str, Any]:
+    """Preferred SMTP settings for From/Reply display for the active lane."""
+    profiles = _smtp_profiles_for_send(
+        sender_role=sender_role, contact=contact, smtp_lane=smtp_lane
+    )
+    if profiles:
+        return profiles[0]
+    # Prefer internal for display when both missing role context
+    for candidate in (_internal_smtp_profile(), _external_smtp_profile()):
+        if candidate:
+            return candidate
     return {
         "host": SMTP_HOST,
         "port": SMTP_PORT,
-        "user": SMTP_USER,
-        "password": SMTP_PASSWORD,
-        "from": from_mailbox,
-        "reply": BUSINESS_EMAIL or SMTP_FROM or from_mailbox,
+        "user": SMTP_INTERNAL_USER or SMTP_EXTERNAL_USER,
+        "password": SMTP_INTERNAL_PASSWORD or SMTP_EXTERNAL_PASSWORD,
+        "from": SMTP_FROM or SMTP_INTERNAL_FROM or SMTP_EXTERNAL_FROM or "",
+        "reply": BUSINESS_EMAIL or SMTP_FROM or "",
         "name": BUSINESS_COMPANY_NAME,
+        "label": "internal",
     }
 
 
@@ -230,20 +419,32 @@ def _looks_like_email(value: str | None) -> bool:
     return "@" in text and " " not in text
 
 
-def smtp_sender_email() -> str:
-    """Address used for From / MAIL FROM.
+def smtp_sender_email(
+    *,
+    sender_role: str | None = None,
+    contact: dict[str, Any] | None = None,
+    smtp_lane: str | None = None,
+) -> str:
+    """Address used for From / MAIL FROM for the active role lane."""
+    return str(
+        _active_smtp(
+            sender_role=sender_role, contact=contact, smtp_lane=smtp_lane
+        ).get("from")
+        or ""
+    )
 
-    Gmail SMTP: SMTP_USER is the mailbox and must be the From address.
-    Amazon SES SMTP: SMTP_USER is an IAM access key (AKIA...) — From must be a
-    verified identity from SMTP_FROM / BUSINESS_EMAIL.
-    CMS Admin email env overrides when a complete SMTP block is active.
-    """
-    return str(_active_smtp().get("from") or "")
 
-
-def smtp_reply_to_email() -> str:
+def smtp_reply_to_email(
+    *,
+    sender_role: str | None = None,
+    contact: dict[str, Any] | None = None,
+    smtp_lane: str | None = None,
+) -> str:
     """Public reply address; may differ from the authenticated From mailbox."""
-    return str(_active_smtp().get("reply") or "") or smtp_sender_email()
+    active = _active_smtp(
+        sender_role=sender_role, contact=contact, smtp_lane=smtp_lane
+    )
+    return str(active.get("reply") or "") or str(active.get("from") or "")
 
 
 def is_gmail_configured() -> bool:
@@ -259,9 +460,8 @@ def receive_inbox_email() -> str | None:
 def _cc_recipients_for_scan(receive_email: str | None = None) -> list[str]:
     """Receive template recipient — Admin (for User scans) or SuperAdmin (for Admin scans).
 
-    If the login inbox cannot receive mail (no MX, e.g. superadmin@ulavi.com),
-    fall back to BUSINESS_EMAIL so the owner still gets a copy.
-    # fall back to the verified Brevo sender so the owner still gets a copy.
+    If the login inbox cannot receive mail (no MX), fall back to SMTP_FROM /
+    BUSINESS_EMAIL so the owner still gets a copy.
     """
     email = str(receive_email or "").strip()
     if not email:
@@ -269,8 +469,9 @@ def _cc_recipients_for_scan(receive_email: str | None = None) -> list[str]:
     mx_ok, mx_error = _check_recipient_mx(email)
     if mx_ok:
         return [email]
-    # fallback = (BREVO_SENDER_EMAIL or BUSINESS_EMAIL or "").strip()
-    fallback = (BUSINESS_EMAIL or "").strip()
+    fallback = (
+        SMTP_FROM or SMTP_INTERNAL_FROM or SMTP_EXTERNAL_FROM or BUSINESS_EMAIL or ""
+    ).strip()
     if fallback and fallback.lower() != email.lower() and _looks_like_email(fallback):
         logger.warning(
             "Owner inbox %s cannot receive mail (%s). Sending owner copy to %s instead.",
@@ -284,7 +485,9 @@ def _cc_recipients_for_scan(receive_email: str | None = None) -> list[str]:
 
 
 def is_email_configured() -> bool:
-    return is_smtp_configured()
+    return bool(
+        _internal_smtp_profile() or _external_smtp_profile() or _cms_smtp_profile()
+    )
 
 
 def is_email_test_recipient_configured() -> bool:
@@ -298,11 +501,9 @@ def is_test_recipient_mode() -> bool:
 
 
 def get_email_provider() -> str | None:
-    """Amazon SES / SMTP (smtplib) is the active email transport."""
-    if is_smtp_configured():
+    """Active transport: SMTP (Amazon SES / Gmail), including CMS Admin override."""
+    if is_email_configured():
         return "smtp"
-    # if is_brevo_configured():
-    #     return "brevo"
     return None
 
 
@@ -562,6 +763,7 @@ def _send_via_smtp_relay(
     return result
 
 
+# Amazon SES SMTP — role lane (internal=SUPER_ADMIN, external=ADMIN/USER).
 def _send_via_smtp(
     to_address: str,
     *,
@@ -569,27 +771,27 @@ def _send_via_smtp(
     plain_body: str,
     html_body: str,
     cc_addresses: list[str] | None = None,
+    sender_role: str | None = None,
+    contact: dict[str, Any] | None = None,
+    smtp_lane: str | None = None,
 ) -> dict[str, Any]:
-    """Send an email over SMTP (smtplib) using the configured credentials."""
-    if not is_smtp_configured():
+    """Send over SMTP: lane primary, then lane fallback if primary fails."""
+    profiles = _smtp_profiles_for_send(
+        sender_role=sender_role, contact=contact, smtp_lane=smtp_lane
+    )
+    lane = resolve_smtp_lane(
+        sender_role=sender_role, contact=contact, smtp_lane=smtp_lane
+    )
+    if not profiles:
         return {
             "success": False,
             "recipient_email": to_address,
             "error": (
-                "SMTP is not configured. Set SMTP_USER + SMTP_PASSWORD "
-                "(and BUSINESS_EMAIL / SMTP_FROM for SES From) in .env."
+                f"Email is not configured for SMTP lane '{lane}'. "
+                "Set SMTP_INTERNAL_* (SUPER_ADMIN) and SMTP_EXTERNAL_* (ADMIN/USER). "
+                "Internal falls back to external; external falls back to internal."
             ),
-        }
-    # Prefer verified From identity (SES) or Gmail mailbox when SMTP_USER is an email.
-    from_mailbox = smtp_sender_email()
-    if not _looks_like_email(from_mailbox):
-        return {
-            "success": False,
-            "recipient_email": to_address,
-            "error": (
-                "Email From address is not configured. Set SMTP_FROM or BUSINESS_EMAIL "
-                "to a verified SES identity (not the SMTP username)."
-            ),
+            "smtp_lane": lane,
         }
 
     mx_ok, mx_error = _check_recipient_mx(to_address)
@@ -602,116 +804,72 @@ def _send_via_smtp(
             "error_code": "EMAIL_RECIPIENT_MX_MISSING",
         }
 
-    smtp = _active_smtp()
-    from_mailbox = str(smtp.get("from") or from_mailbox)
-    host = str(smtp.get("host") or SMTP_HOST)
-    result = _send_via_smtp_relay(
-        to_address,
-        subject=subject,
-        plain_body=plain_body,
-        html_body=html_body,
-        smtp_host=host,
-        smtp_port=int(smtp.get("port") or SMTP_PORT),
-        smtp_user=str(smtp.get("user") or ""),
-        smtp_password=str(smtp.get("password") or ""),
-        from_address=from_mailbox,
-        reply_to=str(smtp.get("reply") or smtp_reply_to_email()),
-        provider_label=(
-            "Amazon SES" if ("amazonaws.com" in host.lower() or host.lower().startswith("email-smtp.")) else "SMTP"
-        ),
-        cc_addresses=cc_addresses,
-    )
-    if not result["success"] and "authentication failed" in str(result.get("error", "")).lower():
-        result["error"] = _SMTP_AUTH_HELP
-    return result
+    last_result: dict[str, Any] = {
+        "success": False,
+        "recipient_email": to_address,
+        "error": _EMAIL_NOT_CONFIGURED,
+        "smtp_lane": lane,
+    }
+    for index, smtp in enumerate(profiles):
+        host = str(smtp.get("host") or SMTP_HOST)
+        label = str(smtp.get("label") or "smtp")
+        provider_label = (
+            "Amazon SES"
+            if ("amazonaws.com" in host.lower() or host.lower().startswith("email-smtp."))
+            else "SMTP"
+        )
+        if label.startswith("internal"):
+            provider_label = f"{provider_label} (internal)"
+        elif label.startswith("external"):
+            provider_label = f"{provider_label} (external)"
 
+        result = _send_via_smtp_relay(
+            to_address,
+            subject=subject,
+            plain_body=plain_body,
+            html_body=html_body,
+            smtp_host=host,
+            smtp_port=int(smtp.get("port") or SMTP_PORT),
+            smtp_user=str(smtp.get("user") or ""),
+            smtp_password=str(smtp.get("password") or ""),
+            from_address=str(smtp.get("from") or ""),
+            reply_to=str(
+                smtp.get("reply")
+                or smtp_reply_to_email(
+                    sender_role=sender_role, contact=contact, smtp_lane=smtp_lane
+                )
+            ),
+            provider_label=provider_label,
+            cc_addresses=cc_addresses,
+        )
+        result["smtp_profile"] = label
+        result["smtp_lane"] = lane
+        if result.get("success"):
+            if index > 0:
+                logger.warning(
+                    "Primary %s SMTP failed; delivered via %s credentials to %s",
+                    lane,
+                    label,
+                    to_address,
+                )
+            return result
 
-# def _brevo_error_detail(response: requests.Response) -> str:
-#     detail = (response.text or "").strip() or response.reason
-#     try:
-#         data = response.json()
-#     except ValueError:
-#         return detail
-#     if isinstance(data, dict):
-#         return str(data.get("message") or data.get("error") or detail)
-#     return detail
-#
-#
-# def _send_via_brevo(
-#     to_address: str,
-#     *,
-#     subject: str,
-#     plain_body: str,
-#     html_body: str,
-#     cc_addresses: list[str] | None = None,
-# ) -> dict[str, Any]:
-#     """Send an email via the Brevo transactional REST API."""
-#     result: dict[str, Any] = {
-#         "success": False,
-#         "recipient_email": to_address,
-#         "cc_emails": [],
-#         "error": None,
-#     }
-#     sender_email = BREVO_SENDER_EMAIL or BUSINESS_EMAIL
-#     if not BREVO_API_KEY or not _looks_like_email(sender_email):
-#         result["error"] = _EMAIL_NOT_CONFIGURED
-#         return result
-#
-#     # Brevo accepts the message and reports bounces itself. Local MX pre-check
-#     # blocked owner copies to domains like ulavi.com even when Brevo was ready.
-#     cc_list, cc_invalid = _prepare_cc_addresses(cc_addresses, to_address=to_address)
-#     result["cc_emails"] = cc_list
-#     if cc_invalid:
-#         result["cc_invalid"] = cc_invalid
-#
-#     payload: dict[str, Any] = {
-#         "sender": {
-#             "name": BUSINESS_COMPANY_NAME,
-#             "email": sender_email,
-#         },
-#         "to": [{"email": to_address}],
-#         "subject": subject,
-#         "htmlContent": html_body,
-#         "textContent": plain_body,
-#     }
-#     reply_to = smtp_reply_to_email()
-#     if _looks_like_email(reply_to):
-#         payload["replyTo"] = {"email": reply_to}
-#     if cc_list:
-#         payload["cc"] = [{"email": addr} for addr in cc_list]
-#
-#     try:
-#         response = requests.post(
-#             BREVO_API_URL,
-#             headers={
-#                 "accept": "application/json",
-#                 "api-key": BREVO_API_KEY,
-#                 "content-type": "application/json",
-#             },
-#             json=payload,
-#             timeout=30,
-#         )
-#     except requests.RequestException as exc:
-#         result["error"] = f"Network error connecting to Brevo: {exc}"
-#         logger.error("Brevo network error: %s", result["error"], exc_info=True)
-#         return result
-#
-#     if response.status_code in (200, 201, 202):
-#         logger.info("SUCCESS: Thank-you email sent via Brevo to %s", to_address)
-#         result["success"] = True
-#         try:
-#             data = response.json()
-#         except ValueError:
-#             data = None
-#         if isinstance(data, dict) and data.get("messageId"):
-#             result["message_id"] = data["messageId"]
-#         return result
-#
-#     result["error"] = (
-#         f"Brevo rejected the send ({response.status_code}): {_brevo_error_detail(response)}"
-#     )
-#     logger.error("Brevo send failed for %s: %s", to_address, result["error"])
-#     return result
+        last_result = result
+        if index < len(profiles) - 1 and _smtp_failure_is_retryable(result):
+            logger.warning(
+                "SMTP profile %s failed for %s (%s); trying lane fallback.",
+                label,
+                to_address,
+                result.get("error"),
+            )
+            continue
+        break
+
+    if not last_result.get("success") and "authentication failed" in str(
+        last_result.get("error", "")
+    ).lower():
+        last_result["error"] = _SMTP_AUTH_HELP
+    return last_result
 
 
 def _deliver_email(
@@ -721,6 +879,9 @@ def _deliver_email(
     plain_body: str,
     html_body: str,
     cc_addresses: list[str] | None = None,
+    sender_role: str | None = None,
+    contact: dict[str, Any] | None = None,
+    smtp_lane: str | None = None,
 ) -> dict[str, Any]:
     if is_smtp_configured():
         return _send_via_smtp(
@@ -729,15 +890,10 @@ def _deliver_email(
             plain_body=plain_body,
             html_body=html_body,
             cc_addresses=cc_addresses,
+            sender_role=sender_role,
+            contact=contact,
+            smtp_lane=smtp_lane,
         )
-    # if is_brevo_configured():
-    #     return _send_via_brevo(
-    #         to_address,
-    #         subject=subject,
-    #         plain_body=plain_body,
-    #         html_body=html_body,
-    #         cc_addresses=cc_addresses,
-    #     )
     return {
         "success": False,
         "recipient_email": to_address,
@@ -1113,10 +1269,12 @@ def _send_cc_scanned_details_emails(
     cc_addresses: list[str],
     *,
     contact: dict[str, Any],
+    sender_role: str | None = None,
+    smtp_lane: str | None = None,
 ) -> list[dict[str, Any]]:
     """Send the CC-only scanned-details template as separate emails."""
     provider = get_email_provider()
-    if provider not in {"smtp"} or not cc_addresses:
+    if provider != "smtp" or not cc_addresses:
         return []
 
     plain_body, html_body = build_cc_scanned_contact_body(contact)
@@ -1135,6 +1293,9 @@ def _send_cc_scanned_details_emails(
             plain_body=plain_body,
             html_body=html_body,
             cc_addresses=None,
+            sender_role=sender_role,
+            contact=contact,
+            smtp_lane=smtp_lane,
         )
         results.append({"email": cc_email, **delivery})
         if delivery.get("success"):
@@ -1189,11 +1350,14 @@ def send_business_thank_you_email(
     test_override: str | None = None,
     cc_addresses: list[str] | None = None,
     contact: dict[str, Any] | None = None,
+    sender_role: str | None = None,
+    smtp_lane: str | None = None,
 ) -> dict[str, Any]:
     """
     Validate, compose, and send the business thank-you email.
 
     To = scanned contact (User). CC = scanning CardSync user (Owner) when provided.
+    SUPER_ADMIN uses INTERNAL SES; ADMIN/USER use EXTERNAL SES.
     """
     result: dict[str, Any] = {
         "success": False,
@@ -1226,6 +1390,11 @@ def send_business_thank_you_email(
     to_address = to_validated_or_error
     result["recipient_email"] = to_address
 
+    lane = resolve_smtp_lane(
+        sender_role=sender_role, contact=contact, smtp_lane=smtp_lane
+    )
+    result["smtp_lane"] = lane
+
     if not is_email_configured():
         error = _EMAIL_NOT_CONFIGURED
         result["error"] = error
@@ -1247,8 +1416,9 @@ def send_business_thank_you_email(
     if cc_invalid:
         result["cc_invalid"] = cc_invalid
     logger.info(
-        "Sending business thank-you email via %s -> to (User)=%s cc (Owner)=%s subject=%r",
+        "Sending business thank-you email via %s lane=%s -> to (User)=%s cc (Owner)=%s subject=%r",
         provider,
+        lane,
         _redact_email(to_address),
         [_redact_email(e) for e in cc_list] or "(none)",
         subject,
@@ -1260,18 +1430,28 @@ def send_business_thank_you_email(
         plain_body=plain_body,
         html_body=html_body,
         cc_addresses=None,
+        sender_role=sender_role,
+        contact=contact,
+        smtp_lane=smtp_lane,
     )
 
     result["success"] = delivery.get("success", False)
-    result["cc_emails"] = cc_list if provider in {"smtp"} else []
+    result["cc_emails"] = cc_list if provider == "smtp" else []
+    result["smtp_profile"] = delivery.get("smtp_profile")
+    result["smtp_lane"] = delivery.get("smtp_lane") or lane
     if cc_invalid and "cc_invalid" not in result:
         result["cc_invalid"] = cc_invalid
     result["error"] = delivery.get("error")
     if delivery.get("message_id"):
         result["message_id"] = delivery.get("message_id")
 
-    if result["success"] and cc_list and contact and provider in {"smtp"}:
-        cc_results = _send_cc_scanned_details_emails(cc_list, contact=contact)
+    if result["success"] and cc_list and contact and provider == "smtp":
+        cc_results = _send_cc_scanned_details_emails(
+            cc_list,
+            contact=contact,
+            sender_role=sender_role,
+            smtp_lane=smtp_lane,
+        )
         result["cc_delivery"] = cc_results
         cc_failures = [r for r in cc_results if not r.get("success")]
         if cc_failures:
@@ -1295,6 +1475,8 @@ def send_thank_you_to_contact(
     *,
     test_override: str | None = None,
     cc_addresses: list[str] | None = None,
+    sender_role: str | None = None,
+    smtp_lane: str | None = None,
 ) -> dict[str, Any]:
     """Extract email from contact data and send the business thank-you email."""
     extracted = extract_primary_email(contact)
@@ -1313,6 +1495,8 @@ def send_thank_you_to_contact(
         test_override=test_override,
         cc_addresses=cc_addresses,
         contact=contact,
+        sender_role=sender_role,
+        smtp_lane=smtp_lane,
     )
 
 
@@ -1344,12 +1528,15 @@ async def schedule_email_for_contact(
     skip_if_already_sent: bool = True,
     test_override: str | None = None,
     scanner_email: str | None = None,
+    sender_role: str | None = None,
+    user: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Send a business thank-you email to the contact's primary email address.
 
     Returns a result dict with attempted/sent/error fields.
     """
+    role = sender_role or (str(user.get("role") or "") if user else None)
     skipped: dict[str, Any] = {
         "attempted": False,
         "sent": False,
@@ -1359,6 +1546,7 @@ async def schedule_email_for_contact(
         "cc_emails": [],
         "extracted_email": None,
         "subject": SUBJECT,
+        "smtp_lane": resolve_smtp_lane(sender_role=role, contact=contact),
     }
 
     if not _auto_send_enabled():
@@ -1411,10 +1599,11 @@ async def schedule_email_for_contact(
     if cc_invalid:
         skipped["cc_invalid"] = cc_invalid
     logger.info(
-        "Email dynamic send -> to (contact)=%s receive/cc (manager)=%s name=%s",
+        "Email dynamic send -> to (contact)=%s receive/cc (manager)=%s name=%s lane=%s",
         _redact_email(recipient),
         [_redact_email(e) for e in cc_list] or "(none)",
         contact_name or "unknown",
+        skipped["smtp_lane"],
     )
 
     if not _should_send_to_email(recipient, bypass_dedupe=is_test_recipient_mode()):
@@ -1429,6 +1618,7 @@ async def schedule_email_for_contact(
             test_override=test_override,
             cc_addresses=raw_cc,
             contact=contact,
+            sender_role=role,
         )
         if delivery["success"]:
             logger.info(
