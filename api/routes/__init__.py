@@ -15,6 +15,7 @@ from api.routes.invitation_routes import router as invitation_router
 from api.routes.ocr import router as ocr_router
 from api.routes.registration_routes import router as registration_router
 from api.routes.offline_queue_routes import router as offline_queue_router
+from api.routes.phone_normalize_routes import router as phone_normalize_router
 from api.routes.profile_routes import router as profile_router
 from api.routes.session_routes import router as session_router
 from api.routes.user_routes import router as user_router
@@ -38,6 +39,7 @@ def build_api_router() -> APIRouter:
     root.include_router(invitation_router)
     root.include_router(registration_router)
     root.include_router(offline_queue_router)
+    root.include_router(phone_normalize_router)
     root.include_router(google_oauth_router)
     root.include_router(cms_admin_env_router)
     return root
