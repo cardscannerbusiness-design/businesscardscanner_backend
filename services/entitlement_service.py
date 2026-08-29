@@ -1,4 +1,4 @@
-"""Company card-count entitlement — Freemium (25 cards) with room for PAYG/Prepaid.
+"""Company card-count entitlement — Freemium (10 cards) with room for PAYG/Prepaid.
 
 Storage quota in storage_service.py stays independent. This module is the
 single backend decision for:
@@ -13,7 +13,7 @@ saved on the device (IndexedDB), not in PostgreSQL, until entitlement is
 restored (e.g. Pay-as-you-go).
 
 Runtime values always come from companies.card_limit / cards_used.
-Do not hard-code 25 at call sites — use DEFAULT_FREEMIUM_CARD_LIMIT.
+Do not hard-code 10 at call sites — use DEFAULT_FREEMIUM_CARD_LIMIT.
 """
 
 from __future__ import annotations
@@ -29,9 +29,9 @@ USAGE_TYPE_CARD_PROCESS = "CARD_PROCESS"
 
 # Single authoritative Freemium allowance. Env override for test/ops only.
 try:
-    DEFAULT_FREEMIUM_CARD_LIMIT = max(0, int(os.getenv("FREEMIUM_CARD_LIMIT", "25")))
+    DEFAULT_FREEMIUM_CARD_LIMIT = max(0, int(os.getenv("FREEMIUM_CARD_LIMIT", "10")))
 except ValueError:
-    DEFAULT_FREEMIUM_CARD_LIMIT = 25
+    DEFAULT_FREEMIUM_CARD_LIMIT = 10
 
 _LOCK_TIMEOUT_MS = 5_000
 _STATEMENT_TIMEOUT_MS = 15_000

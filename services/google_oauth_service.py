@@ -269,6 +269,30 @@ def refresh_access_token(refresh_token: str) -> str:
     return str(token)
 
 
+def _oauth_access_token(
+    *,
+    company_id: str | None = None,
+    user_id: str | None = None,
+) -> str:
+    """Refresh an OAuth access token: company admin first, then creating user."""
+    refresh: str | None = None
+    cid = str(company_id or "").strip()
+    uid = str(user_id or "").strip()
+    if cid:
+        admin = load_company_admin_oauth(cid)
+        if admin and admin.get("refresh_token"):
+            refresh = str(admin["refresh_token"])
+    if not refresh and uid:
+        refresh = load_user_refresh_token(uid)
+    if not refresh:
+        raise GoogleOAuthError(
+            "GOOGLE_NOT_CONNECTED",
+            "Google Drive is not connected. Connect Google Drive in Settings.",
+            400,
+        )
+    return refresh_access_token(refresh)
+
+
 def fetch_google_email(access_token: str) -> str | None:
     response = requests.get(
         _USERINFO_URL,

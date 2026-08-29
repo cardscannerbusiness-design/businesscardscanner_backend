@@ -557,6 +557,7 @@ async def create_contact_json(
                     request=request,
                     user=user,
                 )
+            fire_sheets_sync(contact_id, _sheets_extras(payload))
             return response
 
         result = storage.create_contact(payload)

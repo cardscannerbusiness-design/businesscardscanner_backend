@@ -271,6 +271,7 @@ class CreateManagedEventRequest(BaseModel):
     start_date: str | None = None
     end_date: str | None = None
     status: str = Field(default="active", pattern="^(active|inactive|completed)$")
+    days: list[str] | None = None
 
 
 class UpdateManagedEventRequest(BaseModel):

@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _ALLOWED_STATUS = {"active", "inactive", "completed"}
 
+_EVENT_COLUMNS = """
+    id, name, description, location, start_date, end_date, status,
+    created_by, updated_by, company_id, created_at, updated_at,
+    spreadsheet_id, spreadsheet_url, google_sheet_id, google_sheet_url
+"""
+
 
 def _parse_date(value: str | None, field: str) -> date | None:
     if value is None or value.strip() == "":
@@ -51,6 +57,9 @@ def _serialize_event(row: dict) -> dict:
     for key in ("created_at", "updated_at", "deleted_at"):
         if out.get(key) and hasattr(out[key], "isoformat"):
             out[key] = out[key].isoformat()
+    for key in ("spreadsheet_id", "spreadsheet_url", "google_sheet_id", "google_sheet_url"):
+        if out.get(key) is not None:
+            out[key] = str(out[key])
     return out
 
 
@@ -74,6 +83,130 @@ def _event_scope_sql(user: dict) -> tuple[str, list]:
     if company_id:
         return "company_id = %s", [company_id]
     return "created_by = %s", [user["id"]]
+
+
+def _event_day_names(
+    body: CreateManagedEventRequest,
+    start: date | None,
+    end: date | None,
+) -> list[str]:
+    names = [str(day).strip() for day in (getattr(body, "days", None) or []) if str(day).strip()]
+    if names:
+        return names
+    if start and end:
+        span = (end - start).days + 1
+        span = max(1, min(span, 60))
+        return [f"Day {i}" for i in range(1, span + 1)]
+    return ["Day 1"]
+
+
+def _replace_event_days(cur, event_id: str, day_names: list[str]) -> None:
+    cur.execute("DELETE FROM event_days WHERE event_id = %s", (event_id,))
+    titles = day_names or ["Day 1"]
+    for index, name in enumerate(titles):
+        cur.execute(
+            """
+            INSERT INTO event_days (event_id, name, sort_order)
+            VALUES (%s, %s, %s)
+            """,
+            (event_id, name[:100], index),
+        )
+
+
+def _load_event_day_names(event_id: str, row: dict | None = None) -> list[str]:
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            "SELECT name FROM event_days WHERE event_id = %s ORDER BY sort_order",
+            (event_id,),
+        )
+        rows = cur.fetchall() or []
+    names = [str(item.get("name") or "").strip() for item in rows]
+    names = [name for name in names if name]
+    if names:
+        return names
+    if row:
+        start = row.get("start_date")
+        end = row.get("end_date")
+        if start and end:
+            try:
+                start_d = start if isinstance(start, date) else date.fromisoformat(str(start)[:10])
+                end_d = end if isinstance(end, date) else date.fromisoformat(str(end)[:10])
+                span = (end_d - start_d).days + 1
+                span = max(1, min(span, 60))
+                return [f"Day {i}" for i in range(1, span + 1)]
+            except Exception:
+                pass
+    return ["Day 1"]
+
+
+def _reload_event(event_id: str) -> dict | None:
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            f"""
+            SELECT {_EVENT_COLUMNS}
+            FROM managed_events
+            WHERE id = %s AND deleted_at IS NULL
+            """,
+            (event_id,),
+        )
+        loaded = cur.fetchone()
+    return dict(loaded) if loaded else None
+
+
+def _event_workbook_missing(row: dict) -> bool:
+    sheet_id = str(row.get("spreadsheet_id") or row.get("google_sheet_id") or "").strip()
+    sheet_url = str(row.get("spreadsheet_url") or row.get("google_sheet_url") or "").strip()
+    return not sheet_id and not sheet_url
+
+
+def _create_and_save_event_workbook(
+    *,
+    event_id: str,
+    event_name: str,
+    company_id: str | None,
+    user_id: str,
+    day_titles: list[str] | None = None,
+    reuse_existing: bool = False,
+) -> None:
+    from services.google_sheets_automation import automate_event_sheets
+
+    logger.info("[GSHEET] reuse_existing=%s", reuse_existing)
+    titles = day_titles or _load_event_day_names(event_id)
+    logger.info("[GSHEET] days=%s", titles)
+    automate_event_sheets(
+        event_id=event_id,
+        event_name=event_name,
+        company_id=company_id,
+        user_id=user_id,
+        day_titles=titles,
+        reuse_existing=reuse_existing,
+    )
+
+
+def _ensure_event_workbook_if_missing(row: dict, user: dict) -> dict:
+    """Create an event-specific workbook only when this event has no sheet metadata."""
+    if not _event_workbook_missing(row):
+        return row
+    event_id = str(row.get("id") or "").strip()
+    if not event_id:
+        return row
+    company_id = row.get("company_id")
+    company_id = str(company_id) if company_id else None
+    try:
+        _create_and_save_event_workbook(
+            event_id=event_id,
+            event_name=str(row.get("name") or ""),
+            company_id=company_id,
+            user_id=str(user.get("id") or ""),
+            day_titles=_load_event_day_names(event_id, row),
+            reuse_existing=False,
+        )
+        refreshed = _reload_event(event_id)
+        if refreshed:
+            return refreshed
+    except Exception:
+        logger.exception("[GSHEET] ensure workbook failed for event_id=%s", event_id)
+    return row
 
 
 def _deactivate_other_active_events(cur, keep_id: str, now: datetime, company_id: str | None) -> None:
@@ -138,8 +271,7 @@ def list_events(
         total = cur.fetchone()["total"]
         cur.execute(
             f"""
-            SELECT id, name, description, location, start_date, end_date, status,
-                   created_by, updated_by, company_id, created_at, updated_at
+            SELECT {_EVENT_COLUMNS}
             FROM managed_events
             WHERE {where}
             ORDER BY created_at DESC
@@ -167,8 +299,7 @@ def get_active_event(user: dict = Depends(get_current_user)):
     with db_cursor(commit=False) as cur:
         cur.execute(
             f"""
-            SELECT id, name, description, location, start_date, end_date, status,
-                   created_by, updated_by, company_id, created_at, updated_at
+            SELECT {_EVENT_COLUMNS}
             FROM managed_events
             WHERE deleted_at IS NULL AND status = 'active' AND {scope_sql}
             ORDER BY updated_at DESC NULLS LAST, created_at DESC
@@ -179,7 +310,8 @@ def get_active_event(user: dict = Depends(get_current_user)):
         row = cur.fetchone()
     if not row:
         return {"event": None}
-    return {"event": _serialize_event(dict(row))}
+    event_row = _ensure_event_workbook_if_missing(dict(row), user)
+    return {"event": _serialize_event(event_row)}
 
 
 @router.get(
@@ -194,8 +326,7 @@ def get_event(
     with db_cursor(commit=False) as cur:
         cur.execute(
             f"""
-            SELECT id, name, description, location, start_date, end_date, status,
-                   created_by, updated_by, company_id, created_at, updated_at
+            SELECT {_EVENT_COLUMNS}
             FROM managed_events
             WHERE id = %s AND deleted_at IS NULL AND {scope_sql}
             """,
@@ -229,6 +360,7 @@ def create_event(
 
     company_id = _tenant_company_id(user)
     now = datetime.now(timezone.utc)
+    day_names = _event_day_names(body, start, end)
     with db_cursor() as cur:
         if company_id:
             cur.execute(
@@ -256,8 +388,7 @@ def create_event(
                 created_by, updated_by, company_id, created_at, updated_at
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id, name, description, location, start_date, end_date, status,
-                      created_by, updated_by, company_id, created_at, updated_at
+            RETURNING """ + _EVENT_COLUMNS + """
             """,
             (
                 name,
@@ -274,17 +405,36 @@ def create_event(
             ),
         )
         row = cur.fetchone()
+        event_id = str(row["id"])
+        _replace_event_days(cur, event_id, day_names)
         if status == "active" and row:
-            _deactivate_other_active_events(cur, str(row["id"]), now, company_id)
+            _deactivate_other_active_events(cur, event_id, now, company_id)
+
+    logger.info("[GSHEET] event creation started: event_id=%s", event_id)
+    logger.info("[GSHEET] create_google_workbook=True")
+    try:
+        _create_and_save_event_workbook(
+            event_id=event_id,
+            event_name=name,
+            company_id=company_id,
+            user_id=str(user["id"]),
+            day_titles=day_names,
+            reuse_existing=False,
+        )
+        refreshed = _reload_event(event_id)
+        if refreshed:
+            row = refreshed
+    except Exception:
+        logger.exception("[GSHEET] creation failed:")
 
     audit_service.log_action(
         user["id"],
         AUDIT_EVENT_CREATED,
         ip=request.client.host if request.client else "",
         user_agent=request.headers.get("user-agent", ""),
-        new_value={"event_id": str(row["id"]), "name": name, "company_id": company_id},
+        new_value={"event_id": event_id, "name": name, "company_id": company_id},
     )
-    logger.info("Managed event created: %s by %s", row["id"], user["id"])
+    logger.info("Managed event created: %s by %s", event_id, user["id"])
     return _serialize_event(dict(row))
 
 
@@ -378,8 +528,7 @@ def update_event(
             UPDATE managed_events
             SET {', '.join(set_parts)}
             WHERE id = %s AND deleted_at IS NULL
-            RETURNING id, name, description, location, start_date, end_date, status,
-                      created_by, updated_by, company_id, created_at, updated_at
+            RETURNING {_EVENT_COLUMNS}
             """,
             params,
         )
