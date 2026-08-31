@@ -14,6 +14,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from psycopg2 import IntegrityError
+
 from auth import audit_service
 
 from auth.constants import (
@@ -35,6 +37,7 @@ from auth.email_service import (
     send_registration_approved_email,
     send_registration_received_email,
     send_registration_rejected_email,
+    send_welcome_email,
 )
 from auth.password_utils import hash_password, validate_password_policy, verify_password
 from db.pool import db_cursor
@@ -52,6 +55,7 @@ MSG_PENDING_APPROVAL = (
 MSG_REGISTRATION_REJECTED = (
     "Your NameCardScan registration request was rejected. You cannot sign in with this account."
 )
+MSG_SIGNUP_CREATED = "Your account has been created successfully. You can now sign in."
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _rate_by_ip: dict[str, list[float]] = {}
@@ -142,6 +146,115 @@ def _unique_company_code(cur, email: str, requested: str = "") -> str:
         cur.execute("SELECT 1 FROM companies WHERE LOWER(company_code) = %s", (candidate.lower(),))
         if not cur.fetchone():
             return candidate
+
+
+def _raise_unique_conflict(exc: IntegrityError) -> None:
+    """Map unique-constraint failures to existing API errors (no raw DB text)."""
+    constraint = ""
+    diag = getattr(exc, "diag", None)
+    if diag is not None:
+        constraint = str(getattr(diag, "constraint_name", "") or "").lower()
+    blob = f"{constraint} {exc}".lower()
+    if "email" in blob:
+        raise RegistrationError(ERR_DUPLICATE_EMAIL, "This email is already registered.", 409) from exc
+    if "username" in blob:
+        raise RegistrationError("DUPLICATE_USERNAME", "Username is already taken.", 409) from exc
+    if "company_code" in blob:
+        raise RegistrationError("DUPLICATE_COMPANY_CODE", "Company code already exists.", 409) from exc
+    raise RegistrationError("CONFLICT", "Could not complete registration because of a conflict.", 409) from exc
+
+
+def _create_admin_and_company(
+    cur,
+    *,
+    email: str,
+    first_name: str,
+    last_name: str,
+    password_hash: str,
+    phone: str,
+    designation: str,
+    department: str,
+    username_requested: str,
+    company_name: str,
+    company_code: str,
+    company_address: str,
+    company_phone: str,
+    company_email: str,
+    company_website: str,
+    created_by: str | None,
+    now: datetime,
+) -> tuple[str, str, str]:
+    """Insert Freemium company + ADMIN user (same shape as approve_admin_registration).
+
+    Caller must already be inside db_cursor(commit=True). On exception the
+    surrounding cursor context rolls back company and user together.
+    """
+    username = _unique_username(cur, email, username_requested)
+    cur.execute("SELECT id FROM roles WHERE name = %s", (ROLE_ADMIN,))
+    role_row = cur.fetchone()
+    if not role_row:
+        raise RegistrationError("ROLE_MISSING", "Role ADMIN is not configured.", 500)
+
+    company_name = (company_name or "").strip() or f"{first_name}'s Company"
+    company_code = _unique_company_code(cur, email, company_code)
+    company_id = str(uuid.uuid4())
+    cur.execute(
+        """
+        INSERT INTO companies (
+            id, company_name, company_code, address, phone, email, website,
+            status, plan_name, storage_limit_bytes, used_storage_bytes,
+            created_at, updated_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,0,%s,%s)
+        """,
+        (
+            company_id,
+            company_name,
+            company_code,
+            company_address or "",
+            company_phone or "",
+            company_email or email,
+            company_website or "",
+            DEFAULT_PLAN_NAME,
+            DEFAULT_STORAGE_LIMIT_BYTES,
+            now,
+            now,
+        ),
+    )
+
+    user_id = str(uuid.uuid4())
+    cur.execute(
+        """
+        INSERT INTO users (
+            id, first_name, last_name, email, username, password_hash, phone,
+            designation, department,
+            role_id, company_id, admin_id, is_active, is_verified,
+            created_by, created_at, updated_at, last_password_change
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,TRUE,%s,%s,%s,%s)
+        """,
+        (
+            user_id,
+            first_name,
+            last_name,
+            email,
+            username,
+            password_hash,
+            phone,
+            designation,
+            department,
+            role_row["id"],
+            company_id,
+            None,
+            created_by,
+            now,
+            now,
+            now,
+        ),
+    )
+    cur.execute(
+        "UPDATE companies SET admin_id = %s, updated_at = %s WHERE id = %s",
+        (user_id, now, company_id),
+    )
+    return user_id, company_id, company_code
 
 
 def _role_label(role: str) -> str:
@@ -382,134 +495,113 @@ def create_admin_registration(
     company_email = (company_email or "").strip()[:255] or email
     company_website = (company_website or "").strip()[:255]
     username = (username or "").strip()
-    requested_company_id: str | None = None
+    now = _now()
+    user_id = ""
+    created_company_id = ""
+    created_company_code = company_code
 
-    with db_cursor(commit=True) as cur:
-        if role == ROLE_USER:
-            company = _resolve_existing_company(cur, company_code=company_code, company_name=company_name)
-            requested_company_id = str(company["id"])
-            company_name = str(company.get("company_name") or company_name)
-            company_code = str(company.get("company_code") or company_code)
-
-        cur.execute(
-            "SELECT id FROM users WHERE LOWER(email) = %s AND deleted_at IS NULL",
-            (email,),
-        )
-        if cur.fetchone():
-            raise RegistrationError(ERR_DUPLICATE_EMAIL, "This email is already registered.", 409)
-
-        cur.execute(
-            """
-            SELECT id FROM invitations
-            WHERE LOWER(email) = %s AND status = 'pending' AND expires_at > %s
-            """,
-            (email, _now()),
-        )
-        if cur.fetchone():
-            raise RegistrationError(
-                "PENDING_INVITATION",
-                "A pending invitation already exists for this email. Open the invitation link from your email instead.",
-                409,
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "SELECT id FROM users WHERE LOWER(email) = %s AND deleted_at IS NULL",
+                (email,),
             )
+            if cur.fetchone():
+                raise RegistrationError(ERR_DUPLICATE_EMAIL, "This email is already registered.", 409)
 
-        cur.execute(
-            """
-            SELECT id, status FROM admin_registration_requests
-            WHERE LOWER(email) = %s
-            ORDER BY created_at DESC
-            """,
-            (email,),
-        )
-        existing_rows = [dict(r) for r in (cur.fetchall() or [])]
-        pending = next((r for r in existing_rows if r.get("status") == STATUS_PENDING), None)
-        if pending:
-            raise RegistrationError(
-                "PENDING_EXISTS",
-                "A registration request for this email is already pending SuperAdmin approval.",
-                409,
-            )
-        approved = next((r for r in existing_rows if r.get("status") == STATUS_APPROVED), None)
-        if approved:
-            raise RegistrationError(ERR_DUPLICATE_EMAIL, "This email is already registered.", 409)
-
-        password_hash = hash_password(password)
-        now = _now()
-        rejected = next((r for r in existing_rows if r.get("status") == STATUS_REJECTED), None)
-
-        if rejected:
-            request_id = str(rejected["id"])
             cur.execute(
                 """
-                UPDATE admin_registration_requests SET
-                    first_name = %s, last_name = %s, email = %s, phone = %s,
-                    designation = %s, department = %s, username = %s, password_hash = %s,
-                    role = %s, company_name = %s, company_code = %s,
-                    company_address = %s, company_phone = %s, company_email = %s,
-                    company_website = %s, status = %s, rejection_reason = '',
-                    reviewed_by = NULL, reviewed_at = NULL,
-                    created_user_id = NULL, created_company_id = %s,
-                    phone_normalized = %s, phone_verified_at = %s,
-                    updated_at = %s
-                WHERE id = %s
+                SELECT id FROM invitations
+                WHERE LOWER(email) = %s AND status = 'pending' AND expires_at > %s
                 """,
-                (
-                    first_name, last_name, email, phone, designation, department,
-                    username, password_hash, role, company_name, company_code,
-                    company_address, company_phone, company_email, company_website,
-                    STATUS_PENDING, requested_company_id, phone_normalized, None, now, request_id,
-                ),
+                (email, _now()),
             )
-        else:
-            request_id = str(uuid.uuid4())
-            cur.execute(
-                """
-                INSERT INTO admin_registration_requests (
-                    id, first_name, last_name, email, phone, designation, department,
-                    username, password_hash, role, company_name, company_code,
-                    company_address, company_phone, company_email, company_website,
-                    status, created_company_id, phone_normalized, phone_verified_at,
-                    created_at, updated_at
-                ) VALUES (
-                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            if cur.fetchone():
+                raise RegistrationError(
+                    "PENDING_INVITATION",
+                    "A pending invitation already exists for this email. Open the invitation link from your email instead.",
+                    409,
                 )
+
+            cur.execute(
+                """
+                SELECT id, status FROM admin_registration_requests
+                WHERE LOWER(email) = %s
+                ORDER BY created_at DESC
                 """,
-                (
-                    request_id, first_name, last_name, email, phone, designation, department,
-                    username, password_hash, role, company_name, company_code,
-                    company_address, company_phone, company_email, company_website,
-                    STATUS_PENDING, requested_company_id, phone_normalized, None, now, now,
-                ),
+                (email,),
             )
+            existing_rows = [dict(r) for r in (cur.fetchall() or [])]
+            pending = next((r for r in existing_rows if r.get("status") == STATUS_PENDING), None)
+            if pending:
+                raise RegistrationError(
+                    "PENDING_EXISTS",
+                    "A registration request for this email is already pending SuperAdmin approval.",
+                    409,
+                )
+            approved = next((r for r in existing_rows if r.get("status") == STATUS_APPROVED), None)
+            if approved:
+                raise RegistrationError(ERR_DUPLICATE_EMAIL, "This email is already registered.", 409)
 
-        cur.execute("SELECT * FROM admin_registration_requests WHERE id = %s", (request_id,))
-        row = dict(cur.fetchone())
-        notify_emails = _superadmin_emails(cur)
-
-    applicant_name = f"{first_name} {last_name}".strip()
-    _notify_superadmins(
-        notify_emails,
-        applicant_name=applicant_name,
-        applicant_email=email,
-        company_name=company_name,
-        role=role,
-        phone=phone,
-        designation=designation,
-        company_code=company_code,
-    )
+            password_hash = hash_password(password)
+            user_id, created_company_id, created_company_code = _create_admin_and_company(
+                cur,
+                email=email,
+                first_name=first_name,
+                last_name=last_name,
+                password_hash=password_hash,
+                phone=phone,
+                designation=designation,
+                department=department,
+                username_requested=username,
+                company_name=company_name,
+                company_code=company_code,
+                company_address=company_address,
+                company_phone=company_phone,
+                company_email=company_email,
+                company_website=company_website,
+                created_by=None,
+                now=now,
+            )
+    except IntegrityError as exc:
+        _raise_unique_conflict(exc)
 
     audit_service.log_action(
-        None,
+        user_id or None,
         AUDIT_ADMIN_REG_SUBMITTED,
         ip=ip,
         user_agent=user_agent,
-        new_value={"request_id": request_id, "email": email, "company_name": company_name, "role": role},
+        new_value={
+            "email": email,
+            "company_name": company_name,
+            "role": role,
+            "user_id": user_id,
+            "company_id": created_company_id,
+        },
     )
 
-    result = _serialize(row)
-    result["detail"] = (
-        "Registration submitted successfully. Your account is pending SuperAdmin approval."
-    )
-    return result
+    full_name_out = f"{first_name} {last_name}".strip()
+    try:
+        send_welcome_email(email, full_name_out)
+    except Exception as exc:
+        logger.warning("Could not send welcome email to %s: %s", email, exc)
+
+    try:
+        from services.google_sheets_service import fire_ensure_company_sheet
+
+        fire_ensure_company_sheet(created_company_id)
+    except Exception as exc:
+        logger.warning("Could not schedule company Google Sheet for %s: %s", created_company_id, exc)
+
+    return {
+        "success": True,
+        "detail": MSG_SIGNUP_CREATED,
+        "user_id": user_id,
+        "company_id": created_company_id,
+        "company_code": created_company_code,
+        "email": email,
+        "role": role,
+    }
 
 
 def create_user_registration(**kwargs: Any) -> dict[str, Any]:

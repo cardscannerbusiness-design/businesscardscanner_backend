@@ -98,7 +98,7 @@ def confirm_admin_phone_otp(body: PhoneOtpConfirmRequest):
 @router.post(
     "/admin",
     summary="Submit Admin self-registration (public)",
-    description="Creates a pending Admin registration request. SuperAdmin must approve before login.",
+    description="Creates an Admin user and Freemium company immediately. The Admin can sign in after signup.",
 )
 def submit_admin_registration(body: AdminRegistrationRequest, request: Request):
     if body.password != body.confirm_password:
