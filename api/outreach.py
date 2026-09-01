@@ -40,10 +40,15 @@ def require_outreach_entitlement(
     initial_save: bool = False,
     channel: str | None = None,
 ) -> None:
-    """HTTP 403 when WhatsApp/Email are frozen for this company."""
+    """HTTP 403 when WhatsApp/Email are frozen for this company/user."""
     company_id = resolve_company_id_for_user(user)
     try:
-        assert_can_send_outreach(company_id, initial_save=initial_save, channel=channel)
+        assert_can_send_outreach(
+            company_id,
+            initial_save=initial_save,
+            channel=channel,
+            user=user,
+        )
     except OutreachFrozenError as exc:
         raise HTTPException(status_code=403, detail=exc.to_response()) from exc
 
@@ -238,7 +243,7 @@ async def _schedule_outreach_for_contact_inner(
         "skip_if_already_sent": not force_resend,
     }
     company_id = resolve_company_id_for_user(user)
-    outreach_ok = can_send_outreach(company_id, initial_save=initial_save)
+    outreach_ok = can_send_outreach(company_id, initial_save=initial_save, user=user)
     if not outreach_ok:
         logger.info(
             "Outreach blocked by Freemium entitlement company_id=%s context=%s",

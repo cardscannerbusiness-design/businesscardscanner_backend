@@ -88,12 +88,15 @@ SCHEMA_STATEMENTS: list[str] = [
         updated_by             UUID,
         created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
         updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-        deleted_at             TIMESTAMPTZ
+        deleted_at             TIMESTAMPTZ,
+        scans_unlimited        BOOLEAN      NOT NULL DEFAULT FALSE
     );
     """,
     # Profile fields for invited admins/users (idempotent for existing DBs)
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS designation VARCHAR(255) NOT NULL DEFAULT '';",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(255) NOT NULL DEFAULT '';",
+    # Per-user card-scan exception. Default FALSE; never grant via startup.
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS scans_unlimited BOOLEAN NOT NULL DEFAULT FALSE;",
     # Role-based Google Sheets: one workbook per company (Admin); Super Admin sheet on users
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
     # Company storage quota (defaults from StorageService constants)

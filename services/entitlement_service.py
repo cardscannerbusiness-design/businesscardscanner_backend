@@ -13,6 +13,10 @@ saved on the device (IndexedDB), not in PostgreSQL, until entitlement is
 restored (e.g. Pay-as-you-go).
 
 Runtime values always come from companies.card_limit / cards_used.
+A per-user users.scans_unlimited flag is a USER-level exception: that user
+gets the complete Freemium workflow (OCR/scan, card save, WhatsApp, Email,
+Contacts) without changing company plan_name, card_limit, cards_used, or
+storage. It must not unlimited the company or other users.
 Do not hard-code 10 at call sites — use DEFAULT_FREEMIUM_CARD_LIMIT.
 """
 
@@ -224,6 +228,7 @@ def _normalize(row: dict[str, Any] | None, company_id: str) -> dict[str, Any]:
         "contacts_allowed": contacts_ok,
         "entitlement_started_at": started,
         "entitlement_exhausted_at": exhausted_at,
+        "scans_unlimited": False,
     }
 
 
@@ -245,6 +250,7 @@ def get_entitlement(company_id: str | None) -> dict[str, Any]:
             "contacts_allowed": True,
             "entitlement_started_at": None,
             "entitlement_exhausted_at": None,
+            "scans_unlimited": False,
         }
 
     from db.pool import db_cursor
@@ -261,6 +267,80 @@ def get_entitlement(company_id: str | None) -> dict[str, Any]:
         )
         row = cur.fetchone()
     return _normalize(_row_as_dict(row) if row else None, company_id)
+
+
+def user_has_unlimited_scans(user: dict[str, Any] | None) -> bool:
+    """True when the authenticated users.scans_unlimited flag is set.
+
+    Reads the server-side user record only. Never use a client-supplied email
+    or user id as the source of this decision.
+    """
+    if not user:
+        return False
+    return bool(user.get("scans_unlimited"))
+
+
+def skip_card_quota_for_creator(role_name: str | None, scans_unlimited: bool) -> bool:
+    """Super Admin and per-user scan exceptions skip company card quota."""
+    if str(role_name or "").upper() == "SUPER_ADMIN":
+        return True
+    return bool(scans_unlimited)
+
+
+def skip_storage_quota_for_creator(role_name: str | None) -> bool:
+    """Storage-byte quota is role-based only; scans_unlimited does not skip it."""
+    return str(role_name or "").upper() == "SUPER_ADMIN"
+
+
+def apply_user_scan_overlay(
+    info: dict[str, Any],
+    user: dict[str, Any] | None = None,
+    *,
+    scans_unlimited: bool | None = None,
+) -> dict[str, Any]:
+    """Unlock the complete Freemium workflow for one user.
+
+    Company plan_name, card_limit, cards_used, and storage stay unchanged.
+    WhatsApp, Email, Contacts, and card persist are allowed for this user only.
+    """
+    out = dict(info)
+    unlimited = (
+        bool(scans_unlimited)
+        if scans_unlimited is not None
+        else user_has_unlimited_scans(user)
+    )
+    out["scans_unlimited"] = unlimited
+    if unlimited:
+        out["can_process_card"] = True
+        out["whatsapp_allowed"] = True
+        out["email_allowed"] = True
+        out["contacts_allowed"] = True
+        out["freemium_exhausted"] = False
+    return out
+
+
+def assert_can_process_card(
+    company_id: str | None,
+    user: dict[str, Any] | None = None,
+    *,
+    scans_unlimited: bool = False,
+) -> None:
+    """Non-locking check: can this company persist another card to PostgreSQL?
+
+    Do not call this from OCR — scanning must continue after Freemium exhaustion.
+    """
+    if user_has_unlimited_scans(user) or scans_unlimited:
+        return
+    if not company_id:
+        return
+    info = get_entitlement(company_id)
+    if info["can_process_card"]:
+        return
+    raise CardLimitExceededError(
+        company_id=company_id,
+        cards_used=info["cards_used"],
+        card_limit=info["card_limit"],
+    )
 
 
 def _apply_txn_timeouts(cur: Any) -> None:
@@ -286,25 +366,15 @@ def _lock_company(cur: Any, company_id: str) -> dict[str, Any]:
     return _row_as_dict(row)
 
 
-def assert_can_process_card(company_id: str | None) -> None:
-    """Non-locking check: can this company persist another card to PostgreSQL?
-
-    Do not call this from OCR — scanning must continue after Freemium exhaustion.
-    """
-    if not company_id:
-        return
-    info = get_entitlement(company_id)
-    if info["can_process_card"]:
-        return
-    raise CardLimitExceededError(
-        company_id=company_id,
-        cards_used=info["cards_used"],
-        card_limit=info["card_limit"],
-    )
-
-
-def assert_can_access_contacts(company_id: str | None) -> None:
+def assert_can_access_contacts(
+    company_id: str | None,
+    user: dict[str, Any] | None = None,
+    *,
+    scans_unlimited: bool = False,
+) -> None:
     """Block Contacts list/detail APIs after Freemium exhaustion."""
+    if user_has_unlimited_scans(user) or scans_unlimited:
+        return
     if not company_id:
         return
     info = get_entitlement(company_id)
@@ -322,9 +392,16 @@ def assert_can_send_outreach(
     *,
     initial_save: bool = False,
     channel: str | None = None,
+    user: dict[str, Any] | None = None,
+    scans_unlimited: bool = False,
 ) -> None:
     """Reject WhatsApp/Email send after Freemium exhaustion (except the just-consumed final card)."""
-    if can_send_outreach(company_id, initial_save=initial_save):
+    if can_send_outreach(
+        company_id,
+        initial_save=initial_save,
+        user=user,
+        scans_unlimited=scans_unlimited,
+    ):
         return
     info = get_entitlement(company_id) if company_id else get_entitlement(None)
     if channel == "whatsapp":
@@ -342,8 +419,19 @@ def assert_can_send_outreach(
     )
 
 
-def assert_can_process_card_locked(cur: Any, company_id: str | None) -> dict[str, Any]:
+def assert_can_process_card_locked(
+    cur: Any,
+    company_id: str | None,
+    *,
+    scans_unlimited: bool = False,
+    user: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Atomic check: SELECT … FOR UPDATE then compare cards_used vs card_limit."""
+    if user_has_unlimited_scans(user) or scans_unlimited:
+        if not company_id:
+            return apply_user_scan_overlay(get_entitlement(None), scans_unlimited=True)
+        row = _lock_company(cur, company_id)
+        return apply_user_scan_overlay(_normalize(row, company_id), scans_unlimited=True)
     if not company_id:
         return get_entitlement(None)
     row = _lock_company(cur, company_id)
@@ -364,8 +452,19 @@ def consume_card_locked(
     contact_id: str | None = None,
     user_id: str | None = None,
     plan_name: str | None = None,
+    scans_unlimited: bool = False,
+    user: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Increment cards_used under the current transaction. Caller must hold the row lock."""
+    if user_has_unlimited_scans(user) or scans_unlimited:
+        # Extra cards for this user must not consume the company Freemium quota.
+        if not company_id:
+            return apply_user_scan_overlay(get_entitlement(None), scans_unlimited=True)
+        return {
+            "company_id": company_id,
+            "can_process_card": True,
+            "scans_unlimited": True,
+        }
     if not company_id:
         return get_entitlement(None)
 
@@ -426,13 +525,18 @@ def can_send_outreach(
     company_id: str | None,
     *,
     initial_save: bool = False,
+    user: dict[str, Any] | None = None,
+    scans_unlimited: bool = False,
 ) -> bool:
     """WhatsApp/Email eligibility.
 
     initial_save=True allows the just-consumed final Freemium card to still
     send thank-you messages (remaining is already 0 after consume).
     Resend / later calls use initial_save=False and are blocked when exhausted.
+    A per-user scans_unlimited exception keeps outreach available for that user.
     """
+    if user_has_unlimited_scans(user) or scans_unlimited:
+        return True
     if not company_id:
         return True
     info = get_entitlement(company_id)
@@ -460,4 +564,5 @@ def entitlement_fields_for_usage(company_id: str | None) -> dict[str, Any]:
         "contacts_allowed": info["contacts_allowed"],
         "entitlement_started_at": info["entitlement_started_at"],
         "entitlement_exhausted_at": info["entitlement_exhausted_at"],
+        "scans_unlimited": False,
     }

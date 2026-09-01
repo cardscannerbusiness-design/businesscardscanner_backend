@@ -141,7 +141,7 @@ def _raise_card_limit(exc: CardLimitExceededError) -> None:
 
 def _require_contacts_access(user: dict[str, Any]) -> None:
     try:
-        assert_can_access_contacts(resolve_company_id_for_user(user))
+        assert_can_access_contacts(resolve_company_id_for_user(user), user=user)
     except ContactsFrozenError as exc:
         _raise_entitlement(exc)
 
@@ -209,7 +209,7 @@ async def check_duplicates(
     # After Freemium exhaustion do not leak stored contacts. Empty list lets
     # Capture continue (IndexedDB save) without exposing PostgreSQL rows.
     try:
-        assert_can_access_contacts(resolve_company_id_for_user(user))
+        assert_can_access_contacts(resolve_company_id_for_user(user), user=user)
     except ContactsFrozenError:
         return {"duplicates": []}
     return {"duplicates": find_duplicate_contacts(request.model_dump(), user=user)}
@@ -334,7 +334,11 @@ async def storage_config(user: dict = Depends(get_current_user)):
         company_id = resolve_company_id_for_user(user)
         if company_id:
             try:
-                response["quota"] = get_company_quota_usage(company_id)
+                from services.entitlement_service import apply_user_scan_overlay
+
+                response["quota"] = apply_user_scan_overlay(
+                    get_company_quota_usage(company_id), user
+                )
             except Exception as exc:
                 logger.exception(
                     "[STORAGE] Could not load company storage quota company_id=%s: %s",
@@ -393,7 +397,7 @@ async def storage_config(user: dict = Depends(get_current_user)):
 async def storage_usage(user: dict = Depends(get_current_user)):
     """Return plan, used/limit/remaining bytes, can_upload, and warning_level."""
     from auth.constants import ROLE_SUPER_ADMIN
-    from services.entitlement_service import entitlement_fields_for_usage
+    from services.entitlement_service import apply_user_scan_overlay, entitlement_fields_for_usage
 
     if user.get("role") == ROLE_SUPER_ADMIN:
         unlimited = {
@@ -412,7 +416,7 @@ async def storage_usage(user: dict = Depends(get_current_user)):
         unlimited.update(entitlement_fields_for_usage(None))
         unlimited["plan"] = "UNLIMITED"
         unlimited["plan_name"] = "Unlimited"
-        return unlimited
+        return apply_user_scan_overlay(unlimited, user)
 
     company_id = resolve_company_id_for_user(user)
     if not company_id:
@@ -425,7 +429,7 @@ async def storage_usage(user: dict = Depends(get_current_user)):
             },
         )
     try:
-        return get_company_quota_usage(company_id)
+        return apply_user_scan_overlay(get_company_quota_usage(company_id), user)
     except Exception as exc:
         logger.exception("[STORAGE] Storage usage request failed company_id=%s", company_id)
         raise HTTPException(
@@ -524,7 +528,7 @@ async def create_contact_json(
         # Freeze PostgreSQL persist after Freemium exhaustion (IndexedDB still allowed).
         # Check before duplicate lookup so contact rows are not leaked.
         try:
-            assert_can_process_card(resolve_company_id_for_user(user))
+            assert_can_process_card(resolve_company_id_for_user(user), user=user)
         except CardLimitExceededError as exc:
             _raise_card_limit(exc)
 

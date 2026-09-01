@@ -137,7 +137,8 @@ async def _lookup_user(user_id: str) -> dict | None:
                 """
                 SELECT u.id, u.email, u.first_name, u.last_name, u.username,
                        u.phone, u.is_active, u.is_verified, u.company_id, u.admin_id,
-                       u.profile_image, r.name AS role, c.status AS company_status
+                       u.profile_image, COALESCE(u.scans_unlimited, FALSE) AS scans_unlimited,
+                       r.name AS role, c.status AS company_status
                 FROM users u
                 JOIN roles r ON r.id = u.role_id
                 LEFT JOIN companies c ON c.id = u.company_id
@@ -151,6 +152,7 @@ async def _lookup_user(user_id: str) -> dict | None:
 
             user = dict(user)
             role_name = user["role"]
+            user["scans_unlimited"] = bool(user.get("scans_unlimited"))
 
             # Fetch permissions
             cur.execute(

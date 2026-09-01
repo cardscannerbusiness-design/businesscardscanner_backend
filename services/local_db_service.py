@@ -637,16 +637,17 @@ def get_contact(contact_id: str, user: dict[str, Any] | None = None) -> dict[str
         raise LocalDbError(str(exc)) from exc
 
 
-def _resolve_creator_meta(created_by_user_id: str | None) -> tuple[str | None, str]:
-    """Return (owner_company_id, created_by_role) for the creating user."""
+def _resolve_creator_meta(created_by_user_id: str | None) -> tuple[str | None, str, bool]:
+    """Return (owner_company_id, created_by_role, scans_unlimited) for the creating user."""
     if not created_by_user_id:
-        return None, ""
+        return None, "", False
     try:
         with _connect() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT u.company_id, r.name AS role_name
+                    SELECT u.company_id, r.name AS role_name,
+                           COALESCE(u.scans_unlimited, FALSE) AS scans_unlimited
                     FROM users u
                     LEFT JOIN roles r ON r.id = u.role_id
                     WHERE u.id = %s
@@ -655,13 +656,14 @@ def _resolve_creator_meta(created_by_user_id: str | None) -> tuple[str | None, s
                 )
                 row = cur.fetchone()
         if not row:
-            return None, ""
+            return None, "", False
         company_id = str(row["company_id"]) if row.get("company_id") else None
         role_name = str(row.get("role_name") or "")
-        return company_id, role_name
+        scans_unlimited = bool(row.get("scans_unlimited"))
+        return company_id, role_name, scans_unlimited
     except Exception as exc:
         logger.warning("Failed to resolve creator meta for %s: %s", created_by_user_id, exc)
-        return None, ""
+        return None, "", False
 
 
 def create_contact(
@@ -682,7 +684,7 @@ def create_contact(
     contact_id = str(uuid.uuid4())
     now = datetime.utcnow()
     created_by_user_id = contact_data.get("created_by_user_id")
-    owner_company_id, created_by_role = _resolve_creator_meta(
+    owner_company_id, created_by_role, scans_unlimited = _resolve_creator_meta(
         str(created_by_user_id) if created_by_user_id else None
     )
 
@@ -702,11 +704,17 @@ def create_contact(
             # and callers expect mapping rows (plain cursor tuples broke quota checks).
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 # Atomic card entitlement + storage quota + insert + counters.
-                skip_quota = str(created_by_role or "").upper() == "SUPER_ADMIN"
-                if owner_company_id and not skip_quota:
+                skip_card_quota = entitlement_service.skip_card_quota_for_creator(
+                    created_by_role, scans_unlimited
+                )
+                skip_storage_quota = entitlement_service.skip_storage_quota_for_creator(
+                    created_by_role
+                )
+                if owner_company_id and not skip_card_quota:
                     entitlement_service.assert_can_process_card_locked(
                         cur, owner_company_id
                     )
+                if owner_company_id and not skip_storage_quota:
                     storage_service.assert_can_upload_locked(
                         cur, owner_company_id, image_size_bytes
                     )
@@ -768,14 +776,14 @@ def create_contact(
                     (time.perf_counter() - save_started) * 1000,
                     contact_id,
                 )
-                if owner_company_id and not skip_quota:
+                if owner_company_id and not skip_card_quota:
                     entitlement_service.consume_card_locked(
                         cur,
                         owner_company_id,
                         contact_id=contact_id,
                         user_id=str(created_by_user_id) if created_by_user_id else None,
                     )
-                if owner_company_id and image_size_bytes > 0 and not skip_quota:
+                if owner_company_id and image_size_bytes > 0 and not skip_storage_quota:
                     storage_service.update_storage_after_upload(
                         owner_company_id,
                         image_size_bytes,
