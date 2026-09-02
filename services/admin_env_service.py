@@ -35,13 +35,14 @@ WHATSAPP_KEYS = (
     "enabled",
 )
 
-# Match .env SMTP_* keys used by email_service
+# Match .env SMTP_* keys used by email_service (Amazon SES SMTP relay per Admin)
 EMAIL_KEYS = (
     "smtp_host",
     "smtp_port",
     "smtp_user",
     "smtp_password",
     "smtp_from",
+    "sender_notification_email",
     "enabled",
 )
 
