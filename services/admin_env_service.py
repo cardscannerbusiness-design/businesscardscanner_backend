@@ -11,7 +11,7 @@ from typing import Any
 
 from psycopg2.extras import Json
 
-from auth.constants import ROLE_ADMIN, ROLE_USER
+from auth.constants import ROLE_ADMIN, ROLE_SUPER_ADMIN, ROLE_USER
 from db.pool import db_cursor
 
 logger = logging.getLogger(__name__)
@@ -496,6 +496,7 @@ def list_cms_tenant_users(admin_user_id: str) -> dict[str, Any]:
                     u.is_active,
                     u.last_login,
                     u.created_at,
+                    COALESCE(u.scans_unlimited, FALSE) AS scans_unlimited,
                     r.name AS role,
                     EXISTS (
                         SELECT 1
@@ -526,6 +527,7 @@ def list_cms_tenant_users(admin_user_id: str) -> dict[str, Any]:
                     u.is_active,
                     u.last_login,
                     u.created_at,
+                    COALESCE(u.scans_unlimited, FALSE) AS scans_unlimited,
                     r.name AS role,
                     EXISTS (
                         SELECT 1
@@ -552,6 +554,7 @@ def list_cms_tenant_users(admin_user_id: str) -> dict[str, Any]:
         connected = bool(row.get("connected")) and is_active
         last_login = row.get("last_login")
         created_at = row.get("created_at")
+        scans_unlimited = bool(row.get("scans_unlimited"))
         users.append(
             {
                 "id": str(row["id"]),
@@ -560,6 +563,7 @@ def list_cms_tenant_users(admin_user_id: str) -> dict[str, Any]:
                 "role": str(row.get("role") or ""),
                 "is_active": is_active,
                 "connected": connected,
+                "scans_unlimited": scans_unlimited,
                 "status": "Active" if is_active else "Inactive",
                 "check_status": "pass" if connected else ("pending" if is_active else "fail"),
                 "last_login": last_login.isoformat() if last_login and hasattr(last_login, "isoformat") else None,
@@ -587,4 +591,72 @@ def list_cms_tenant_users(admin_user_id: str) -> dict[str, Any]:
             f"Only Google Sheets has access. {active} active · {connected} connected "
             f"of {total} tenant user{'s' if total != 1 else ''}."
         ),
+    }
+
+
+def set_cms_tenant_user_scans_unlimited(
+    admin_user_id: str,
+    target_user_id: str,
+    *,
+    scans_unlimited: bool,
+) -> dict[str, Any]:
+    """Grant or revoke per-user unlimited card scans for one tenant user (SuperAdmin CMS)."""
+    existing = get_admin_env_settings(admin_user_id)
+    if not existing:
+        raise ValueError("Admin not found")
+
+    company_id = existing.get("company_id")
+    with db_cursor(commit=True) as cur:
+        if company_id:
+            cur.execute(
+                """
+                SELECT u.id, r.name AS role
+                FROM users u
+                JOIN roles r ON r.id = u.role_id
+                WHERE u.id = %s
+                  AND u.deleted_at IS NULL
+                  AND u.company_id = %s
+                  AND r.name IN (%s, %s)
+                """,
+                (target_user_id, company_id, ROLE_ADMIN, ROLE_USER),
+            )
+        else:
+            if str(target_user_id) != str(admin_user_id):
+                raise ValueError("User not found in this tenant")
+            cur.execute(
+                """
+                SELECT u.id, r.name AS role
+                FROM users u
+                JOIN roles r ON r.id = u.role_id
+                WHERE u.id = %s
+                  AND u.deleted_at IS NULL
+                  AND r.name = %s
+                """,
+                (target_user_id, ROLE_ADMIN),
+            )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("User not found in this tenant")
+        if str(row.get("role") or "").upper() == ROLE_SUPER_ADMIN:
+            raise ValueError("Cannot change entitlement for Super Admin")
+
+        cur.execute(
+            """
+            UPDATE users
+            SET scans_unlimited = %s, updated_at = NOW()
+            WHERE id = %s
+            RETURNING id
+            """,
+            (bool(scans_unlimited), target_user_id),
+        )
+        if not cur.fetchone():
+            raise ValueError("User not found in this tenant")
+
+    summary = list_cms_tenant_users(admin_user_id)
+    updated = next((u for u in summary["users"] if u["id"] == str(target_user_id)), None)
+    return {
+        "success": True,
+        "scans_unlimited": bool(scans_unlimited),
+        "user": updated,
+        "users": summary,
     }

@@ -130,6 +130,7 @@ AUDIT_ADMIN_REG_SUBMITTED = "admin_registration_submitted"
 AUDIT_ADMIN_REG_APPROVED = "admin_registration_approved"
 AUDIT_ADMIN_REG_REJECTED = "admin_registration_rejected"
 AUDIT_ADMIN_REG_DELETED = "admin_registration_deleted"
+AUDIT_SCANS_UNLIMITED_UPDATED = "scans_unlimited_updated"
 
 # ---------------------------------------------------------------------------
 # Invitation settings

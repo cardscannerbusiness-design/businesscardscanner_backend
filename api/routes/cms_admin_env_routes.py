@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from auth.audit_service import log_action
-from auth.constants import ROLE_SUPER_ADMIN
+from auth.constants import AUDIT_SCANS_UNLIMITED_UPDATED, ROLE_SUPER_ADMIN
 from auth.dependencies import get_current_user, require_role
 from services.admin_env_service import (
     EMAIL_KEYS,
@@ -21,6 +21,7 @@ from services.admin_env_service import (
     list_admin_env_settings as list_admins_with_env,
     list_cms_tenant_users,
     merge_admin_env_for_test,
+    set_cms_tenant_user_scans_unlimited,
     upsert_admin_env_settings as upsert_admin_env,
 )
 from services.company_lifecycle import CompanyNotFoundError, remove_cms_client
@@ -371,6 +372,52 @@ def get_admin_tenant_users(admin_id: str):
         return list_cms_tenant_users(admin_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class CmsUserScansUnlimitedRequest(BaseModel):
+    scans_unlimited: bool = Field(
+        ...,
+        description="When true, this user gets unlimited card scans (Freemium bypass for that user only).",
+    )
+
+
+@router.patch(
+    "/admin-env/{admin_id}/users/{user_id}/scans-unlimited",
+    summary="Grant or revoke unlimited card scans for one tenant user",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def patch_tenant_user_scans_unlimited(
+    admin_id: str,
+    user_id: str,
+    body: CmsUserScansUnlimitedRequest,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        result = set_cms_tenant_user_scans_unlimited(
+            admin_id,
+            user_id,
+            scans_unlimited=body.scans_unlimited,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=status, detail=msg) from exc
+
+    target = result.get("user") or {}
+    log_action(
+        str(user["id"]),
+        AUDIT_SCANS_UNLIMITED_UPDATED,
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        new_value={
+            "cms_admin_id": admin_id,
+            "user_id": user_id,
+            "email": target.get("email"),
+            "scans_unlimited": body.scans_unlimited,
+        },
+    )
+    return result
 
 
 @router.post(
