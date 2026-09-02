@@ -115,6 +115,7 @@ Contact CRUD is served by Python (`/api/contacts`) — no separate Node local-db
   - `FRONTEND_BASE_URL=https://www.namecardscan.com`
   - `BACKEND_BASE_URL=https://api.namecardscan.com`
   - `ALLOWED_ORIGINS=https://www.namecardscan.com,https://namecardscan.com`
+  - CMS Amplify is included by default (`https://main.d3ty5vjjsuy3g7.amplifyapp.com`); override with `CMS_ALLOWED_ORIGINS` if needed
 - Do not use Netlify URLs; they are rejected by URL helpers.
 
 ## Removed (do not use)

@@ -48,13 +48,22 @@ def normalize_origin(origin: str) -> str:
     return origin.strip().rstrip("/")
 
 
+def _cms_cors_origins() -> list[str]:
+    """Super Admin CMS hosts (AWS Amplify). Override via CMS_ALLOWED_ORIGINS."""
+    raw = (os.getenv("CMS_ALLOWED_ORIGINS") or "").strip()
+    if raw:
+        return [normalize_origin(part) for part in raw.split(",") if part.strip()]
+    return [normalize_origin("https://main.d3ty5vjjsuy3g7.amplifyapp.com")]
+
+
 def get_allowed_origins() -> list[str]:
     """
-    CORS allow-list from environment only (no hardcoded production domains).
+    CORS allow-list from environment plus built-in CMS Amplify host.
 
     Sources:
       - FRONTEND_BASE_URL (preferred) or FRONTEND_URL
       - ALLOWED_ORIGINS (comma-separated)
+      - CMS_ALLOWED_ORIGINS (comma-separated) or default Amplify CMS URL
     """
     origins: list[str] = []
 
@@ -71,6 +80,8 @@ def get_allowed_origins() -> list[str]:
         part = part.strip()
         if part:
             origins.append(normalize_origin(part))
+
+    origins.extend(_cms_cors_origins())
 
     # Drop any leftover Netlify hosts
     cleaned = [
