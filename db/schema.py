@@ -97,6 +97,15 @@ SCHEMA_STATEMENTS: list[str] = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(255) NOT NULL DEFAULT '';",
     # Per-user card-scan exception. Default FALSE; never grant via startup.
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS scans_unlimited BOOLEAN NOT NULL DEFAULT FALSE;",
+    # Per-user numeric cap (NULL = inherit company card_limit). Unlimited uses scans_unlimited.
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS user_card_limit INTEGER;",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS user_cards_used INTEGER NOT NULL DEFAULT 0;",
+    f"""
+    UPDATE users
+    SET user_card_limit = {int(DEFAULT_FREEMIUM_CARD_LIMIT)}
+    WHERE user_card_limit IS NULL
+      AND COALESCE(scans_unlimited, FALSE) = FALSE;
+    """,
     # Role-based Google Sheets: one workbook per company (Admin); Super Admin sheet on users
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
     # Company storage quota (defaults from StorageService constants)

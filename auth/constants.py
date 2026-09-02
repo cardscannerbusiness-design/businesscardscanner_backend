@@ -131,6 +131,7 @@ AUDIT_ADMIN_REG_APPROVED = "admin_registration_approved"
 AUDIT_ADMIN_REG_REJECTED = "admin_registration_rejected"
 AUDIT_ADMIN_REG_DELETED = "admin_registration_deleted"
 AUDIT_SCANS_UNLIMITED_UPDATED = "scans_unlimited_updated"
+AUDIT_USER_SCAN_ENTITLEMENT_UPDATED = "user_scan_entitlement_updated"
 
 # ---------------------------------------------------------------------------
 # Invitation settings

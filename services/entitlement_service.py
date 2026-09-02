@@ -280,11 +280,103 @@ def user_has_unlimited_scans(user: dict[str, Any] | None) -> bool:
     return bool(user.get("scans_unlimited"))
 
 
-def skip_card_quota_for_creator(role_name: str | None, scans_unlimited: bool) -> bool:
-    """Super Admin and per-user scan exceptions skip company card quota."""
+def user_has_custom_card_limit(user: dict[str, Any] | None) -> bool:
+    """True when this user uses a personal card cap (default 10 or CMS override)."""
+    if not user or user_has_unlimited_scans(user):
+        return False
+    return True
+
+
+def effective_user_card_limit(
+    user: dict[str, Any] | None = None,
+    *,
+    user_card_limit: int | None = None,
+    scans_unlimited: bool = False,
+) -> int:
+    """Personal scan cap for one user. Default is 10 cards for everyone."""
+    if scans_unlimited or user_has_unlimited_scans(user):
+        return DEFAULT_FREEMIUM_CARD_LIMIT
+    if user_card_limit is not None:
+        return max(1, int(user_card_limit))
+    if user and user.get("user_card_limit") is not None:
+        return max(1, int(user["user_card_limit"]))
+    return DEFAULT_FREEMIUM_CARD_LIMIT
+
+
+def is_default_user_card_limit(limit: int | None) -> bool:
+    return limit is None or int(limit) == DEFAULT_FREEMIUM_CARD_LIMIT
+
+
+def _normalize_user_card_entitlement(
+    used: int,
+    limit: int,
+    company_id: str | None,
+) -> dict[str, Any]:
+    used = max(0, int(used))
+    limit = max(1, int(limit))
+    remaining = max(0, limit - used)
+    exhausted = remaining == 0
+    outreach_ok = not exhausted
+    return {
+        "company_id": company_id,
+        "card_limit": limit,
+        "cards_used": used,
+        "cards_remaining": remaining,
+        "freemium_exhausted": exhausted,
+        "card_quota_enforced": True,
+        "can_process_card": not exhausted,
+        "whatsapp_allowed": outreach_ok,
+        "email_allowed": outreach_ok,
+        "contacts_allowed": outreach_ok,
+        "user_card_limit": limit,
+        "user_cards_used": used,
+        "scans_unlimited": False,
+    }
+
+
+def resolve_user_card_entitlement(
+    user: dict[str, Any] | None,
+    company_info: dict[str, Any],
+) -> dict[str, Any]:
+    """Effective card entitlement for one authenticated user."""
+    if user_has_unlimited_scans(user):
+        return apply_user_scan_overlay(company_info, user)
+    used = int(user.get("user_cards_used") or 0) if user else 0
+    limit = effective_user_card_limit(user)
+    out = dict(company_info)
+    out.update(
+        _normalize_user_card_entitlement(
+            used,
+            limit,
+            company_info.get("company_id"),
+        )
+    )
+    return out
+
+
+def skip_card_quota_for_creator(
+    role_name: str | None,
+    scans_unlimited: bool,
+    *,
+    user_card_limit: int | None = None,
+) -> bool:
+    """Super Admin and per-user unlimited skip all card quota checks."""
     if str(role_name or "").upper() == "SUPER_ADMIN":
         return True
-    return bool(scans_unlimited)
+    if bool(scans_unlimited):
+        return True
+    return False
+
+
+def uses_user_card_quota(
+    role_name: str | None,
+    scans_unlimited: bool,
+    user_card_limit: int | None = None,
+) -> bool:
+    """True when card saves use the user's personal counter (default 10 for everyone)."""
+    if skip_card_quota_for_creator(role_name, scans_unlimited, user_card_limit=user_card_limit):
+        return False
+    return True
 
 
 def skip_storage_quota_for_creator(role_name: str | None) -> bool:
@@ -298,24 +390,25 @@ def apply_user_scan_overlay(
     *,
     scans_unlimited: bool | None = None,
 ) -> dict[str, Any]:
-    """Unlock the complete Freemium workflow for one user.
-
-    Company plan_name, card_limit, cards_used, and storage stay unchanged.
-    WhatsApp, Email, Contacts, and card persist are allowed for this user only.
-    """
-    out = dict(info)
+    """Apply per-user entitlement overlay for usage APIs and outreach checks."""
     unlimited = (
         bool(scans_unlimited)
         if scans_unlimited is not None
         else user_has_unlimited_scans(user)
     )
-    out["scans_unlimited"] = unlimited
     if unlimited:
+        out = dict(info)
+        out["scans_unlimited"] = True
         out["can_process_card"] = True
         out["whatsapp_allowed"] = True
         out["email_allowed"] = True
         out["contacts_allowed"] = True
         out["freemium_exhausted"] = False
+        return out
+    if user_has_custom_card_limit(user):
+        return resolve_user_card_entitlement(user, info)
+    out = dict(info)
+    out["scans_unlimited"] = False
     return out
 
 
@@ -324,6 +417,8 @@ def assert_can_process_card(
     user: dict[str, Any] | None = None,
     *,
     scans_unlimited: bool = False,
+    user_card_limit: int | None = None,
+    user_cards_used: int = 0,
 ) -> None:
     """Non-locking check: can this company persist another card to PostgreSQL?
 
@@ -331,6 +426,17 @@ def assert_can_process_card(
     """
     if user_has_unlimited_scans(user) or scans_unlimited:
         return
+    if user:
+        limit = effective_user_card_limit(user, scans_unlimited=scans_unlimited)
+        used = int(user.get("user_cards_used") or 0)
+        info = _normalize_user_card_entitlement(used, limit, company_id)
+        if info["can_process_card"]:
+            return
+        raise CardLimitExceededError(
+            company_id=company_id,
+            cards_used=info["cards_used"],
+            card_limit=info["card_limit"],
+        )
     if not company_id:
         return
     info = get_entitlement(company_id)
@@ -375,6 +481,16 @@ def assert_can_access_contacts(
     """Block Contacts list/detail APIs after Freemium exhaustion."""
     if user_has_unlimited_scans(user) or scans_unlimited:
         return
+    if user_has_custom_card_limit(user):
+        base = {"company_id": company_id} if company_id else get_entitlement(None)
+        info = resolve_user_card_entitlement(user, base)
+        if info.get("contacts_allowed", True):
+            return
+        raise ContactsFrozenError(
+            company_id=company_id,
+            cards_used=info["cards_used"],
+            card_limit=info["card_limit"],
+        )
     if not company_id:
         return
     info = get_entitlement(company_id)
@@ -425,6 +541,9 @@ def assert_can_process_card_locked(
     *,
     scans_unlimited: bool = False,
     user: dict[str, Any] | None = None,
+    user_id: str | None = None,
+    user_card_limit: int | None = None,
+    user_cards_used: int = 0,
 ) -> dict[str, Any]:
     """Atomic check: SELECT … FOR UPDATE then compare cards_used vs card_limit."""
     if user_has_unlimited_scans(user) or scans_unlimited:
@@ -432,10 +551,57 @@ def assert_can_process_card_locked(
             return apply_user_scan_overlay(get_entitlement(None), scans_unlimited=True)
         row = _lock_company(cur, company_id)
         return apply_user_scan_overlay(_normalize(row, company_id), scans_unlimited=True)
+    if user_id and not (user_has_unlimited_scans(user) or scans_unlimited):
+        effective_limit = effective_user_card_limit(
+            user,
+            user_card_limit=user_card_limit,
+            scans_unlimited=scans_unlimited,
+        )
+        return assert_can_process_user_card_locked(
+            cur,
+            user_id,
+            effective_limit,
+            user_cards_used,
+            company_id=company_id,
+        )
     if not company_id:
         return get_entitlement(None)
     row = _lock_company(cur, company_id)
     info = _normalize(row, company_id)
+    if info["can_process_card"]:
+        return info
+    raise CardLimitExceededError(
+        company_id=company_id,
+        cards_used=info["cards_used"],
+        card_limit=info["card_limit"],
+    )
+
+
+def assert_can_process_user_card_locked(
+    cur: Any,
+    user_id: str,
+    user_card_limit: int,
+    user_cards_used: int,
+    *,
+    company_id: str | None = None,
+) -> dict[str, Any]:
+    _apply_txn_timeouts(cur)
+    cur.execute(
+        """
+        SELECT COALESCE(user_cards_used, 0) AS user_cards_used, user_card_limit
+        FROM users
+        WHERE id = %s
+          AND deleted_at IS NULL
+        FOR UPDATE
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise LookupError(f"User not found: {user_id}")
+    used = max(0, int(row.get("user_cards_used") or user_cards_used))
+    limit = int(row.get("user_card_limit") or user_card_limit)
+    info = _normalize_user_card_entitlement(used, limit, company_id)
     if info["can_process_card"]:
         return info
     raise CardLimitExceededError(
@@ -454,6 +620,7 @@ def consume_card_locked(
     plan_name: str | None = None,
     scans_unlimited: bool = False,
     user: dict[str, Any] | None = None,
+    user_card_limit: int | None = None,
 ) -> dict[str, Any]:
     """Increment cards_used under the current transaction. Caller must hold the row lock."""
     if user_has_unlimited_scans(user) or scans_unlimited:
@@ -465,6 +632,20 @@ def consume_card_locked(
             "can_process_card": True,
             "scans_unlimited": True,
         }
+    if user_id and not (user_has_unlimited_scans(user) or scans_unlimited):
+        effective_limit = effective_user_card_limit(
+            user,
+            user_card_limit=user_card_limit,
+            scans_unlimited=scans_unlimited,
+        )
+        return consume_user_card_locked(
+            cur,
+            user_id,
+            company_id=company_id,
+            contact_id=contact_id,
+            plan_name=plan_name,
+            user_card_limit=effective_limit,
+        )
     if not company_id:
         return get_entitlement(None)
 
@@ -521,6 +702,74 @@ def consume_card_locked(
     return info
 
 
+def consume_user_card_locked(
+    cur: Any,
+    user_id: str,
+    *,
+    company_id: str | None = None,
+    contact_id: str | None = None,
+    plan_name: str | None = None,
+    user_card_limit: int = DEFAULT_FREEMIUM_CARD_LIMIT,
+) -> dict[str, Any]:
+    """Increment a user's personal card counter without touching company cards_used."""
+    cap = max(1, int(user_card_limit))
+    cur.execute(
+        """
+        UPDATE users
+        SET user_cards_used = COALESCE(user_cards_used, 0) + 1,
+            user_card_limit = COALESCE(user_card_limit, %s),
+            updated_at = NOW()
+        WHERE id = %s
+          AND COALESCE(user_cards_used, 0) < COALESCE(user_card_limit, %s)
+        RETURNING user_cards_used, user_card_limit
+        """,
+        (cap, user_id, cap),
+    )
+    row = cur.fetchone()
+    if not row:
+        cur.execute(
+            """
+            SELECT COALESCE(user_cards_used, 0) AS user_cards_used, user_card_limit
+            FROM users
+            WHERE id = %s
+            """,
+            (user_id,),
+        )
+        current = cur.fetchone() or {}
+        raise CardLimitExceededError(
+            company_id=company_id,
+            cards_used=int(current.get("user_cards_used") or 0),
+            card_limit=int(current.get("user_card_limit") or cap),
+        )
+
+    used = int(row["user_cards_used"])
+    limit = int(row["user_card_limit"])
+    info = _normalize_user_card_entitlement(used, limit, company_id)
+    if company_id:
+        cur.execute(
+            """
+            INSERT INTO usage_events (
+                company_id, user_id, contact_id, usage_type, quantity, plan_name
+            ) VALUES (%s, %s, %s, %s, 1, %s)
+            """,
+            (
+                company_id,
+                user_id,
+                contact_id,
+                USAGE_TYPE_CARD_PROCESS,
+                plan_name or DEFAULT_PLAN_NAME,
+            ),
+        )
+    logger.info(
+        "[ENTITLEMENT] User card consumed user_id=%s used=%s limit=%s contact_id=%s",
+        user_id,
+        used,
+        limit,
+        contact_id,
+    )
+    return info
+
+
 def can_send_outreach(
     company_id: str | None,
     *,
@@ -537,6 +786,16 @@ def can_send_outreach(
     """
     if user_has_unlimited_scans(user) or scans_unlimited:
         return True
+    if user_has_custom_card_limit(user):
+        base = {"company_id": company_id} if company_id else get_entitlement(None)
+        info = resolve_user_card_entitlement(user, base)
+        if not info["card_quota_enforced"]:
+            return True
+        if info["cards_remaining"] and info["cards_remaining"] > 0:
+            return True
+        if initial_save and info["cards_used"] > 0 and info["card_limit"] is not None:
+            return info["cards_used"] <= int(info["card_limit"])
+        return False
     if not company_id:
         return True
     info = get_entitlement(company_id)

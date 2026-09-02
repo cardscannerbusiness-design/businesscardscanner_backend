@@ -13,6 +13,10 @@ from psycopg2.extras import Json
 
 from auth.constants import ROLE_ADMIN, ROLE_SUPER_ADMIN, ROLE_USER
 from db.pool import db_cursor
+from services.entitlement_service import (
+    DEFAULT_FREEMIUM_CARD_LIMIT,
+    is_default_user_card_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +501,8 @@ def list_cms_tenant_users(admin_user_id: str) -> dict[str, Any]:
                     u.last_login,
                     u.created_at,
                     COALESCE(u.scans_unlimited, FALSE) AS scans_unlimited,
+                    u.user_card_limit,
+                    COALESCE(u.user_cards_used, 0) AS user_cards_used,
                     r.name AS role,
                     EXISTS (
                         SELECT 1
@@ -528,6 +534,8 @@ def list_cms_tenant_users(admin_user_id: str) -> dict[str, Any]:
                     u.last_login,
                     u.created_at,
                     COALESCE(u.scans_unlimited, FALSE) AS scans_unlimited,
+                    u.user_card_limit,
+                    COALESCE(u.user_cards_used, 0) AS user_cards_used,
                     r.name AS role,
                     EXISTS (
                         SELECT 1
@@ -555,6 +563,10 @@ def list_cms_tenant_users(admin_user_id: str) -> dict[str, Any]:
         last_login = row.get("last_login")
         created_at = row.get("created_at")
         scans_unlimited = bool(row.get("scans_unlimited"))
+        raw_limit = row.get("user_card_limit")
+        user_card_limit = int(raw_limit) if raw_limit is not None else DEFAULT_FREEMIUM_CARD_LIMIT
+        user_cards_used = max(0, int(row.get("user_cards_used") or 0))
+        mode = _scan_entitlement_mode(scans_unlimited, user_card_limit)
         users.append(
             {
                 "id": str(row["id"]),
@@ -564,6 +576,10 @@ def list_cms_tenant_users(admin_user_id: str) -> dict[str, Any]:
                 "is_active": is_active,
                 "connected": connected,
                 "scans_unlimited": scans_unlimited,
+                "user_card_limit": user_card_limit,
+                "user_cards_used": user_cards_used,
+                "scan_entitlement_mode": mode,
+                "effective_card_limit": None if mode == "unlimited" else user_card_limit,
                 "status": "Active" if is_active else "Inactive",
                 "check_status": "pass" if connected else ("pending" if is_active else "fail"),
                 "last_login": last_login.isoformat() if last_login and hasattr(last_login, "isoformat") else None,
@@ -594,13 +610,56 @@ def list_cms_tenant_users(admin_user_id: str) -> dict[str, Any]:
     }
 
 
+def _scan_entitlement_mode(scans_unlimited: bool, user_card_limit: int | None) -> str:
+    if scans_unlimited:
+        return "unlimited"
+    if is_default_user_card_limit(user_card_limit):
+        return "default"
+    return "custom"
+
+
 def set_cms_tenant_user_scans_unlimited(
     admin_user_id: str,
     target_user_id: str,
     *,
     scans_unlimited: bool,
 ) -> dict[str, Any]:
-    """Grant or revoke per-user unlimited card scans for one tenant user (SuperAdmin CMS)."""
+    """Backward-compatible unlimited toggle."""
+    mode = "unlimited" if scans_unlimited else "default"
+    return set_cms_tenant_user_scan_entitlement(
+        admin_user_id,
+        target_user_id,
+        mode=mode,
+        limit=None,
+    )
+
+
+def set_cms_tenant_user_scan_entitlement(
+    admin_user_id: str,
+    target_user_id: str,
+    *,
+    mode: str,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Set per-user scan entitlement: default (10 cards), unlimited, or custom limit."""
+    mode_norm = str(mode or "default").strip().lower()
+    if mode_norm not in {"default", "unlimited", "custom"}:
+        raise ValueError("mode must be default, unlimited, or custom")
+
+    if mode_norm == "custom":
+        if limit is None or int(limit) < 1:
+            raise ValueError("limit is required for custom mode and must be at least 1")
+        if int(limit) > 100_000:
+            raise ValueError("limit must be 100000 or less")
+        next_unlimited = False
+        next_limit = int(limit)
+    elif mode_norm == "unlimited":
+        next_unlimited = True
+        next_limit = None
+    else:
+        next_unlimited = False
+        next_limit = DEFAULT_FREEMIUM_CARD_LIMIT
+
     existing = get_admin_env_settings(admin_user_id)
     if not existing:
         raise ValueError("Admin not found")
@@ -643,11 +702,13 @@ def set_cms_tenant_user_scans_unlimited(
         cur.execute(
             """
             UPDATE users
-            SET scans_unlimited = %s, updated_at = NOW()
+            SET scans_unlimited = %s,
+                user_card_limit = %s,
+                updated_at = NOW()
             WHERE id = %s
             RETURNING id
             """,
-            (bool(scans_unlimited), target_user_id),
+            (bool(next_unlimited), next_limit, target_user_id),
         )
         if not cur.fetchone():
             raise ValueError("User not found in this tenant")
@@ -656,7 +717,9 @@ def set_cms_tenant_user_scans_unlimited(
     updated = next((u for u in summary["users"] if u["id"] == str(target_user_id)), None)
     return {
         "success": True,
-        "scans_unlimited": bool(scans_unlimited),
+        "scans_unlimited": bool(next_unlimited),
+        "user_card_limit": next_limit,
+        "scan_entitlement_mode": _scan_entitlement_mode(bool(next_unlimited), next_limit),
         "user": updated,
         "users": summary,
     }

@@ -10,7 +10,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from auth.audit_service import log_action
-from auth.constants import AUDIT_SCANS_UNLIMITED_UPDATED, ROLE_SUPER_ADMIN
+from auth.constants import (
+    AUDIT_SCANS_UNLIMITED_UPDATED,
+    AUDIT_USER_SCAN_ENTITLEMENT_UPDATED,
+    ROLE_SUPER_ADMIN,
+)
 from auth.dependencies import get_current_user, require_role
 from services.admin_env_service import (
     EMAIL_KEYS,
@@ -22,6 +26,7 @@ from services.admin_env_service import (
     list_cms_tenant_users,
     merge_admin_env_for_test,
     set_cms_tenant_user_scans_unlimited,
+    set_cms_tenant_user_scan_entitlement,
     upsert_admin_env_settings as upsert_admin_env,
 )
 from services.company_lifecycle import CompanyNotFoundError, remove_cms_client
@@ -381,6 +386,19 @@ class CmsUserScansUnlimitedRequest(BaseModel):
     )
 
 
+class CmsUserScanEntitlementRequest(BaseModel):
+    mode: str = Field(
+        ...,
+        description="default = company Freemium pool, unlimited = no cap, custom = per-user numeric limit",
+    )
+    limit: int | None = Field(
+        None,
+        ge=1,
+        le=100_000,
+        description="Required when mode=custom (e.g. 500)",
+    )
+
+
 @router.patch(
     "/admin-env/{admin_id}/users/{user_id}/scans-unlimited",
     summary="Grant or revoke unlimited card scans for one tenant user",
@@ -415,6 +433,49 @@ def patch_tenant_user_scans_unlimited(
             "user_id": user_id,
             "email": target.get("email"),
             "scans_unlimited": body.scans_unlimited,
+        },
+    )
+    return result
+
+
+@router.patch(
+    "/admin-env/{admin_id}/users/{user_id}/scan-entitlement",
+    summary="Set per-user scan entitlement (default, unlimited, or custom limit)",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def patch_tenant_user_scan_entitlement(
+    admin_id: str,
+    user_id: str,
+    body: CmsUserScanEntitlementRequest,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        result = set_cms_tenant_user_scan_entitlement(
+            admin_id,
+            user_id,
+            mode=body.mode,
+            limit=body.limit,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=status, detail=msg) from exc
+
+    target = result.get("user") or {}
+    log_action(
+        str(user["id"]),
+        AUDIT_USER_SCAN_ENTITLEMENT_UPDATED,
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        new_value={
+            "cms_admin_id": admin_id,
+            "user_id": user_id,
+            "email": target.get("email"),
+            "mode": body.mode,
+            "limit": body.limit,
+            "scans_unlimited": result.get("scans_unlimited"),
+            "user_card_limit": result.get("user_card_limit"),
         },
     )
     return result

@@ -95,26 +95,20 @@ class TestConsume(unittest.TestCase):
     def test_consume_increments(self) -> None:
         cur = MagicMock()
         cur.fetchone.return_value = {
-            "id": "c1",
-            "plan_name": "FREEMIUM",
-            "card_limit": 2,
-            "cards_used": 1,
-            "entitlement_started_at": None,
-            "entitlement_exhausted_at": None,
+            "user_cards_used": 1,
+            "user_card_limit": 10,
         }
         info = ent.consume_card_locked(cur, "c1", contact_id="contact-1", user_id="u1")
         self.assertEqual(info["cards_used"], 1)
-        self.assertEqual(cur.execute.call_count, 2)
+        self.assertEqual(info["card_limit"], 10)
         sql = cur.execute.call_args_list[0][0][0]
-        self.assertIn("cards_used = cards_used + 1", sql)
+        self.assertIn("user_cards_used", sql)
 
     def test_consume_rejected_when_update_matches_nothing(self) -> None:
         cur = MagicMock()
-        cur.fetchone.return_value = None
-        with patch.object(ent, "get_entitlement") as get_ent:
-            get_ent.return_value = {"cards_used": 2, "card_limit": 2}
-            with self.assertRaises(ent.CardLimitExceededError):
-                ent.consume_card_locked(cur, "c1", contact_id="x")
+        cur.fetchone.side_effect = [None, {"user_cards_used": 10, "user_card_limit": 10}]
+        with self.assertRaises(ent.CardLimitExceededError):
+            ent.consume_card_locked(cur, "c1", contact_id="x", user_id="u1")
 
 
 class TestOutreachGate(unittest.TestCase):
@@ -195,44 +189,43 @@ class TestUserScanUnlimited(unittest.TestCase):
         "freemium_exhausted": True,
     }
 
+    _NORMAL_EXHAUSTED_USER = {
+        "id": "u-normal",
+        "scans_unlimited": False,
+        "user_card_limit": 10,
+        "user_cards_used": 10,
+    }
+
     def test_flag_false_uses_existing_company_limit(self) -> None:
-        """1. Normal Freemium user: 10-card limit still applies."""
-        with patch.object(ent, "get_entitlement") as get_ent:
-            get_ent.return_value = {
-                "can_process_card": False,
-                "cards_used": 10,
-                "card_limit": 10,
-            }
-            with self.assertRaises(ent.CardLimitExceededError):
-                ent.assert_can_process_card(
-                    "c1", user={"id": "u-normal", "scans_unlimited": False}
-                )
+        """1. Normal Freemium user: 10-card personal limit still applies."""
+        with self.assertRaises(ent.CardLimitExceededError):
+            ent.assert_can_process_card("c1", user=dict(self._NORMAL_EXHAUSTED_USER))
 
     def test_normal_user_whatsapp_email_contacts_freeze_at_cap(self) -> None:
         """1. Normal Freemium user: WhatsApp / Email / Contacts freeze at exhaustion."""
         with patch.object(ent, "get_entitlement", return_value=self._EXHAUSTED):
             with self.assertRaises(ent.ContactsFrozenError):
                 ent.assert_can_access_contacts(
-                    "c1", user={"id": "u-normal", "scans_unlimited": False}
+                    "c1", user=dict(self._NORMAL_EXHAUSTED_USER)
                 )
             self.assertFalse(
                 ent.can_send_outreach(
                     "c1",
                     initial_save=False,
-                    user={"id": "u-normal", "scans_unlimited": False},
+                    user=dict(self._NORMAL_EXHAUSTED_USER),
                 )
             )
             with self.assertRaises(ent.OutreachFrozenError):
                 ent.assert_can_send_outreach(
                     "c1",
                     channel="whatsapp",
-                    user={"id": "u-normal", "scans_unlimited": False},
+                    user=dict(self._NORMAL_EXHAUSTED_USER),
                 )
             with self.assertRaises(ent.OutreachFrozenError):
                 ent.assert_can_send_outreach(
                     "c1",
                     channel="email",
-                    user={"id": "u-normal", "scans_unlimited": False},
+                    user=dict(self._NORMAL_EXHAUSTED_USER),
                 )
 
     def test_flag_true_allows_save_when_company_at_limit(self) -> None:
@@ -300,6 +293,8 @@ class TestUserScanUnlimited(unittest.TestCase):
             "id": "other",
             "company_id": "company-x",
             "scans_unlimited": False,
+            "user_card_limit": 10,
+            "user_cards_used": 10,
         }
         with patch.object(ent, "get_entitlement") as get_ent:
             get_ent.return_value = dict(self._EXHAUSTED)
@@ -319,33 +314,20 @@ class TestUserScanUnlimited(unittest.TestCase):
             )
 
     def test_other_company_unchanged(self) -> None:
-        """4. Other companies keep the existing 10-card enforcement."""
-        with patch.object(ent, "get_entitlement") as get_ent:
-            get_ent.return_value = {
-                "can_process_card": False,
-                "cards_used": 10,
-                "card_limit": 10,
-                "contacts_allowed": False,
-                "card_quota_enforced": True,
-                "cards_remaining": 0,
-            }
-            with self.assertRaises(ent.CardLimitExceededError):
-                ent.assert_can_process_card(
-                    "company-other",
-                    user={"id": "admin-2", "scans_unlimited": False},
-                )
-            with self.assertRaises(ent.ContactsFrozenError):
-                ent.assert_can_access_contacts(
-                    "company-other",
-                    user={"id": "admin-2", "scans_unlimited": False},
-                )
-            self.assertFalse(
-                ent.can_send_outreach(
-                    "company-other",
-                    initial_save=False,
-                    user={"id": "admin-2", "scans_unlimited": False},
-                )
+        """4. Other users keep the default 10-card personal enforcement."""
+        exhausted = dict(self._NORMAL_EXHAUSTED_USER)
+        exhausted["id"] = "admin-2"
+        with self.assertRaises(ent.CardLimitExceededError):
+            ent.assert_can_process_card("company-other", user=exhausted)
+        with self.assertRaises(ent.ContactsFrozenError):
+            ent.assert_can_access_contacts("company-other", user=exhausted)
+        self.assertFalse(
+            ent.can_send_outreach(
+                "company-other",
+                initial_save=False,
+                user=exhausted,
             )
+        )
 
     def test_storage_quota_not_skipped_for_unlimited_scans(self) -> None:
         """5. Unlimited scans does not skip the storage-byte limit."""
@@ -371,7 +353,7 @@ class TestUserScanUnlimited(unittest.TestCase):
         self.assertEqual(overlay["cards_used"], 10)
 
         normal = ent.apply_user_scan_overlay(
-            self._EXHAUSTED, user={"scans_unlimited": False}
+            self._EXHAUSTED, user=dict(self._NORMAL_EXHAUSTED_USER)
         )
         self.assertFalse(normal["scans_unlimited"])
         self.assertFalse(normal["can_process_card"])
