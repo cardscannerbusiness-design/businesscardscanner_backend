@@ -412,5 +412,90 @@ class TestUserScanUnlimited(unittest.TestCase):
         )
 
 
+class TestCrossAdminIsolation(unittest.TestCase):
+    """Admin A at 10/10 must never consume Admin B's independent allowance."""
+
+    _COMPANY_A_EXHAUSTED = {
+        "company_id": "company-a",
+        "plan": "FREEMIUM",
+        "plan_name": "FREEMIUM",
+        "card_limit": 10,
+        "cards_used": 10,
+        "cards_remaining": 0,
+        "card_quota_enforced": True,
+        "can_process_card": False,
+        "whatsapp_allowed": False,
+        "email_allowed": False,
+        "contacts_allowed": False,
+        "freemium_exhausted": True,
+    }
+
+    _ADMIN_A = {
+        "id": "admin-a",
+        "company_id": "company-a",
+        "scans_unlimited": False,
+        "user_card_limit": 10,
+        "user_cards_used": 10,
+    }
+
+    _ADMIN_B = {
+        "id": "admin-b",
+        "company_id": "company-b",
+        "scans_unlimited": False,
+        "user_card_limit": 10,
+        "user_cards_used": 0,
+    }
+
+    def test_admin_a_exhausted_does_not_block_admin_b(self) -> None:
+        with self.assertRaises(ent.CardLimitExceededError) as blocked:
+            ent.assert_can_process_card("company-a", user=dict(self._ADMIN_A))
+        self.assertEqual(blocked.exception.cards_used, 10)
+        self.assertEqual(blocked.exception.card_limit, 10)
+
+        ent.assert_can_process_card("company-b", user=dict(self._ADMIN_B))
+        ent.assert_can_access_contacts("company-b", user=dict(self._ADMIN_B))
+        self.assertTrue(
+            ent.can_send_outreach(
+                "company-b", initial_save=False, user=dict(self._ADMIN_B)
+            )
+        )
+
+    def test_admin_b_usage_overlay_stays_at_zero_even_if_company_snapshot_is_exhausted(
+        self,
+    ) -> None:
+        overlay = ent.apply_user_scan_overlay(
+            dict(self._COMPANY_A_EXHAUSTED), user=dict(self._ADMIN_B)
+        )
+        self.assertEqual(overlay["cards_used"], 0)
+        self.assertEqual(overlay["card_limit"], 10)
+        self.assertEqual(overlay["cards_remaining"], 10)
+        self.assertTrue(overlay["can_process_card"])
+        self.assertFalse(overlay["freemium_exhausted"])
+        self.assertTrue(overlay["whatsapp_allowed"])
+        self.assertTrue(overlay["email_allowed"])
+        self.assertTrue(overlay["contacts_allowed"])
+
+    def test_admin_a_overlay_stays_exhausted(self) -> None:
+        overlay = ent.apply_user_scan_overlay(
+            dict(self._COMPANY_A_EXHAUSTED), user=dict(self._ADMIN_A)
+        )
+        self.assertEqual(overlay["cards_used"], 10)
+        self.assertFalse(overlay["can_process_card"])
+        self.assertTrue(overlay["freemium_exhausted"])
+
+    def test_consume_targets_the_authenticated_user_row_only(self) -> None:
+        cur = MagicMock()
+        cur.fetchone.return_value = {"user_cards_used": 1, "user_card_limit": 10}
+        info = ent.consume_card_locked(
+            cur, "company-a", contact_id="c1", user_id="admin-a"
+        )
+        self.assertEqual(info["cards_used"], 1)
+        args = cur.execute.call_args_list[0][0]
+        self.assertIn("user_cards_used", args[0])
+        self.assertIn("admin-a", args[1])
+        self.assertNotIn("admin-b", args[1])
+
+
 if __name__ == "__main__":
     unittest.main()
+
