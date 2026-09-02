@@ -73,6 +73,15 @@ OUTREACH_BLOCKED_MESSAGE = (
     f"WhatsApp and Email are locked because your {_limit_label()} Freemium limit "
     "has been reached. Complete payment to unlock them."
 )
+CMS_WHATSAPP_LOCKED_MESSAGE = (
+    "WhatsApp is locked by Super Admin in CMS for your company."
+)
+CMS_EMAIL_LOCKED_MESSAGE = (
+    "Email is locked by Super Admin in CMS for your company."
+)
+CMS_SHEETS_LOCKED_MESSAGE = (
+    "Google Sheets is locked by Super Admin in CMS for your company."
+)
 
 
 class EntitlementDeniedError(Exception):
@@ -404,12 +413,19 @@ def apply_user_scan_overlay(
         out["email_allowed"] = True
         out["contacts_allowed"] = True
         out["freemium_exhausted"] = False
-        return out
+        from services.admin_env_service import apply_channel_locks_to_entitlement
+
+        return apply_channel_locks_to_entitlement(out, out.get("company_id"))
     if user_has_custom_card_limit(user):
-        return resolve_user_card_entitlement(user, info)
+        resolved = resolve_user_card_entitlement(user, info)
+        from services.admin_env_service import apply_channel_locks_to_entitlement
+
+        return apply_channel_locks_to_entitlement(resolved, resolved.get("company_id"))
     out = dict(info)
     out["scans_unlimited"] = False
-    return out
+    from services.admin_env_service import apply_channel_locks_to_entitlement
+
+    return apply_channel_locks_to_entitlement(out, out.get("company_id"))
 
 
 def assert_can_process_card(
@@ -511,7 +527,29 @@ def assert_can_send_outreach(
     user: dict[str, Any] | None = None,
     scans_unlimited: bool = False,
 ) -> None:
-    """Reject WhatsApp/Email send after Freemium exhaustion (except the just-consumed final card)."""
+    """Reject WhatsApp/Email send after CMS lock or Freemium exhaustion."""
+    from services.admin_env_service import channel_is_locked
+
+    ch = str(channel or "").strip().lower()
+    if ch == "whatsapp" and channel_is_locked(company_id, "whatsapp"):
+        info = get_entitlement(company_id) if company_id else get_entitlement(None)
+        raise OutreachFrozenError(
+            CMS_WHATSAPP_LOCKED_MESSAGE,
+            company_id=company_id,
+            cards_used=info.get("cards_used"),
+            card_limit=info.get("card_limit"),
+            channel="whatsapp",
+        )
+    if ch == "email" and channel_is_locked(company_id, "email"):
+        info = get_entitlement(company_id) if company_id else get_entitlement(None)
+        raise OutreachFrozenError(
+            CMS_EMAIL_LOCKED_MESSAGE,
+            company_id=company_id,
+            cards_used=info.get("cards_used"),
+            card_limit=info.get("card_limit"),
+            channel="email",
+        )
+
     if can_send_outreach(
         company_id,
         initial_save=initial_save,
@@ -810,7 +848,9 @@ def can_send_outreach(
 
 def entitlement_fields_for_usage(company_id: str | None) -> dict[str, Any]:
     """Subset merged into GET /api/storage/usage."""
-    info = get_entitlement(company_id)
+    from services.admin_env_service import apply_channel_locks_to_entitlement
+
+    info = apply_channel_locks_to_entitlement(get_entitlement(company_id), company_id)
     return {
         "card_limit": info["card_limit"],
         "cards_used": info["cards_used"],
@@ -820,6 +860,11 @@ def entitlement_fields_for_usage(company_id: str | None) -> dict[str, Any]:
         "can_process_card": info["can_process_card"],
         "whatsapp_allowed": info["whatsapp_allowed"],
         "email_allowed": info["email_allowed"],
+        "google_sheets_allowed": info.get("google_sheets_allowed", True),
+        "cms_channel_locks": info.get("cms_channel_locks") or {},
+        "cms_whatsapp_locked": bool(info.get("cms_whatsapp_locked")),
+        "cms_email_locked": bool(info.get("cms_email_locked")),
+        "cms_google_sheets_locked": bool(info.get("cms_google_sheets_locked")),
         "contacts_allowed": info["contacts_allowed"],
         "entitlement_started_at": info["entitlement_started_at"],
         "entitlement_exhausted_at": info["entitlement_exhausted_at"],

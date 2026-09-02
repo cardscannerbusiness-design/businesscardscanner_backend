@@ -1179,11 +1179,20 @@ def sync_contact_by_id(contact_id: str, extras: dict[str, Any] | None = None) ->
         logger.info("[GSHEET] sync skipped: Google Drive/Sheets not configured")
         return False
     from services import contact_storage as storage
+    from services.admin_env_service import channel_is_locked
 
     contact = storage.get_contact(contact_id)
     if not contact:
         logger.info("[GSHEET] contact_id=%s not found in PostgreSQL", contact_id)
         logger.warning("Google Sheets sync skipped: contact %s not found in PostgreSQL.", contact_id)
+        return False
+
+    company_id = str(contact.get("owner_company_id") or contact.get("company_id") or "").strip() or None
+    if channel_is_locked(company_id, "google_sheets"):
+        logger.info(
+            "[GSHEET] sync skipped: CMS locked Google Sheets for company_id=%s",
+            company_id or "-",
+        )
         return False
 
     ok = sync_contact_to_sheet(contact, extras)

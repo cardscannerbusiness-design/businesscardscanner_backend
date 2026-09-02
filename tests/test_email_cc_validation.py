@@ -62,6 +62,15 @@ class TestCcAddressValidation(unittest.TestCase):
         self.assertEqual(len(result.invalid), 1)
         self.assertIn("cannot match the To recipient", result.invalid[0]["reason"])
 
+    def test_allow_same_as_to_for_receive_copy(self) -> None:
+        result = validate_cc_address_list(
+            ["contact@example.com"],
+            to_address="contact@example.com",
+            allow_same_as_to=True,
+        )
+        self.assertEqual(result.valid, ["contact@example.com"])
+        self.assertEqual(result.invalid, [])
+
 
 class TestEmailSendWithCc(unittest.TestCase):
     @patch("services.email_service._send_cc_scanned_details_emails", return_value=[{"email": "owner@example.com", "success": True}])
@@ -103,6 +112,35 @@ class TestEmailSendWithCc(unittest.TestCase):
             sender_role=ANY,
             smtp_lane=ANY,
         )
+
+    @patch("services.email_service._send_cc_scanned_details_emails", return_value=[{"email": "same@example.com", "success": True}])
+    @patch("services.email_service._deliver_email")
+    @patch("services.email_service.is_email_configured", return_value=True)
+    @patch("services.email_service.get_email_provider", return_value="smtp")
+    def test_receive_same_as_to_still_sends_scanned_details(
+        self,
+        _provider: MagicMock,
+        _configured: MagicMock,
+        deliver: MagicMock,
+        cc_send: MagicMock,
+    ) -> None:
+        from services.email_service import send_business_thank_you_email
+
+        deliver.return_value = {
+            "success": True,
+            "recipient_email": "same@example.com",
+            "error": None,
+        }
+        contact = {"fullName": "Jane", "email": "same@example.com"}
+        result = send_business_thank_you_email(
+            "same@example.com",
+            cc_addresses=["same@example.com"],
+            contact=contact,
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["cc_emails"], ["same@example.com"])
+        cc_send.assert_called_once()
+        self.assertEqual(cc_send.call_args.args[0], ["same@example.com"])
 
     @patch("services.email_service._deliver_email")
     @patch("services.email_service.is_email_configured", return_value=True)

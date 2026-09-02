@@ -524,6 +524,8 @@ SCHEMA_STATEMENTS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_admin_env_settings_admin ON admin_env_settings(admin_user_id);",
     "ALTER TABLE admin_env_settings ADD COLUMN IF NOT EXISTS templates JSONB NOT NULL DEFAULT '{}'::jsonb;",
     "ALTER TABLE admin_env_settings ADD COLUMN IF NOT EXISTS google_sheets JSONB NOT NULL DEFAULT '{}'::jsonb;",
+    # CMS Super Admin kill-switches: locked=true turns the channel off for that company in the app
+    "ALTER TABLE admin_env_settings ADD COLUMN IF NOT EXISTS channel_locks JSONB NOT NULL DEFAULT '{\"whatsapp\": true, \"email\": false, \"google_sheets\": false}'::jsonb;",
     # ── Admin self-registration requests (SuperAdmin approve/reject) ────────
     """
     CREATE TABLE IF NOT EXISTS admin_registration_requests (

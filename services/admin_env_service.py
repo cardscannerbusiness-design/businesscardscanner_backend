@@ -42,7 +42,7 @@ EMAIL_KEYS = (
     "smtp_user",
     "smtp_password",
     "smtp_from",
-    "sender_notification_email",
+    "sender_notification_email",  # CMS "Receive email" — scanned-details copy inbox
     "enabled",
 )
 
@@ -88,6 +88,15 @@ SECRET_KEYS = frozenset(
 
 MASK = "••••••••"
 
+# CMS kill-switches: locked=true → channel OFF for that Admin's company in the main app.
+# WhatsApp defaults locked to match the current CMS product stage; Email/Sheets start unlocked.
+DEFAULT_CHANNEL_LOCKS: dict[str, bool] = {
+    "whatsapp": True,
+    "email": False,
+    "google_sheets": False,
+}
+CHANNEL_LOCK_KEYS = tuple(DEFAULT_CHANNEL_LOCKS.keys())
+
 # Old CMS keys → current keys (keep existing saved rows working)
 _WA_LEGACY = {
     "business_phone_number": "business_phone",
@@ -117,6 +126,71 @@ def _as_dict(value: Any) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def normalize_channel_locks(raw: Any) -> dict[str, bool]:
+    """Return {whatsapp, email, google_sheets} locked flags (True = OFF in app)."""
+    data = _as_dict(raw)
+    out: dict[str, bool] = {}
+    for key, default in DEFAULT_CHANNEL_LOCKS.items():
+        if key in data:
+            out[key] = bool(data[key])
+        else:
+            out[key] = bool(default)
+    return out
+
+
+def get_channel_locks_for_company(company_id: str | None) -> dict[str, bool]:
+    """Resolve CMS channel locks for a company (via its Admin env settings)."""
+    if not company_id:
+        return dict(DEFAULT_CHANNEL_LOCKS)
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT s.channel_locks
+            FROM admin_env_settings s
+            JOIN users u ON u.id = s.admin_user_id
+            JOIN roles r ON r.id = u.role_id
+            WHERE u.company_id = %s
+              AND u.deleted_at IS NULL
+              AND r.name = %s
+            ORDER BY s.updated_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            (company_id, ROLE_ADMIN),
+        )
+        row = cur.fetchone()
+    if not row:
+        return dict(DEFAULT_CHANNEL_LOCKS)
+    return normalize_channel_locks(row.get("channel_locks") if isinstance(row, dict) else row[0])
+
+
+def channel_is_locked(company_id: str | None, channel: str) -> bool:
+    key = str(channel or "").strip().lower()
+    if key in ("sheets", "google", "gsheets"):
+        key = "google_sheets"
+    locks = get_channel_locks_for_company(company_id)
+    return bool(locks.get(key, DEFAULT_CHANNEL_LOCKS.get(key, False)))
+
+
+def apply_channel_locks_to_entitlement(
+    info: dict[str, Any],
+    company_id: str | None = None,
+) -> dict[str, Any]:
+    """AND CMS locks onto entitlement whatsapp/email/sheets allowed flags."""
+    cid = company_id if company_id is not None else info.get("company_id")
+    locks = get_channel_locks_for_company(str(cid) if cid else None)
+    out = dict(info)
+    out["cms_channel_locks"] = locks
+    out["cms_whatsapp_locked"] = locks["whatsapp"]
+    out["cms_email_locked"] = locks["email"]
+    out["cms_google_sheets_locked"] = locks["google_sheets"]
+    if locks["whatsapp"]:
+        out["whatsapp_allowed"] = False
+    if locks["email"]:
+        out["email_allowed"] = False
+    out["google_sheets_allowed"] = not locks["google_sheets"]
+    return out
 
 
 def _apply_legacy(raw: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
@@ -209,6 +283,43 @@ def _public_templates(data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _normalize_email_receive_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """Map receive_email ↔ sender_notification_email (CMS Receive email field)."""
+    out = dict(data)
+    receive = str(
+        out.get("sender_notification_email")
+        or out.get("receive_email")
+        or ""
+    ).strip()
+    out["sender_notification_email"] = receive
+    out["receive_email"] = receive
+    return out
+
+
+def get_cms_receive_email(admin_user_id: str | None) -> str | None:
+    """Per-Admin CMS Receive email (scanned-details inbox), ignoring SMTP enabled flag."""
+    if not admin_user_id:
+        return None
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT s.email
+            FROM admin_env_settings s
+            JOIN users u ON u.id = s.admin_user_id
+            JOIN roles r ON r.id = u.role_id
+            WHERE s.admin_user_id = %s
+              AND u.deleted_at IS NULL
+              AND r.name = %s
+            """,
+            (admin_user_id, ROLE_ADMIN),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    em = _normalize_email_receive_fields(_as_dict(row.get("email") if isinstance(row, dict) else None))
+    return str(em.get("receive_email") or "").strip() or None
+
+
 def _mask_section(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key in keys:
@@ -253,9 +364,12 @@ def _merge_section(
 
 def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
     whatsapp_raw = _apply_legacy(_as_dict(row.get("whatsapp")), _WA_LEGACY)
-    email_raw = _apply_legacy(_as_dict(row.get("email")), _EMAIL_LEGACY)
+    email_raw = _normalize_email_receive_fields(
+        _apply_legacy(_as_dict(row.get("email")), _EMAIL_LEGACY)
+    )
     templates_raw = _as_dict(row.get("templates"))
     sheets_raw = _as_dict(row.get("google_sheets"))
+    channel_locks = normalize_channel_locks(row.get("channel_locks"))
     return {
         "admin_id": str(row["id"]),
         "email": row.get("email_addr") or row.get("user_email") or "",
@@ -274,9 +388,14 @@ def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
             WHATSAPP_KEYS,
         ),
         "email_settings": _mask_section(
-            {**_empty_email(), **{k: email_raw.get(k, "") for k in EMAIL_KEYS if k != "enabled"}, "enabled": bool(email_raw.get("enabled"))},
+            {
+                **_empty_email(),
+                **{k: email_raw.get(k, "") for k in EMAIL_KEYS if k != "enabled"},
+                "enabled": bool(email_raw.get("enabled")),
+            },
             EMAIL_KEYS,
         ),
+        "receive_email": str(email_raw.get("receive_email") or ""),
         "templates": _public_templates(templates_raw),
         "google_sheets": _mask_section(
             {
@@ -286,6 +405,7 @@ def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
             },
             GOOGLE_SHEETS_KEYS,
         ),
+        "channel_locks": channel_locks,
         "settings_updated_at": (
             row["settings_updated_at"].isoformat() if row.get("settings_updated_at") else None
         ),
@@ -312,6 +432,7 @@ def list_admin_env_settings() -> list[dict[str, Any]]:
                 s.email,
                 s.templates,
                 s.google_sheets,
+                s.channel_locks,
                 s.updated_at AS settings_updated_at
             FROM users u
             JOIN roles r ON r.id = u.role_id
@@ -347,6 +468,7 @@ def get_admin_env_settings(admin_user_id: str) -> dict[str, Any] | None:
                 s.email,
                 s.templates,
                 s.google_sheets,
+                s.channel_locks,
                 s.updated_at AS settings_updated_at
             FROM users u
             JOIN roles r ON r.id = u.role_id
@@ -397,31 +519,45 @@ def upsert_admin_env_settings(
 
     with db_cursor(commit=False) as cur:
         cur.execute(
-            "SELECT whatsapp, email, templates, google_sheets FROM admin_env_settings WHERE admin_user_id = %s",
+            "SELECT whatsapp, email, templates, google_sheets, channel_locks FROM admin_env_settings WHERE admin_user_id = %s",
             (admin_user_id,),
         )
         prev = cur.fetchone() or {}
 
     prev_wa = _apply_legacy(_as_dict(prev.get("whatsapp")), _WA_LEGACY)
-    prev_em = _apply_legacy(_as_dict(prev.get("email")), _EMAIL_LEGACY)
+    prev_em = _normalize_email_receive_fields(
+        _apply_legacy(_as_dict(prev.get("email")), _EMAIL_LEGACY)
+    )
     prev_tpl = _as_dict(prev.get("templates"))
     prev_gs = _as_dict(prev.get("google_sheets"))
+    prev_locks = normalize_channel_locks(prev.get("channel_locks"))
 
     merged_wa = _merge_section(prev_wa, whatsapp, WHATSAPP_KEYS)
-    merged_em = _merge_section(prev_em, email, EMAIL_KEYS)
+    email_incoming = _as_dict(email) if email is not None else None
+    if email_incoming is not None and not str(
+        email_incoming.get("sender_notification_email") or ""
+    ).strip():
+        alias = str(email_incoming.get("receive_email") or "").strip()
+        if alias:
+            email_incoming["sender_notification_email"] = alias
+    merged_em = _normalize_email_receive_fields(
+        _merge_section(prev_em, email_incoming, EMAIL_KEYS)
+    )
+    merged_em.pop("receive_email", None)
     merged_tpl = _merge_templates(prev_tpl, templates)
     merged_gs = _merge_section(prev_gs, google_sheets, GOOGLE_SHEETS_KEYS)
 
     with db_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO admin_env_settings (admin_user_id, whatsapp, email, templates, google_sheets, updated_at)
-            VALUES (%s, %s, %s, %s, %s, NOW())
+            INSERT INTO admin_env_settings (admin_user_id, whatsapp, email, templates, google_sheets, channel_locks, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (admin_user_id) DO UPDATE SET
                 whatsapp = EXCLUDED.whatsapp,
                 email = EXCLUDED.email,
                 templates = EXCLUDED.templates,
                 google_sheets = EXCLUDED.google_sheets,
+                channel_locks = COALESCE(admin_env_settings.channel_locks, EXCLUDED.channel_locks),
                 updated_at = NOW()
             """,
             (
@@ -430,6 +566,7 @@ def upsert_admin_env_settings(
                 Json(merged_em),
                 Json(merged_tpl),
                 Json(merged_gs),
+                Json(prev_locks),
             ),
         )
 
@@ -448,6 +585,55 @@ def upsert_admin_env_settings(
     result = get_admin_env_settings(admin_user_id)
     if not result:
         raise RuntimeError("Failed to load settings after save")
+    return result
+
+
+def set_admin_channel_locks(
+    admin_user_id: str,
+    locks: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Create/update CMS channel locks for an Admin (company kill-switches)."""
+    existing = get_admin_env_settings(admin_user_id)
+    if not existing:
+        raise ValueError("Admin not found")
+
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            "SELECT whatsapp, email, templates, google_sheets, channel_locks FROM admin_env_settings WHERE admin_user_id = %s",
+            (admin_user_id,),
+        )
+        prev = cur.fetchone() or {}
+
+    prev_wa = _apply_legacy(_as_dict(prev.get("whatsapp")), _WA_LEGACY) or _empty_whatsapp()
+    prev_em = _apply_legacy(_as_dict(prev.get("email")), _EMAIL_LEGACY) or _empty_email()
+    prev_tpl = _as_dict(prev.get("templates")) or _empty_templates()
+    prev_gs = _as_dict(prev.get("google_sheets")) or _empty_google_sheets()
+    merged_locks = normalize_channel_locks(
+        {**normalize_channel_locks(prev.get("channel_locks")), **_as_dict(locks)}
+    )
+
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO admin_env_settings (admin_user_id, whatsapp, email, templates, google_sheets, channel_locks, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (admin_user_id) DO UPDATE SET
+                channel_locks = EXCLUDED.channel_locks,
+                updated_at = NOW()
+            """,
+            (
+                admin_user_id,
+                Json(prev_wa),
+                Json(prev_em),
+                Json(prev_tpl),
+                Json(prev_gs),
+                Json(merged_locks),
+            ),
+        )
+
+    result = get_admin_env_settings(admin_user_id)
+    if not result:
+        raise RuntimeError("Failed to reload Admin env after channel lock update")
     return result
 
 

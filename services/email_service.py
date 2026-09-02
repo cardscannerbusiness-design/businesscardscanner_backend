@@ -638,9 +638,14 @@ def _prepare_cc_addresses(
     cc_addresses: list[str] | None,
     *,
     to_address: str,
+    allow_same_as_to: bool = False,
 ) -> tuple[list[str], list[dict[str, str]]]:
-    """Validate CC list; return valid addresses and invalid entries with reasons."""
-    validation = validate_cc_address_list(cc_addresses, to_address=to_address)
+    """Validate CC / receive list; return valid addresses and invalid entries with reasons."""
+    validation = validate_cc_address_list(
+        cc_addresses,
+        to_address=to_address,
+        allow_same_as_to=allow_same_as_to,
+    )
     if validation.invalid:
         for entry in validation.invalid:
             logger.warning(
@@ -1411,12 +1416,18 @@ def send_business_thank_you_email(
     subject = _cms_email_subject(recipient_name, contact=contact)
     result["subject"] = subject
     provider = get_email_provider()
-    cc_list, cc_invalid = _prepare_cc_addresses(cc_addresses, to_address=to_address)
+    # Receive/scanned-details is a *separate* email, so same address as To is OK
+    # (e.g. contact + CMS Receive both yogeshvanaparthi@gmail.com).
+    cc_list, cc_invalid = _prepare_cc_addresses(
+        cc_addresses,
+        to_address=to_address,
+        allow_same_as_to=True,
+    )
     result["cc_emails"] = cc_list
     if cc_invalid:
         result["cc_invalid"] = cc_invalid
     logger.info(
-        "Sending business thank-you email via %s lane=%s -> to (User)=%s cc (Owner)=%s subject=%r",
+        "Sending business thank-you email via %s lane=%s -> to (User)=%s receive (Owner)=%s subject=%r",
         provider,
         lane,
         _redact_email(to_address),
@@ -1593,7 +1604,12 @@ async def schedule_email_for_contact(
     contact_name = extract_contact_name(contact)
     recipient = _resolve_recipient(validated_or_error, test_override=test_override)
     raw_cc = _cc_recipients_for_scan(scanner_email)
-    cc_list, cc_invalid = _prepare_cc_addresses(raw_cc or None, to_address=recipient)
+    # Separate scanned-details email — allow Receive == contact To.
+    cc_list, cc_invalid = _prepare_cc_addresses(
+        raw_cc or None,
+        to_address=recipient,
+        allow_same_as_to=True,
+    )
     skipped["recipient_email"] = recipient
     skipped["cc_emails"] = cc_list
     if cc_invalid:

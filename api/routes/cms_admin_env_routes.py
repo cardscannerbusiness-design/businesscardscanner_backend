@@ -25,6 +25,7 @@ from services.admin_env_service import (
     list_admin_env_settings as list_admins_with_env,
     list_cms_tenant_users,
     merge_admin_env_for_test,
+    set_admin_channel_locks,
     set_cms_tenant_user_scans_unlimited,
     set_cms_tenant_user_scan_entitlement,
     upsert_admin_env_settings as upsert_admin_env,
@@ -52,6 +53,14 @@ class AdminEnvUpdateRequest(BaseModel):
     email: dict[str, Any] | None = Field(default=None)
     templates: dict[str, Any] | None = Field(default=None)
     google_sheets: dict[str, Any] | None = Field(default=None)
+
+
+class ChannelLocksUpdateRequest(BaseModel):
+    """CMS kill-switches: locked=true turns the channel off for that company in the app."""
+
+    whatsapp: bool | None = None
+    email: bool | None = None
+    google_sheets: bool | None = None
 
 
 class CmsWhatsAppTestRequest(BaseModel):
@@ -141,13 +150,49 @@ def put_admin_env(admin_id: str, body: AdminEnvUpdateRequest, request: Request):
     return {"success": True, "item": item}
 
 
+@router.put(
+    "/admin-env/{admin_id}/channel-locks",
+    summary="Lock or unlock WhatsApp / Email / Google Sheets for this Admin's company",
+    description=(
+        "When locked=true, that channel is turned off for all users in the Admin's company "
+        "in the main app (send/sync blocked)."
+    ),
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def put_admin_channel_locks(admin_id: str, body: ChannelLocksUpdateRequest, request: Request):
+    actor = get_current_user(request)
+    payload = {
+        key: value
+        for key, value in {
+            "whatsapp": body.whatsapp,
+            "email": body.email,
+            "google_sheets": body.google_sheets,
+        }.items()
+        if value is not None
+    }
+    if not payload:
+        raise HTTPException(status_code=400, detail="Provide at least one channel lock flag.")
+    try:
+        item = set_admin_channel_locks(admin_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    log_action(
+        str(actor["id"]),
+        "cms_channel_locks_updated",
+        ip=request.client.host if request.client else "",
+        new_value={"admin_id": admin_id, "channel_locks": item.get("channel_locks")},
+    )
+    return {"success": True, "item": item, "channel_locks": item.get("channel_locks")}
+
+
 @router.delete(
     "/admin-env/{admin_id}",
     summary="Remove per-Admin CMS WhatsApp/Email/template settings",
     description="Deletes the CMS env row so this Admin falls back to global .env.",
     dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
 )
-def delete_one_admin_env(admin_id: str, request: Request):
+def delete_one_admin_env_after_locks(admin_id: str, request: Request):
     actor = get_current_user(request)
     try:
         item = delete_admin_env(admin_id)
@@ -333,6 +378,11 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
                 detail="Email is not configured. Set Amazon SES SMTP_EXTERNAL_* credentials in CMS or server .env, then try again."
             )
         try:
+            from services.admin_env_service import get_cms_receive_email
+
+            # Data-receive copy → CMS Receive email (Admin/User scan path).
+            # Super Admin scans do not use CMS; they keep own email / SUPERADMIN_EMAIL.
+            receive_cc = get_cms_receive_email(admin_id)
             result = await asyncio.to_thread(
                 send_business_thank_you_email,
                 body.contact_email,
@@ -343,6 +393,7 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
                     "eventName": "CMS Test",
                 },
                 sender_role="ADMIN",
+                cc_addresses=[receive_cc] if receive_cc else None,
             )
         except Exception as exc:
             logger.error("CMS Email test failed for admin=%s: %s", admin_id, exc, exc_info=True)
@@ -351,10 +402,14 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
     if not result.get("success"):
         raise HTTPException(status_code=502, detail=result.get("error") or "Email send failed.")
 
+    cc_emails = result.get("cc_emails") or []
     return {
         "success": True,
         "to": result.get("recipient_email") or body.contact_email,
         "subject": result.get("subject"),
+        "cc_emails": cc_emails,
+        "receive_email": cc_emails[0] if cc_emails else receive_cc,
+        "cc_delivery": result.get("cc_delivery") or [],
     }
 
 
