@@ -330,7 +330,7 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
         if not is_email_configured():
             raise HTTPException(
                 status_code=400,
-                detail="Email is not configured. Set SMTP_INTERNAL_* and SMTP_EXTERNAL_* in .env, then try again.",
+                detail="Email is not configured. Set Amazon SES SMTP_EXTERNAL_* credentials in CMS or server .env, then try again."
             )
         try:
             result = await asyncio.to_thread(
