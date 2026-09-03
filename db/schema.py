@@ -108,6 +108,8 @@ SCHEMA_STATEMENTS: list[str] = [
     """,
     # Role-based Google Sheets: one workbook per company (Admin); Super Admin sheet on users
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
+    # CMS "Email Display Name" — From header only; mailbox/SMTP unchanged
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS email_display_name VARCHAR(255) NOT NULL DEFAULT '';",
     # Company storage quota (defaults from StorageService constants)
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS plan_name VARCHAR(64) NOT NULL DEFAULT '{DEFAULT_PLAN_NAME}';",
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS storage_limit_bytes BIGINT NOT NULL DEFAULT {int(DEFAULT_STORAGE_LIMIT_BYTES)};",

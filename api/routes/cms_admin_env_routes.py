@@ -26,6 +26,7 @@ from services.admin_env_service import (
     list_cms_tenant_users,
     merge_admin_env_for_test,
     set_admin_channel_locks,
+    set_admin_company_email_display_name,
     set_cms_tenant_user_scans_unlimited,
     set_cms_tenant_user_scan_entitlement,
     upsert_admin_env_settings as upsert_admin_env,
@@ -61,6 +62,12 @@ class ChannelLocksUpdateRequest(BaseModel):
     whatsapp: bool | None = None
     email: bool | None = None
     google_sheets: bool | None = None
+
+
+class EmailDisplayNameUpdateRequest(BaseModel):
+    """From header display name only. Empty string restores the default."""
+
+    email_display_name: str = ""
 
 
 class CmsWhatsAppTestRequest(BaseModel):
@@ -184,6 +191,44 @@ def put_admin_channel_locks(admin_id: str, body: ChannelLocksUpdateRequest, requ
         new_value={"admin_id": admin_id, "channel_locks": item.get("channel_locks")},
     )
     return {"success": True, "item": item, "channel_locks": item.get("channel_locks")}
+
+
+@router.put(
+    "/admin-env/{admin_id}/email-display-name",
+    summary="Set the From display name for this Admin's company",
+    description=(
+        "Stores companies.email_display_name only. Does not change From address, "
+        "Reply-To, Receive email, SMTP, or SES credentials."
+    ),
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def put_admin_email_display_name(
+    admin_id: str,
+    body: EmailDisplayNameUpdateRequest,
+    request: Request,
+):
+    actor = get_current_user(request)
+    try:
+        item = set_admin_company_email_display_name(admin_id, body.email_display_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    log_action(
+        str(actor["id"]),
+        "cms_email_display_name_updated",
+        ip=request.client.host if request.client else "",
+        new_value={
+            "admin_id": admin_id,
+            "company_id": item.get("company_id"),
+            "email_display_name": item.get("email_display_name"),
+        },
+    )
+    return {
+        "success": True,
+        "item": item,
+        "company_id": item.get("company_id"),
+        "email_display_name": item.get("email_display_name") or "",
+    }
 
 
 @router.delete(
@@ -383,6 +428,7 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
             # Data-receive copy → CMS Receive email (Admin/User scan path).
             # Super Admin scans do not use CMS; they keep own email / SUPERADMIN_EMAIL.
             receive_cc = get_cms_receive_email(admin_id)
+            admin_item = get_admin_env(admin_id) or {}
             result = await asyncio.to_thread(
                 send_business_thank_you_email,
                 body.contact_email,
@@ -391,6 +437,8 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
                     "fullName": "Test Contact",
                     "email": body.contact_email,
                     "eventName": "CMS Test",
+                    "owner_company_id": admin_item.get("company_id"),
+                    "company_id": admin_item.get("company_id"),
                 },
                 sender_role="ADMIN",
                 cc_addresses=[receive_cc] if receive_cc else None,

@@ -514,6 +514,57 @@ def _format_from_address(email: str, name: str | None = None) -> str:
     return email
 
 
+def _company_id_from_contact(contact: dict[str, Any] | None) -> str | None:
+    if not contact:
+        return None
+    for key in ("owner_company_id", "ownerCompanyId", "company_id", "companyId"):
+        value = str(contact.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _from_display_name_for_send(
+    *,
+    sender_role: str | None = None,
+    contact: dict[str, Any] | None = None,
+    smtp_lane: str | None = None,
+) -> str:
+    """Company From display name for ADMIN/USER sends; Super Admin keeps the default."""
+    lane = resolve_smtp_lane(
+        sender_role=sender_role, contact=contact, smtp_lane=smtp_lane
+    )
+    role = str(sender_role or "").strip().upper()
+    default_name = BUSINESS_COMPANY_NAME or "NameCardScan"
+    if lane == "internal" or role == "SUPER_ADMIN":
+        return default_name
+
+    company_id = _company_id_from_contact(contact)
+    if not company_id:
+        try:
+            from services.admin_runtime_config import get_runtime
+            from services.admin_env_service import get_company_id_for_admin
+
+            runtime = get_runtime() or {}
+            company_id = get_company_id_for_admin(str(runtime.get("admin_user_id") or "") or None)
+        except Exception:
+            company_id = None
+
+    if company_id:
+        try:
+            from services.admin_env_service import get_company_email_display_name
+
+            custom = get_company_email_display_name(company_id)
+            if custom:
+                from services.email_display_name import normalize_email_display_name
+
+                return normalize_email_display_name(custom) or default_name
+        except Exception:
+            logger.debug("Could not load company email display name for %s", company_id)
+
+    return default_name
+
+
 def _message_id_domain(smtp_user: str, from_address: str) -> str:
     for candidate in (smtp_user, from_address):
         if "@" in candidate:
@@ -671,6 +722,7 @@ def _send_via_smtp_relay(
     reply_to: str,
     provider_label: str,
     cc_addresses: list[str] | None = None,
+    from_display_name: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "success": False,
@@ -699,7 +751,7 @@ def _send_via_smtp_relay(
         return result
     message = EmailMessage()
     message["Subject"] = subject
-    message["From"] = _format_from_address(authenticated_from)
+    message["From"] = _format_from_address(authenticated_from, name=from_display_name)
     message["To"] = to_address
     if cc_list:
         message["Cc"] = ", ".join(cc_list)
@@ -828,6 +880,11 @@ def _send_via_smtp(
         elif label.startswith("external"):
             provider_label = f"{provider_label} (external)"
 
+        from_display_name = _from_display_name_for_send(
+            sender_role=sender_role,
+            contact=contact,
+            smtp_lane=smtp_lane,
+        )
         result = _send_via_smtp_relay(
             to_address,
             subject=subject,
@@ -846,6 +903,7 @@ def _send_via_smtp(
             ),
             provider_label=provider_label,
             cc_addresses=cc_addresses,
+            from_display_name=from_display_name,
         )
         result["smtp_profile"] = label
         result["smtp_lane"] = lane

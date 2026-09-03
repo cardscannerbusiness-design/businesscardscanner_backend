@@ -13,6 +13,7 @@ from psycopg2.extras import Json
 
 from auth.constants import ROLE_ADMIN, ROLE_SUPER_ADMIN, ROLE_USER
 from db.pool import db_cursor
+from services.email_display_name import normalize_email_display_name
 from services.entitlement_service import (
     DEFAULT_FREEMIUM_CARD_LIMIT,
     is_default_user_card_limit,
@@ -320,6 +321,78 @@ def get_cms_receive_email(admin_user_id: str | None) -> str | None:
     return str(em.get("receive_email") or "").strip() or None
 
 
+def get_company_email_display_name(company_id: str | None) -> str | None:
+    """Saved From display name for this company; None means use the default."""
+    if not company_id:
+        return None
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT email_display_name
+            FROM companies
+            WHERE id = %s
+              AND COALESCE(status, 'active') <> 'deleted'
+            """,
+            (company_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    name = str(row.get("email_display_name") if isinstance(row, dict) else "").strip()
+    return name or None
+
+
+def get_company_id_for_admin(admin_user_id: str | None) -> str | None:
+    if not admin_user_id:
+        return None
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT u.company_id
+            FROM users u
+            JOIN roles r ON r.id = u.role_id
+            WHERE u.id = %s
+              AND u.deleted_at IS NULL
+              AND r.name = %s
+            """,
+            (admin_user_id, ROLE_ADMIN),
+        )
+        row = cur.fetchone()
+    if not row or not row.get("company_id"):
+        return None
+    return str(row["company_id"])
+
+
+def set_admin_company_email_display_name(
+    admin_user_id: str,
+    display_name: str | None,
+) -> dict[str, Any]:
+    """Store From display name on companies.email_display_name for this Admin's company."""
+    existing = get_admin_env_settings(admin_user_id)
+    if not existing:
+        raise ValueError("Admin not found")
+    company_id = existing.get("company_id")
+    if not company_id:
+        raise ValueError("Admin has no company")
+    cleaned = normalize_email_display_name(display_name)
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE companies
+            SET email_display_name = %s, updated_at = NOW()
+            WHERE id = %s
+              AND COALESCE(status, 'active') <> 'deleted'
+            """,
+            (cleaned, company_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError("Company not found")
+    result = get_admin_env_settings(admin_user_id)
+    if not result:
+        raise RuntimeError("Failed to reload Admin after saving email display name")
+    return result
+
+
 def _mask_section(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key in keys:
@@ -380,6 +453,7 @@ def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
         "company_id": str(row["company_id"]) if row.get("company_id") else None,
         "tenant_id": str(row["company_id"]) if row.get("company_id") else str(row["id"]),
         "company_name": row.get("company_name") or "",
+        "email_display_name": str(row.get("email_display_name") or "").strip(),
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
         "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
         "has_settings": bool(row.get("settings_id")),
@@ -425,6 +499,7 @@ def list_admin_env_settings() -> list[dict[str, Any]]:
                 u.is_active,
                 u.company_id,
                 c.company_name AS company_name,
+                c.email_display_name AS email_display_name,
                 u.created_at,
                 u.updated_at,
                 s.id AS settings_id,
@@ -461,6 +536,7 @@ def get_admin_env_settings(admin_user_id: str) -> dict[str, Any] | None:
                 u.is_active,
                 u.company_id,
                 c.company_name AS company_name,
+                c.email_display_name AS email_display_name,
                 u.created_at,
                 u.updated_at,
                 s.id AS settings_id,
