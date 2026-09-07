@@ -104,8 +104,15 @@ SMTP_EXTERNAL_HOST = _normalize_env(os.getenv("SMTP_EXTERNAL_HOST")) or SMTP_HOS
 SMTP_EXTERNAL_PORT = int(
     _normalize_env(os.getenv("SMTP_EXTERNAL_PORT")) or str(SMTP_PORT) or str(DEFAULT_SMTP_PORT)
 )
-SMTP_EXTERNAL_USER = _normalize_env(os.getenv("SMTP_EXTERNAL_USER"))
-SMTP_EXTERNAL_PASSWORD = _normalize_gmail_app_password(os.getenv("SMTP_EXTERNAL_PASSWORD"))
+# Single-identity .env (SMTP_USER / SMTP_PASSWORD) serves both lanes until
+# SMTP_EXTERNAL_* is set. ADMIN/USER would otherwise have an empty external
+# profile and only reach SES via fallback — or not at all if CMS SMTP hijacks.
+SMTP_EXTERNAL_USER = _normalize_env(os.getenv("SMTP_EXTERNAL_USER")) or _normalize_env(
+    os.getenv("SMTP_USER")
+)
+SMTP_EXTERNAL_PASSWORD = _normalize_gmail_app_password(
+    os.getenv("SMTP_EXTERNAL_PASSWORD")
+) or _normalize_gmail_app_password(os.getenv("SMTP_PASSWORD"))
 SMTP_EXTERNAL_FROM = _normalize_env(os.getenv("SMTP_EXTERNAL_FROM")) or SMTP_FROM
 
 # Legacy aliases (health / older callers)
@@ -301,18 +308,63 @@ def resolve_smtp_lane(
     return "external"
 
 
+def _is_ses_host(host: str | None) -> bool:
+    text = str(host or "").strip().lower()
+    return "amazonaws.com" in text or text.startswith("email-smtp.")
+
+
+def _is_google_mailbox(user: str | None) -> bool:
+    text = str(user or "").strip().lower()
+    return text.endswith("@gmail.com") or text.endswith("@googlemail.com")
+
+
+def _redact_smtp_user(user: str | None) -> str:
+    value = str(user or "").strip()
+    if not value:
+        return "(none)"
+    if "@" in value:
+        local, _, domain = value.partition("@")
+        return f"{local[:2]}***@{domain}" if local else f"***@{domain}"
+    if value.upper().startswith("AKIA"):
+        return f"AKIA***{value[-4:]}" if len(value) >= 8 else "AKIA***"
+    return f"{value[:4]}***" if len(value) > 4 else "***"
+
+
+def _infer_smtp_host(*, user: str, configured_host: str) -> str:
+    """Match host to credential type. Gmail mailboxes cannot auth to SES."""
+    host = str(configured_host or "").strip()
+    if _is_google_mailbox(user) and (not host or _is_ses_host(host)):
+        return "smtp.gmail.com"
+    if host:
+        return host
+    return SMTP_HOST or DEFAULT_SMTP_HOST
+
+
 def _cms_smtp_profile() -> dict[str, Any] | None:
-    """CMS Admin override when complete — takes exclusive precedence."""
+    """CMS Admin SMTP override when complete. Env SES lanes still run as fallback."""
     from services.admin_runtime_config import runtime_email
 
     em = runtime_email()
     if not em:
         return None
     user = str(em.get("smtp_user") or em.get("smtp_username") or "").strip()
-    password = str(em.get("smtp_password") or "").strip()
+    password = _normalize_gmail_app_password(
+        str(em.get("smtp_password") or "")
+    )
     if not (user and password):
         return None
-    host = str(em.get("smtp_host") or "").strip() or SMTP_HOST
+    host = _infer_smtp_host(
+        user=user,
+        configured_host=str(em.get("smtp_host") or "").strip(),
+    )
+    # Mailbox usernames (not AKIA) cannot authenticate to Amazon SES.
+    if _looks_like_email(user) and _is_ses_host(host) and not _is_google_mailbox(user):
+        logger.warning(
+            "Ignoring CMS SMTP user %s on SES host %s; using env SES credentials instead.",
+            _redact_smtp_user(user),
+            host,
+        )
+        return None
     port_raw = str(em.get("smtp_port") or "").strip()
     try:
         port = int(port_raw) if port_raw else SMTP_PORT
@@ -341,14 +393,15 @@ def _smtp_profiles_for_send(
     contact: dict[str, Any] | None = None,
     smtp_lane: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Ordered SMTP profiles: CMS override, else lane primary then lane fallback."""
-    cms = _cms_smtp_profile()
-    if cms:
-        return [cms]
+    """CMS override first, then role lane primary, then the other lane."""
+    profiles: list[dict[str, Any]] = []
+    _append_unique_profile(profiles, _cms_smtp_profile())
     lane = resolve_smtp_lane(
         sender_role=sender_role, contact=contact, smtp_lane=smtp_lane
     )
-    return _smtp_profiles_for_lane(lane)
+    for profile in _smtp_profiles_for_lane(lane):
+        _append_unique_profile(profiles, profile)
+    return profiles
 
 
 def _smtp_failure_is_retryable(result: dict[str, Any]) -> bool:
@@ -410,8 +463,7 @@ def _active_smtp(
 
 
 def _is_ses_smtp() -> bool:
-    host = (SMTP_HOST or "").lower()
-    return "amazonaws.com" in host or host.startswith("email-smtp.")
+    return _is_ses_host(SMTP_HOST)
 
 
 def _looks_like_email(value: str | None) -> bool:
@@ -779,7 +831,13 @@ def _send_via_smtp_relay(
             )
     except smtplib.SMTPAuthenticationError as exc:
         result["error"] = f"{provider_label} authentication failed: {exc}"
-        logger.error("SMTP auth failed for %s: %s", to_address, exc, exc_info=True)
+        logger.error(
+            "SMTP auth failed host=%s user=%s to=%s: %s",
+            smtp_host,
+            _redact_smtp_user(smtp_user),
+            _redact_email(to_address),
+            exc,
+        )
         return result
     except smtplib.SMTPRecipientsRefused as exc:
         detail = exc.recipients
@@ -872,18 +930,27 @@ def _send_via_smtp(
         label = str(smtp.get("label") or "smtp")
         provider_label = (
             "Amazon SES"
-            if ("amazonaws.com" in host.lower() or host.lower().startswith("email-smtp."))
+            if _is_ses_host(host)
             else "SMTP"
         )
         if label.startswith("internal"):
             provider_label = f"{provider_label} (internal)"
         elif label.startswith("external"):
             provider_label = f"{provider_label} (external)"
+        elif label.startswith("cms"):
+            provider_label = f"{provider_label} (cms)"
 
         from_display_name = _from_display_name_for_send(
             sender_role=sender_role,
             contact=contact,
             smtp_lane=smtp_lane,
+        )
+        logger.info(
+            "SMTP send profile=%s host=%s user=%s to=%s",
+            label,
+            host,
+            _redact_smtp_user(str(smtp.get("user") or "")),
+            _redact_email(to_address),
         )
         result = _send_via_smtp_relay(
             to_address,

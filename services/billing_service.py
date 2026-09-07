@@ -21,7 +21,7 @@ from db.pool import db_cursor
 logger = logging.getLogger(__name__)
 
 PREPAID_PACKAGES: dict[str, dict[str, Any]] = {
-    "PREPAID_STARTER": {"name": "Starter", "amount_inr": 750, "scan_capacity": 1000, "validity_days": 5},
+    "PREPAID_STARTER": {"name": "Starter", "amount_inr": 750, "scan_capacity": 1000, "validity_days": 365},
     "PREPAID_GROWTH": {"name": "Growth", "amount_inr": 1500, "scan_capacity": 2000, "validity_days": 10},
     "PREPAID_PRO": {"name": "Pro", "amount_inr": 2300, "scan_capacity": 3000, "validity_days": 25},
     "PREPAID_EVENT_PLUS": {"name": "Event Plus", "amount_inr": 3300, "scan_capacity": 5000, "validity_days": 30},

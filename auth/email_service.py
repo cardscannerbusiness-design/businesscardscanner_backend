@@ -38,12 +38,12 @@ def _normalize_smtp_password(value: str | None) -> str:
 def _smtp_lane_config(lane: str) -> dict[str, str] | None:
     """Build INTERNAL or EXTERNAL SES profile from env."""
     key = "INTERNAL" if lane == "internal" else "EXTERNAL"
-    user = _normalize_env(os.getenv(f"SMTP_{key}_USER")) or (
-        _normalize_env(os.getenv("SMTP_USER")) if key == "INTERNAL" else ""
+    user = _normalize_env(os.getenv(f"SMTP_{key}_USER")) or _normalize_env(
+        os.getenv("SMTP_USER")
     )
-    password = _normalize_smtp_password(os.getenv(f"SMTP_{key}_PASSWORD")) or (
-        _normalize_smtp_password(os.getenv("SMTP_PASSWORD")) if key == "INTERNAL" else ""
-    )
+    password = _normalize_smtp_password(
+        os.getenv(f"SMTP_{key}_PASSWORD")
+    ) or _normalize_smtp_password(os.getenv("SMTP_PASSWORD"))
     if not user or not password:
         return None
     smtp_from = (

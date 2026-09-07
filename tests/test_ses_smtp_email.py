@@ -156,6 +156,68 @@ class TestRoleBasedOutreachTransport(unittest.TestCase):
         self.assertEqual(second["smtp_user"], "AKIAEXTERNALKEY12345")
         self.assertEqual(second["from_address"], "external@example.com")
 
+    def test_gmail_cms_user_does_not_use_ses_host(self) -> None:
+        with patch(
+            "services.admin_runtime_config.runtime_email",
+            return_value={
+                "smtp_user": "tenant@gmail.com",
+                "smtp_password": "gmail-app-password",
+                "smtp_host": "",
+                "smtp_from": "tenant@gmail.com",
+            },
+        ):
+            profile = outreach._cms_smtp_profile()
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        self.assertEqual(profile["host"], "smtp.gmail.com")
+        self.assertEqual(profile["user"], "tenant@gmail.com")
+        self.assertEqual(profile["label"], "cms")
+
+    @patch("services.email_service._send_via_smtp_relay")
+    @patch("services.email_service._check_recipient_mx", return_value=(True, ""))
+    def test_cms_gmail_auth_failure_falls_back_to_ses(
+        self, _mx: MagicMock, relay: MagicMock
+    ) -> None:
+        relay.side_effect = [
+            {
+                "success": False,
+                "recipient_email": "to@example.com",
+                "error": "SMTP (cms) authentication failed: (535, b'Invalid')",
+            },
+            {
+                "success": True,
+                "recipient_email": "to@example.com",
+                "error": None,
+            },
+        ]
+        cms_profile = {
+            "host": "smtp.gmail.com",
+            "port": 587,
+            "user": "tenant@gmail.com",
+            "password": "bad-gmail-password",
+            "from": "tenant@gmail.com",
+            "reply": "tenant@gmail.com",
+            "name": "CMS",
+            "label": "cms",
+        }
+        with patch.object(outreach, "_cms_smtp_profile", return_value=cms_profile):
+            result = outreach._deliver_email(
+                "to@example.com",
+                subject="Hello",
+                plain_body="hi",
+                html_body="<p>hi</p>",
+                sender_role="ADMIN",
+            )
+        self.assertTrue(result["success"])
+        self.assertEqual(result.get("smtp_profile"), "external")
+        self.assertEqual(relay.call_count, 2)
+        self.assertEqual(relay.call_args_list[0].kwargs["smtp_user"], "tenant@gmail.com")
+        self.assertEqual(relay.call_args_list[1].kwargs["smtp_user"], "AKIAEXTERNALKEY12345")
+        self.assertEqual(
+            relay.call_args_list[1].kwargs["smtp_host"],
+            "email-smtp.ap-south-1.amazonaws.com",
+        )
+
 
 class TestRoleBasedAuthEmail(unittest.TestCase):
     @patch("auth.email_service.smtplib.SMTP")
