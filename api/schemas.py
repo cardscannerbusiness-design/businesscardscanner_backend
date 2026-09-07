@@ -89,6 +89,7 @@ class LocalContactBody(BaseModel):
     designation: str = ""
     company: str = ""
     countryCode: str = Field(default="", description="Dial code only, e.g. +91.")
+    countryIso: str = Field(default="", description="ISO 3166-1 alpha-2, e.g. IN.")
     countryName: str = Field(default="", description="Country display name, e.g. India.")
     phone: str = ""
     secondaryPhone: str = ""
@@ -270,6 +271,7 @@ class CreateManagedEventRequest(BaseModel):
     start_date: str | None = None
     end_date: str | None = None
     status: str = Field(default="active", pattern="^(active|inactive|completed)$")
+    days: list[str] | None = None
 
 
 class UpdateManagedEventRequest(BaseModel):

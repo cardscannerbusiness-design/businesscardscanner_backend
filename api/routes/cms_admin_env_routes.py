@@ -10,7 +10,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from auth.audit_service import log_action
-from auth.constants import ROLE_SUPER_ADMIN
+from auth.constants import (
+    AUDIT_SCANS_UNLIMITED_UPDATED,
+    AUDIT_USER_SCAN_ENTITLEMENT_UPDATED,
+    ROLE_SUPER_ADMIN,
+)
 from auth.dependencies import get_current_user, require_role
 from services.admin_env_service import (
     EMAIL_KEYS,
@@ -21,6 +25,10 @@ from services.admin_env_service import (
     list_admin_env_settings as list_admins_with_env,
     list_cms_tenant_users,
     merge_admin_env_for_test,
+    set_admin_channel_locks,
+    set_admin_company_email_display_name,
+    set_cms_tenant_user_scans_unlimited,
+    set_cms_tenant_user_scan_entitlement,
     upsert_admin_env_settings as upsert_admin_env,
 )
 from services.cms_app_access import update_channel_locks
@@ -49,10 +57,21 @@ class AdminEnvUpdateRequest(BaseModel):
     google_sheets: dict[str, Any] | None = Field(default=None)
 
 
-class CmsChannelLocksRequest(BaseModel):
+class ChannelLocksUpdateRequest(BaseModel):
+    """CMS kill-switches: locked=true turns the channel off for that company in the app."""
+
     whatsapp: bool | None = None
     email: bool | None = None
     google_sheets: bool | None = None
+
+
+CmsChannelLocksRequest = ChannelLocksUpdateRequest
+
+
+class EmailDisplayNameUpdateRequest(BaseModel):
+    """From header display name only. Empty string restores the default."""
+
+    email_display_name: str = ""
 
 
 class CmsWhatsAppTestRequest(BaseModel):
@@ -144,7 +163,11 @@ def put_admin_env(admin_id: str, body: AdminEnvUpdateRequest, request: Request):
 
 @router.put(
     "/admin-env/{admin_id}/channel-locks",
-    summary="Lock or unlock main-app channels for this Admin without changing CMS internals",
+    summary="Lock or unlock WhatsApp / Email / Google Sheets for this Admin's company",
+    description=(
+        "When locked=true, that channel is turned off for all users in the Admin's company "
+        "in the main app (send/sync blocked)."
+    ),
     dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
 )
 @router.patch(
@@ -152,18 +175,22 @@ def put_admin_env(admin_id: str, body: AdminEnvUpdateRequest, request: Request):
     summary="Lock or unlock main-app channels for this Admin without changing CMS internals",
     dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
 )
-def patch_admin_channel_locks(admin_id: str, body: CmsChannelLocksRequest, request: Request):
+def put_admin_channel_locks(admin_id: str, body: ChannelLocksUpdateRequest, request: Request):
     actor = get_current_user(request)
+    payload = {
+        key: value
+        for key, value in {
+            "whatsapp": body.whatsapp,
+            "email": body.email,
+            "google_sheets": body.google_sheets,
+        }.items()
+        if value is not None
+    }
+    if not payload:
+        raise HTTPException(status_code=400, detail="Provide at least one channel lock flag.")
     try:
-        update_channel_locks(
-            admin_id,
-            {
-                "whatsapp": body.whatsapp,
-                "email": body.email,
-                "google_sheets": body.google_sheets,
-            },
-        )
-        item = get_admin_env(admin_id)
+        update_channel_locks(admin_id, payload)
+        item = set_admin_channel_locks(admin_id, payload)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -171,9 +198,47 @@ def patch_admin_channel_locks(admin_id: str, body: CmsChannelLocksRequest, reque
         str(actor["id"]),
         "cms_channel_locks_updated",
         ip=request.client.host if request.client else "",
-        new_value={"admin_id": admin_id, **body.model_dump()},
+        new_value={"admin_id": admin_id, "channel_locks": item.get("channel_locks")},
     )
-    return {"success": True, "item": item}
+    return {"success": True, "item": item, "channel_locks": item.get("channel_locks")}
+
+
+@router.put(
+    "/admin-env/{admin_id}/email-display-name",
+    summary="Set the From display name for this Admin's company",
+    description=(
+        "Stores companies.email_display_name only. Does not change From address, "
+        "Reply-To, Receive email, SMTP, or SES credentials."
+    ),
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def put_admin_email_display_name(
+    admin_id: str,
+    body: EmailDisplayNameUpdateRequest,
+    request: Request,
+):
+    actor = get_current_user(request)
+    try:
+        item = set_admin_company_email_display_name(admin_id, body.email_display_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    log_action(
+        str(actor["id"]),
+        "cms_email_display_name_updated",
+        ip=request.client.host if request.client else "",
+        new_value={
+            "admin_id": admin_id,
+            "company_id": item.get("company_id"),
+            "email_display_name": item.get("email_display_name"),
+        },
+    )
+    return {
+        "success": True,
+        "item": item,
+        "company_id": item.get("company_id"),
+        "email_display_name": item.get("email_display_name") or "",
+    }
 
 
 @router.delete(
@@ -182,7 +247,7 @@ def patch_admin_channel_locks(admin_id: str, body: CmsChannelLocksRequest, reque
     description="Deletes the CMS env row so this Admin falls back to global .env.",
     dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
 )
-def delete_one_admin_env(admin_id: str, request: Request):
+def delete_one_admin_env_after_locks(admin_id: str, request: Request):
     actor = get_current_user(request)
     try:
         item = delete_admin_env(admin_id)
@@ -365,9 +430,15 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
         if not is_email_configured():
             raise HTTPException(
                 status_code=400,
-                detail="Email is not configured. Set SMTP_INTERNAL_* and SMTP_EXTERNAL_* in .env, then try again.",
+                detail="Email is not configured. Set Amazon SES SMTP_EXTERNAL_* credentials in CMS or server .env, then try again."
             )
         try:
+            from services.admin_env_service import get_cms_receive_email
+
+            # Data-receive copy → CMS Receive email (Admin/User scan path).
+            # Super Admin scans do not use CMS; they keep own email / SUPERADMIN_EMAIL.
+            receive_cc = get_cms_receive_email(admin_id)
+            admin_item = get_admin_env(admin_id) or {}
             result = await asyncio.to_thread(
                 send_business_thank_you_email,
                 body.contact_email,
@@ -376,8 +447,11 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
                     "fullName": "Test Contact",
                     "email": body.contact_email,
                     "eventName": "CMS Test",
+                    "owner_company_id": admin_item.get("company_id"),
+                    "company_id": admin_item.get("company_id"),
                 },
                 sender_role="ADMIN",
+                cc_addresses=[receive_cc] if receive_cc else None,
             )
         except Exception as exc:
             logger.error("CMS Email test failed for admin=%s: %s", admin_id, exc, exc_info=True)
@@ -386,10 +460,14 @@ async def test_admin_email(admin_id: str, body: CmsEmailTestRequest):
     if not result.get("success"):
         raise HTTPException(status_code=502, detail=result.get("error") or "Email send failed.")
 
+    cc_emails = result.get("cc_emails") or []
     return {
         "success": True,
         "to": result.get("recipient_email") or body.contact_email,
         "subject": result.get("subject"),
+        "cc_emails": cc_emails,
+        "receive_email": cc_emails[0] if cc_emails else receive_cc,
+        "cc_delivery": result.get("cc_delivery") or [],
     }
 
 
@@ -412,6 +490,108 @@ def get_admin_tenant_users(admin_id: str):
         return list_cms_tenant_users(admin_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class CmsUserScansUnlimitedRequest(BaseModel):
+    scans_unlimited: bool = Field(
+        ...,
+        description="When true, this user gets unlimited card scans (Freemium bypass for that user only).",
+    )
+
+
+class CmsUserScanEntitlementRequest(BaseModel):
+    mode: str = Field(
+        ...,
+        description="default = company Freemium pool, unlimited = no cap, custom = per-user numeric limit",
+    )
+    limit: int | None = Field(
+        None,
+        ge=1,
+        le=100_000,
+        description="Required when mode=custom (e.g. 500)",
+    )
+
+
+@router.patch(
+    "/admin-env/{admin_id}/users/{user_id}/scans-unlimited",
+    summary="Grant or revoke unlimited card scans for one tenant user",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def patch_tenant_user_scans_unlimited(
+    admin_id: str,
+    user_id: str,
+    body: CmsUserScansUnlimitedRequest,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        result = set_cms_tenant_user_scans_unlimited(
+            admin_id,
+            user_id,
+            scans_unlimited=body.scans_unlimited,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=status, detail=msg) from exc
+
+    target = result.get("user") or {}
+    log_action(
+        str(user["id"]),
+        AUDIT_SCANS_UNLIMITED_UPDATED,
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        new_value={
+            "cms_admin_id": admin_id,
+            "user_id": user_id,
+            "email": target.get("email"),
+            "scans_unlimited": body.scans_unlimited,
+        },
+    )
+    return result
+
+
+@router.patch(
+    "/admin-env/{admin_id}/users/{user_id}/scan-entitlement",
+    summary="Set per-user scan entitlement (default, unlimited, or custom limit)",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def patch_tenant_user_scan_entitlement(
+    admin_id: str,
+    user_id: str,
+    body: CmsUserScanEntitlementRequest,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        result = set_cms_tenant_user_scan_entitlement(
+            admin_id,
+            user_id,
+            mode=body.mode,
+            limit=body.limit,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=status, detail=msg) from exc
+
+    target = result.get("user") or {}
+    log_action(
+        str(user["id"]),
+        AUDIT_USER_SCAN_ENTITLEMENT_UPDATED,
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        new_value={
+            "cms_admin_id": admin_id,
+            "user_id": user_id,
+            "email": target.get("email"),
+            "mode": body.mode,
+            "limit": body.limit,
+            "scans_unlimited": result.get("scans_unlimited"),
+            "user_card_limit": result.get("user_card_limit"),
+        },
+    )
+    return result
 
 
 @router.post(

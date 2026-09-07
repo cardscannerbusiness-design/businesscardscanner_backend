@@ -9,6 +9,7 @@ os.environ.setdefault("JWT_SECRET_KEY", "test-secret-for-admin-registration-unit
 
 from auth.registration_service import (  # noqa: E402
     MSG_PENDING_APPROVAL,
+    MSG_SIGNUP_CREATED,
     RegistrationError,
     _split_name,
     create_admin_registration,
@@ -65,6 +66,10 @@ class TestAdminRegistrationValidation(unittest.TestCase):
 
     def test_pending_message(self) -> None:
         self.assertIn("pending SuperAdmin approval", MSG_PENDING_APPROVAL)
+
+    def test_signup_created_message(self) -> None:
+        self.assertIn("You can now sign in", MSG_SIGNUP_CREATED)
+        self.assertNotIn("pending", MSG_SIGNUP_CREATED.lower())
 
     def test_user_self_registration_closed(self) -> None:
         from auth.registration_service import create_user_registration

@@ -17,6 +17,7 @@ from services.entitlement_service import (
 )
 from services.storage_service import resolve_company_id_for_user
 from services.whatsapp_service import schedule_whatsapp_for_contact
+from utils.international_phone import apply_international_phone_to_contact
 
 from api.schemas import LocalContactBody
 
@@ -40,10 +41,15 @@ def require_outreach_entitlement(
     initial_save: bool = False,
     channel: str | None = None,
 ) -> None:
-    """HTTP 403 when WhatsApp/Email are frozen for this company."""
+    """HTTP 403 when WhatsApp/Email are frozen for this company/user."""
     company_id = resolve_company_id_for_user(user)
     try:
-        assert_can_send_outreach(company_id, initial_save=initial_save, channel=channel)
+        assert_can_send_outreach(
+            company_id,
+            initial_save=initial_save,
+            channel=channel,
+            user=user,
+        )
     except OutreachFrozenError as exc:
         raise HTTPException(status_code=403, detail=exc.to_response()) from exc
 
@@ -111,6 +117,7 @@ def body_to_outreach_contact(body: LocalContactBody) -> dict[str, Any]:
         "emails": emails,
         "phone": body.phone,
         "countryCode": body.countryCode,
+        "countryIso": body.countryIso,
         "countryName": body.countryName,
         "phones": phones,
         "website": body.website,
@@ -237,7 +244,7 @@ async def _schedule_outreach_for_contact_inner(
         "skip_if_already_sent": not force_resend,
     }
     company_id = resolve_company_id_for_user(user)
-    outreach_ok = can_send_outreach(company_id, initial_save=initial_save)
+    outreach_ok = can_send_outreach(company_id, initial_save=initial_save, user=user)
     if company_id:
         locks = get_entitlement(company_id).get("cms_channel_locks") or {}
         if locks.get("whatsapp"):
@@ -284,12 +291,18 @@ async def _schedule_outreach_for_contact_inner(
             log_context,
         )
 
+    whatsapp_contact = apply_international_phone_to_contact(contact) if not skip_whatsapp else contact
+
     tasks: list[tuple[str, Any]] = []
     if not skip_whatsapp:
         tasks.append(
             (
                 "whatsapp",
-                schedule_whatsapp_for_contact(contact, **outreach_kwargs, log_context=log_context),
+                schedule_whatsapp_for_contact(
+                    whatsapp_contact,
+                    **outreach_kwargs,
+                    log_context=log_context,
+                ),
             )
         )
     if not skip_email:
@@ -350,6 +363,7 @@ def payload_to_outreach_contact(data: dict[str, Any]) -> dict[str, Any]:
         "emails": [e for e in (email, str(data.get("secondaryEmail") or "").strip()) if e],
         "phone": phone,
         "countryCode": str(data.get("countryCode") or "").strip(),
+        "countryIso": str(data.get("countryIso") or "").strip(),
         "countryName": str(data.get("countryName") or "").strip(),
         "phones": [p for p in (phone, str(data.get("secondaryPhone") or "").strip()) if p],
         "website": website or secondary_website,

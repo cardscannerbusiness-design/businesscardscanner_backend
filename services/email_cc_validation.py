@@ -33,10 +33,15 @@ def validate_cc_address_list(
     cc_addresses: list[str] | None,
     *,
     to_address: str,
+    allow_same_as_to: bool = False,
 ) -> CcValidationResult:
     """
-    Validate CC recipients. Invalid entries are skipped; valid ones are deduplicated.
-    CC must not duplicate the primary To address.
+    Validate CC / receive-notification recipients.
+    Invalid entries are skipped; valid ones are deduplicated.
+
+    When allow_same_as_to is False (SMTP Cc: header), addresses matching To are rejected.
+    When True (separate scanned-details email), same-as-To is allowed so Receive still
+    gets the data copy when contact email equals CMS Receive email.
     """
     result = CcValidationResult()
     if not cc_addresses:
@@ -59,7 +64,7 @@ def validate_cc_address_list(
 
         email = str(validated_or_error).strip()
         key = email.lower()
-        if key == to_normalized:
+        if key == to_normalized and not allow_same_as_to:
             result.invalid.append(
                 {"address": candidate, "reason": "CC address cannot match the To recipient."},
             )
@@ -80,6 +85,11 @@ def normalize_cc_addresses(
     cc_addresses: list[str] | None,
     *,
     to_address: str,
+    allow_same_as_to: bool = False,
 ) -> list[str]:
     """Return only valid, deduplicated CC emails (backward-compatible helper)."""
-    return validate_cc_address_list(cc_addresses, to_address=to_address).valid
+    return validate_cc_address_list(
+        cc_addresses,
+        to_address=to_address,
+        allow_same_as_to=allow_same_as_to,
+    ).valid

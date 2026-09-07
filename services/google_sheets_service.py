@@ -203,6 +203,31 @@ def is_sheets_configured() -> bool:
     return _resolve_service_account_path(raw) is not None
 
 
+def _event_sheet_sync_available() -> bool:
+    """Event-workbook append can use OAuth (how workbooks are created) or a service account."""
+    from services import google_oauth_service as oauth
+
+    return oauth.is_oauth_configured() or is_sheets_configured()
+
+
+def _event_sheet_auth_headers(contact: dict[str, Any]) -> dict[str, str]:
+    """Auth for writing to the contact's event workbook. Prefers OAuth; same spreadsheet either way."""
+    from services import google_oauth_service as oauth
+
+    company_id = str(contact.get("owner_company_id") or contact.get("company_id") or "").strip() or None
+    user_id = str(contact.get("created_by_user_id") or "").strip() or None
+    if oauth.is_oauth_configured():
+        try:
+            access = oauth._oauth_access_token(company_id=company_id, user_id=user_id)
+            return oauth.oauth_auth_headers(access)
+        except Exception as exc:
+            logger.info("[GSHEET] OAuth token unavailable (%s)", exc)
+    auth = _auth_headers()
+    if not auth:
+        raise RuntimeError("Google Sheets auth failed (no OAuth or service-account token).")
+    return auth
+
+
 def probe_spreadsheet(*, spreadsheet_id: str, worksheet: str | None = None) -> dict[str, Any]:
     """Read-only health check used by CMS. Never writes dummy contact rows."""
     sheet_id = (spreadsheet_id or "").strip() or _sheet_id()
@@ -484,6 +509,18 @@ def _values_append(
         "?valueInputOption=RAW&insertDataOption=INSERT_ROWS"
     )
     response = requests.post(url, headers=headers, json={"values": values}, timeout=20)
+    updated_range = ""
+    try:
+        payload = response.json()
+        updated_range = str((payload.get("updates") or {}).get("updatedRange") or "")
+    except Exception:
+        payload = {}
+    logger.info(
+        "[GSHEET] append API status=%s updatedRange=%s body=%s",
+        response.status_code,
+        updated_range or "-",
+        (response.text or "")[:400],
+    )
     response.raise_for_status()
 
 
@@ -1012,51 +1049,54 @@ def fire_ensure_company_sheet(company_id: str) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _load_managed_event_spreadsheet_id(event_id: str) -> str | None:
+    """Return the workbook id stored on managed_events for this event id."""
+    from db.pool import db_cursor
+
+    eid = str(event_id or "").strip()
+    if not eid:
+        return None
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT spreadsheet_id, google_sheet_id
+            FROM managed_events
+            WHERE id = %s AND deleted_at IS NULL
+            """,
+            (eid,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return (
+        str(row.get("spreadsheet_id") or "").strip()
+        or str(row.get("google_sheet_id") or "").strip()
+        or None
+    )
+
+
 def _resolve_workbook_id(
     headers: dict[str, str],
     contact: dict[str, Any],
     event_day: str,
 ) -> str:
-    """Resolve the role-based workbook for this contact (company or Super Admin)."""
-    role = str(contact.get("created_by_role") or "").strip().upper()
-    company_id = str(
-        contact.get("owner_company_id") or contact.get("company_id") or ""
-    ).strip()
-
-    if role == "SUPER_ADMIN" or (not company_id and role not in ("ADMIN", "USER")):
-        try:
-            return ensure_superadmin_sheet(first_sheet=event_day)
-        except Exception as exc:
-            fallback = _sheet_id()
-            if fallback:
-                logger.warning(
-                    "Super Admin sheet ensure failed (%s); using GOOGLE_SHEET_ID.",
-                    exc,
-                )
-                return fallback
-            raise
-
-    if company_id:
-        try:
-            return ensure_company_sheet(company_id, first_sheet=event_day)
-        except Exception as exc:
-            fallback = _sheet_id()
-            if fallback:
-                logger.warning(
-                    "Company sheet ensure failed for %s (%s); using GOOGLE_SHEET_ID.",
-                    company_id,
-                    exc,
-                )
-                return fallback
-            raise
-
-    fallback = _sheet_id()
-    if fallback:
-        return fallback
-    raise RuntimeError(
-        "Cannot resolve Google Sheet: contact has no company and "
-        "GOOGLE_SHEET_ID is not configured."
-    )
+    """Resolve the event workbook from contacts.eventId → managed_events.id."""
+    del headers, event_day
+    event_id = str(contact.get("eventId") or contact.get("event_id") or "").strip()
+    logger.info("[GSHEET] event_id=%s", event_id or "-")
+    if not event_id:
+        logger.info("[GSHEET] spreadsheet_id=-")
+        raise RuntimeError(
+            "Cannot resolve Google Sheet: contact has no eventId "
+            "(contacts.eventId → managed_events.id)."
+        )
+    spreadsheet_id = _load_managed_event_spreadsheet_id(event_id)
+    logger.info("[GSHEET] spreadsheet_id=%s", spreadsheet_id or "-")
+    if not spreadsheet_id:
+        raise RuntimeError(
+            "Cannot resolve Google Sheet: managed event has no spreadsheet_id."
+        )
+    return spreadsheet_id
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1064,9 +1104,8 @@ def _resolve_workbook_id(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _upsert_row(contact: dict[str, Any], extras: dict[str, Any] | None) -> None:
-    auth = _auth_headers()
-    if not auth:
-        raise RuntimeError("Google Sheets auth failed (no access token).")
+    contact_id = str(contact.get("id") or "")
+    auth = _event_sheet_auth_headers(contact)
 
     event_day = _sanitize_sheet_title(
         str(contact.get("eventDay") or "").strip() or _sheet_name(),
@@ -1075,12 +1114,9 @@ def _upsert_row(contact: dict[str, Any], extras: dict[str, Any] | None) -> None:
 
     spreadsheet_id = _resolve_workbook_id(auth, contact, event_day)
     worksheet = _ensure_worksheet(auth, spreadsheet_id, event_day)
+    logger.info("[GSHEET] target_tab=%s", worksheet)
     _ensure_header_row(auth, spreadsheet_id, worksheet)
 
-    contact_id = str(contact.get("id") or "")
-    company_label = str(
-        contact.get("owner_company_id") or contact.get("company_id") or spreadsheet_id
-    )
     row = contact_to_row(contact, extras)
     existing_row = _find_row_by_contact_id(auth, spreadsheet_id, worksheet, contact_id)
     if existing_row:
@@ -1090,21 +1126,10 @@ def _upsert_row(contact: dict[str, Any], extras: dict[str, Any] | None) -> None:
             f"'{worksheet}'!A{existing_row}:{_LAST_COL}{existing_row}",
             [row],
         )
-        logger.info(
-            "Google Sheets: updated row %s for contact %s in %r / %r.",
-            existing_row,
-            contact_id,
-            company_label,
-            worksheet,
-        )
+        logger.info("[GSHEET] append successful")
     else:
         _values_append(auth, spreadsheet_id, f"'{worksheet}'!A:{_LAST_COL}", [row])
-        logger.info(
-            "Google Sheets: appended row for contact %s in %r / %r.",
-            contact_id,
-            company_label,
-            worksheet,
-        )
+        logger.info("[GSHEET] append successful")
 
 
 def sync_contact_to_sheet(
@@ -1115,7 +1140,8 @@ def sync_contact_to_sheet(
 
     Never raises — Sheets is a secondary layer and must not affect saves.
     """
-    if not is_sheets_configured():
+    if not _event_sheet_sync_available():
+        logger.info("[GSHEET] sync_contact_to_sheet skipped: Google Drive/Sheets not configured")
         logger.debug("Google Sheets sync skipped: not configured.")
         return False
 
@@ -1138,6 +1164,7 @@ def sync_contact_to_sheet(
             )
 
     contact_id = str(contact.get("id") or "")
+    logger.info("[GSHEET] sync_contact_to_sheet contact_id=%s", contact_id or "-")
     last_error: Exception | None = None
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
@@ -1147,9 +1174,11 @@ def sync_contact_to_sheet(
             return True
         except Exception as exc:
             last_error = exc
+            logger.info("[GSHEET] append error (attempt %s/%s): %s", attempt, _MAX_ATTEMPTS, exc)
             if attempt < _MAX_ATTEMPTS:
                 time.sleep(_RETRY_DELAYS[min(attempt - 1, len(_RETRY_DELAYS) - 1)])
 
+    logger.info("[GSHEET] append error: %s", last_error)
     logger.error(
         "Google Sheets sync failed for contact %s after %s attempts: %s "
         "(contact is safe in PostgreSQL; queued for retry on next sync).",
@@ -1164,13 +1193,24 @@ def sync_contact_to_sheet(
 
 def sync_contact_by_id(contact_id: str, extras: dict[str, Any] | None = None) -> bool:
     """Fetch the committed contact from PostgreSQL and upsert it into the sheet."""
-    if not is_sheets_configured():
+    if not _event_sheet_sync_available():
+        logger.info("[GSHEET] sync skipped: Google Drive/Sheets not configured")
         return False
     from services import contact_storage as storage
+    from services.admin_env_service import channel_is_locked
 
     contact = storage.get_contact(contact_id)
     if not contact:
+        logger.info("[GSHEET] contact_id=%s not found in PostgreSQL", contact_id)
         logger.warning("Google Sheets sync skipped: contact %s not found in PostgreSQL.", contact_id)
+        return False
+
+    company_id = str(contact.get("owner_company_id") or contact.get("company_id") or "").strip() or None
+    if channel_is_locked(company_id, "google_sheets"):
+        logger.info(
+            "[GSHEET] sync skipped: CMS locked Google Sheets for company_id=%s",
+            company_id or "-",
+        )
         return False
 
     ok = sync_contact_to_sheet(contact, extras)
@@ -1200,26 +1240,19 @@ _background_tasks: set[asyncio.Task] = set()
 
 
 def fire_sheets_sync(contact_id: str, extras: dict[str, Any] | None = None) -> None:
-    """Fire-and-forget sheet sync after a successful PostgreSQL commit.
+    """Sheet sync after a successful PostgreSQL commit.
 
-    Runs in a worker thread via asyncio so the API response is never blocked.
+    Runs in a worker thread so the API response is never blocked and the work
+    is not cancelled when the request task finishes.
     """
-    if not is_sheets_configured() or not contact_id:
+    logger.info("[GSHEET] sync triggered contact_id=%s", contact_id or "-")
+    if not contact_id:
+        logger.info("[GSHEET] sync skipped: empty contact_id")
+        return
+    if not _event_sheet_sync_available():
+        logger.info("[GSHEET] sync skipped: Google Drive/Sheets not configured")
         return
 
-    async def _run() -> None:
-        try:
-            await asyncio.to_thread(sync_contact_by_id, contact_id, extras)
-        except Exception as exc:
-            logger.error("Google Sheets background sync crashed for %s: %s", contact_id, exc)
-
-    try:
-        asyncio.get_running_loop()
-        task = asyncio.create_task(_run())
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
-    except RuntimeError:
-        # No running loop (sync context / tests) — run inline but still guarded.
-        threading.Thread(
-            target=sync_contact_by_id, args=(contact_id, extras), daemon=True
-        ).start()
+    threading.Thread(
+        target=sync_contact_by_id, args=(contact_id, extras), daemon=True
+    ).start()

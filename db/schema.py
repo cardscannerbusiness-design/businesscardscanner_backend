@@ -88,21 +88,36 @@ SCHEMA_STATEMENTS: list[str] = [
         updated_by             UUID,
         created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
         updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-        deleted_at             TIMESTAMPTZ
+        deleted_at             TIMESTAMPTZ,
+        scans_unlimited        BOOLEAN      NOT NULL DEFAULT FALSE
     );
     """,
     # Profile fields for invited admins/users (idempotent for existing DBs)
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS designation VARCHAR(255) NOT NULL DEFAULT '';",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(255) NOT NULL DEFAULT '';",
+    # Per-user card-scan exception. Default FALSE; never grant via startup.
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS scans_unlimited BOOLEAN NOT NULL DEFAULT FALSE;",
+    # Per-user numeric cap (NULL = inherit company card_limit). Unlimited uses scans_unlimited.
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS user_card_limit INTEGER;",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS user_cards_used INTEGER NOT NULL DEFAULT 0;",
+    f"""
+    UPDATE users
+    SET user_card_limit = {int(DEFAULT_FREEMIUM_CARD_LIMIT)}
+    WHERE user_card_limit IS NULL
+      AND COALESCE(scans_unlimited, FALSE) = FALSE;
+    """,
     # Role-based Google Sheets: one workbook per company (Admin); Super Admin sheet on users
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
+    # CMS "Email Display Name" — From header only; mailbox/SMTP unchanged
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS email_display_name VARCHAR(255) NOT NULL DEFAULT '';",
     # Company storage quota (defaults from StorageService constants)
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS plan_name VARCHAR(64) NOT NULL DEFAULT '{DEFAULT_PLAN_NAME}';",
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS storage_limit_bytes BIGINT NOT NULL DEFAULT {int(DEFAULT_STORAGE_LIMIT_BYTES)};",
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS used_storage_bytes BIGINT NOT NULL DEFAULT 0;",
-    # Freemium card allowance (default = 25). Existing DBs that still have the
-    # original test default of 2 are raised below; SuperAdmin is not billed via
-    # companies.card_limit (role check in resolve_company_id_for_user / upload).
+    # Freemium card allowance (default = 10). Existing DBs that still have the
+    # original test default of 2 or the previous 25-card default are updated
+    # below; SuperAdmin is not billed via companies.card_limit (role check in
+    # resolve_company_id_for_user / upload).
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS card_limit INTEGER NOT NULL DEFAULT {int(DEFAULT_FREEMIUM_CARD_LIMIT)};",
     f"ALTER TABLE companies ALTER COLUMN card_limit SET DEFAULT {int(DEFAULT_FREEMIUM_CARD_LIMIT)};",
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS cards_used INTEGER NOT NULL DEFAULT 0;",
@@ -121,8 +136,8 @@ SCHEMA_STATEMENTS: list[str] = [
             ELSE NULL
         END
     WHERE UPPER(COALESCE(plan_name, '{DEFAULT_PLAN_NAME}')) = 'FREEMIUM'
-      AND card_limit = 2
-      AND {int(DEFAULT_FREEMIUM_CARD_LIMIT)} <> 2;
+      AND card_limit IN (2, 25)
+      AND card_limit <> {int(DEFAULT_FREEMIUM_CARD_LIMIT)};
     """,
     """
     UPDATE companies
@@ -273,6 +288,19 @@ SCHEMA_STATEMENTS: list[str] = [
         ON managed_events (LOWER(name))
         WHERE deleted_at IS NULL AND company_id IS NULL;
     """,
+    "ALTER TABLE managed_events ADD COLUMN IF NOT EXISTS spreadsheet_id VARCHAR(128);",
+    "ALTER TABLE managed_events ADD COLUMN IF NOT EXISTS spreadsheet_url TEXT;",
+    "ALTER TABLE managed_events ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
+    "ALTER TABLE managed_events ADD COLUMN IF NOT EXISTS google_sheet_url TEXT;",
+    """
+    CREATE TABLE IF NOT EXISTS event_days (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_id    UUID NOT NULL REFERENCES managed_events(id) ON DELETE CASCADE,
+        name        VARCHAR(100) NOT NULL,
+        sort_order  INTEGER NOT NULL DEFAULT 0
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_event_days_event ON event_days(event_id, sort_order);",
     # ── Indexes ────────────────────────────────────────────────────────────
     "CREATE INDEX IF NOT EXISTS idx_users_email        ON users(email);",
     "CREATE INDEX IF NOT EXISTS idx_users_username     ON users(username);",
@@ -503,6 +531,8 @@ SCHEMA_STATEMENTS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_admin_env_settings_admin ON admin_env_settings(admin_user_id);",
     "ALTER TABLE admin_env_settings ADD COLUMN IF NOT EXISTS templates JSONB NOT NULL DEFAULT '{}'::jsonb;",
     "ALTER TABLE admin_env_settings ADD COLUMN IF NOT EXISTS google_sheets JSONB NOT NULL DEFAULT '{}'::jsonb;",
+    # CMS Super Admin kill-switches: locked=true turns the channel off for that company in the app
+    "ALTER TABLE admin_env_settings ADD COLUMN IF NOT EXISTS channel_locks JSONB NOT NULL DEFAULT '{\"whatsapp\": true, \"email\": false, \"google_sheets\": false}'::jsonb;",
     # ── Admin self-registration requests (SuperAdmin approve/reject) ────────
     """
     CREATE TABLE IF NOT EXISTS admin_registration_requests (

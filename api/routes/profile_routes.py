@@ -293,3 +293,59 @@ def delete_own_account(body: DeleteAccountRequest, request: Request):
     )
     logger.info("User self-deleted account %s", user_id)
     return {"success": True, "message": "Account deleted."}
+
+
+@router.get(
+    "/email-template",
+    summary="Get assigned email template for authenticated user",
+    description="Read-only endpoint returning the email template assigned to the current user's admin.",
+)
+def get_assigned_email_template(request: Request):
+    """Return the email template assigned to the current user's admin.
+
+    Strictly read-only; does not send emails or modify configuration.
+    Resolves the admin context securely from the authenticated JWT session.
+    Reuses existing get_admin_env_settings() to match the CMS Templates page.
+    """
+    user = get_current_user(request)
+
+    from services.admin_runtime_config import resolve_owner_admin_id
+    from services.admin_env_service import get_admin_env_settings
+
+    admin_id = resolve_owner_admin_id(user)
+    if not admin_id:
+        return {
+            "assigned": False,
+            "email_subject": "",
+            "email_body": "",
+            "token_map": {},
+        }
+
+    admin_settings = get_admin_env_settings(admin_id)
+    if not admin_settings or not admin_settings.get("templates"):
+        return {
+            "assigned": False,
+            "email_subject": "",
+            "email_body": "",
+            "token_map": {},
+        }
+
+    templates = admin_settings["templates"]
+    subject = str(templates.get("email_subject") or "").strip()
+    body = str(templates.get("email_body") or "").strip()
+
+    raw_token_map = templates.get("token_map")
+    token_map: dict[str, str] = {}
+    if isinstance(raw_token_map, dict):
+        token_map = {str(k): str(v) for k, v in raw_token_map.items() if str(k).strip()}
+
+    has_template = bool(subject or body)
+
+    return {
+        "assigned": has_template,
+        "email_subject": subject,
+        "email_body": body,
+        "token_map": token_map,
+    }
+
+

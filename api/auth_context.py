@@ -91,9 +91,11 @@ def get_receive_email_from_request(request: Request) -> str | None:
     Who gets the scanned-details (receive) email for this scan.
 
     Hierarchy:
-      USER  → their Admin's email (users.admin_id)
-      ADMIN → SUPERADMIN_EMAIL from .env
-      SUPER_ADMIN → their own email (fallback SUPERADMIN_EMAIL)
+      SUPER_ADMIN → own login email, else SUPERADMIN_EMAIL (unchanged; never CMS)
+      USER        → CMS Receive email for their Admin (required source when set),
+                    else Admin account email, else SUPERADMIN_EMAIL
+      ADMIN       → CMS Receive email for this Admin (required source when set),
+                    else Admin account email, else SUPERADMIN_EMAIL
     """
     user = get_request_app_user(request)
     if not user:
@@ -101,23 +103,39 @@ def get_receive_email_from_request(request: Request) -> str | None:
 
     role = str(user.get("role") or "").strip().upper()
 
+    # Super Admin: previous default only — never CMS Receive email.
+    if role == ROLE_SUPER_ADMIN:
+        own = str(user.get("email") or "").strip().lower()
+        return own or _superadmin_env_email()
+
+    from services.admin_env_service import get_cms_receive_email
+
     if role == ROLE_USER:
         admin_id = str(user.get("admin_id") or "").strip()
         if admin_id:
+            # CMS Receive email is the source of truth for this company (not hardcoded).
+            cms_receive = get_cms_receive_email(admin_id)
+            if cms_receive:
+                return cms_receive.lower()
             admin_email = _lookup_user_email(admin_id)
             if admin_email:
                 return admin_email
         logger.warning(
-            "User %s has no Admin email; falling back to SUPERADMIN_EMAIL",
+            "User %s has no CMS/Admin receive email; falling back to SUPERADMIN_EMAIL",
             user.get("id"),
         )
         return _superadmin_env_email()
 
     if role == ROLE_ADMIN:
-        return _superadmin_env_email()
-
-    if role == ROLE_SUPER_ADMIN:
+        admin_id = str(user.get("id") or "").strip()
+        # CMS Receive email is the source of truth for this Admin's company.
+        cms_receive = get_cms_receive_email(admin_id) if admin_id else None
+        if cms_receive:
+            return cms_receive.lower()
+        # No CMS value yet → Admin's own account email (not a hardcoded inbox).
         own = str(user.get("email") or "").strip().lower()
-        return own or _superadmin_env_email()
+        if own:
+            return own
+        return _superadmin_env_email()
 
     return _superadmin_env_email()

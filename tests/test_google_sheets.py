@@ -72,7 +72,10 @@ class TestRowMapping(unittest.TestCase):
 
 class TestConfiguration(unittest.TestCase):
     def test_not_configured_skips_without_error(self) -> None:
-        with patch.dict("os.environ", {"GOOGLE_SHEET_ID": "", "GOOGLE_SERVICE_ACCOUNT_JSON": ""}):
+        with (
+            patch.dict("os.environ", {"GOOGLE_SHEET_ID": "", "GOOGLE_SERVICE_ACCOUNT_JSON": ""}),
+            patch("services.google_oauth_service.is_oauth_configured", return_value=False),
+        ):
             self.assertFalse(sheets.is_sheets_configured())
             self.assertFalse(sheets.sync_contact_to_sheet(CONTACT, EXTRAS))
 
@@ -91,7 +94,7 @@ class TestUpsert(unittest.TestCase):
     def test_appends_when_contact_id_not_found(self) -> None:
         calls: dict[str, int] = {"append": 0, "update": 0}
         with (
-            patch.object(sheets, "_auth_headers", return_value={"Authorization": "Bearer x"}),
+            patch.object(sheets, "_event_sheet_auth_headers", return_value={"Authorization": "Bearer x"}),
             patch.object(sheets, "_resolve_workbook_id", return_value="sheet123"),
             patch.object(sheets, "_ensure_worksheet", return_value="Day 1"),
             patch.object(sheets, "_ensure_header_row", return_value=None),
@@ -114,7 +117,7 @@ class TestUpsert(unittest.TestCase):
     def test_updates_existing_row_no_duplicate(self) -> None:
         calls: dict[str, list] = {"append": [], "update": []}
         with (
-            patch.object(sheets, "_auth_headers", return_value={"Authorization": "Bearer x"}),
+            patch.object(sheets, "_event_sheet_auth_headers", return_value={"Authorization": "Bearer x"}),
             patch.object(sheets, "_resolve_workbook_id", return_value="sheet123"),
             patch.object(sheets, "_ensure_worksheet", return_value="Day 1"),
             patch.object(sheets, "_ensure_header_row", return_value=None),
@@ -150,33 +153,33 @@ class TestRoleBasedRouting(unittest.TestCase):
         self.addCleanup(self.env.stop)
         sheets._workbook_cache.clear()
 
-    def test_admin_or_user_routes_to_company_sheet(self) -> None:
-        contact = {**CONTACT, "created_by_role": "USER"}
+    def test_contact_routes_to_event_spreadsheet(self) -> None:
+        contact = {**CONTACT, "eventId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}
         with (
-            patch.object(sheets, "_auth_headers", return_value={"Authorization": "Bearer x"}),
-            patch.object(sheets, "ensure_company_sheet", return_value="company-sheet") as ensure_co,
+            patch.object(
+                sheets,
+                "_load_managed_event_spreadsheet_id",
+                return_value="event-sheet-id",
+            ) as load_event,
+            patch.object(sheets, "ensure_company_sheet") as ensure_co,
             patch.object(sheets, "ensure_superadmin_sheet") as ensure_sa,
         ):
             sid = sheets._resolve_workbook_id({"Authorization": "Bearer x"}, contact, "Day 1")
-        self.assertEqual(sid, "company-sheet")
-        ensure_co.assert_called_once_with(CONTACT["owner_company_id"], first_sheet="Day 1")
+        self.assertEqual(sid, "event-sheet-id")
+        load_event.assert_called_once_with("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        ensure_co.assert_not_called()
         ensure_sa.assert_not_called()
 
-    def test_super_admin_routes_to_superadmin_sheet(self) -> None:
-        contact = {
-            **CONTACT,
-            "created_by_role": "SUPER_ADMIN",
-            "owner_company_id": "",
-            "company_id": "",
-        }
+    def test_missing_event_id_does_not_use_company_fallback(self) -> None:
+        contact = {**CONTACT, "created_by_role": "SUPER_ADMIN", "owner_company_id": ""}
         with (
-            patch.object(sheets, "ensure_superadmin_sheet", return_value="sa-sheet") as ensure_sa,
             patch.object(sheets, "ensure_company_sheet") as ensure_co,
+            patch.object(sheets, "ensure_superadmin_sheet") as ensure_sa,
         ):
-            sid = sheets._resolve_workbook_id({"Authorization": "Bearer x"}, contact, "Day 1")
-        self.assertEqual(sid, "sa-sheet")
-        ensure_sa.assert_called_once_with(first_sheet="Day 1")
+            with self.assertRaises(RuntimeError):
+                sheets._resolve_workbook_id({"Authorization": "Bearer x"}, contact, "Day 1")
         ensure_co.assert_not_called()
+        ensure_sa.assert_not_called()
 
 
 class TestEnsureCompanySheet(unittest.TestCase):
