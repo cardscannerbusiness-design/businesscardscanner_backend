@@ -32,6 +32,9 @@ WHATSAPP_KEYS = (
     "app_secret",
     "verify_token",
     "template_name",
+    "business_card_template_name",
+    "card_received_template_name",
+    "scan_template_name",
     "template_language_code",
     "enabled",
 )
@@ -54,6 +57,7 @@ TEMPLATE_KEYS = (
     "whatsapp_header",
     "whatsapp_header_media_url",
     "whatsapp_header_media_filename",
+    "whatsapp_header_media",
     "whatsapp_body",
     "whatsapp_footer",
     "whatsapp_button_text",
@@ -65,6 +69,55 @@ TEMPLATE_KEYS = (
     "preview_website",
     "preview_signoff",
 )
+
+_HEADER_FORMATS = frozenset({"NONE", "TEXT", "IMAGE", "VIDEO", "DOCUMENT"})
+
+
+def _normalize_header_media_item(raw: Any) -> dict[str, str]:
+    data = raw if isinstance(raw, dict) else {}
+    fmt = str(data.get("format") or data.get("whatsapp_header_format") or "NONE").strip().upper()
+    if fmt not in _HEADER_FORMATS:
+        fmt = "NONE"
+    return {
+        "format": fmt,
+        "text": str(data.get("text") or data.get("whatsapp_header") or "").strip(),
+        "media_url": str(
+            data.get("media_url") or data.get("whatsapp_header_media_url") or ""
+        ).strip(),
+        "media_filename": str(
+            data.get("media_filename")
+            or data.get("whatsapp_header_media_filename")
+            or "brochure.pdf"
+        ).strip()
+        or "brochure.pdf",
+    }
+
+
+def _sync_template_header_media(tpl: dict[str, Any]) -> dict[str, Any]:
+    """Keep whatsapp_header_media[] and legacy single-header fields aligned."""
+    out = dict(tpl or {})
+    raw_list = out.get("whatsapp_header_media")
+    items: list[dict[str, str]] = []
+    if isinstance(raw_list, list) and raw_list:
+        items = [_normalize_header_media_item(item) for item in raw_list]
+    else:
+        items = [
+            _normalize_header_media_item(
+                {
+                    "format": out.get("whatsapp_header_format") or "NONE",
+                    "text": out.get("whatsapp_header") or "",
+                    "media_url": out.get("whatsapp_header_media_url") or "",
+                    "media_filename": out.get("whatsapp_header_media_filename") or "brochure.pdf",
+                }
+            )
+        ]
+    primary = items[0]
+    out["whatsapp_header_media"] = items
+    out["whatsapp_header_format"] = primary["format"]
+    out["whatsapp_header"] = primary["text"]
+    out["whatsapp_header_media_url"] = primary["media_url"]
+    out["whatsapp_header_media_filename"] = primary["media_filename"]
+    return out
 
 GOOGLE_SHEETS_KEYS = (
     "google_sheet_id",
@@ -203,6 +256,32 @@ def _apply_legacy(raw: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any
     return out
 
 
+def _sync_whatsapp_template_names(wa: dict[str, Any]) -> dict[str, Any]:
+    """Keep CMS template fields and runtime template_name in sync.
+
+    CMS UI edits business_card_template_name / card_received_template_name /
+    scan_template_name. Runtime + Meta sends use template_name.
+    """
+    out = dict(wa or {})
+    card_received = str(out.get("card_received_template_name") or "").strip()
+    business_card = str(out.get("business_card_template_name") or "").strip()
+    scan = str(out.get("scan_template_name") or "").strip()
+    template_name = str(out.get("template_name") or "").strip()
+
+    preferred = card_received or business_card or scan or template_name
+    if preferred:
+        out["template_name"] = preferred
+        # Expose the active name on all CMS fields that were left blank so the UI
+        # and _active_whatsapp_template_name see the same value.
+        if not card_received:
+            out["card_received_template_name"] = preferred
+        if not business_card:
+            out["business_card_template_name"] = preferred
+        if not scan:
+            out["scan_template_name"] = preferred
+    return out
+
+
 def _empty_whatsapp() -> dict[str, Any]:
     return {k: (False if k == "enabled" else "") for k in WHATSAPP_KEYS}
 
@@ -226,6 +305,14 @@ def _empty_templates() -> dict[str, Any]:
         "whatsapp_header": "CardScan Message",
         "whatsapp_header_media_url": "",
         "whatsapp_header_media_filename": "brochure.pdf",
+        "whatsapp_header_media": [
+            {
+                "format": "NONE",
+                "text": "CardScan Message",
+                "media_url": "",
+                "media_filename": "brochure.pdf",
+            }
+        ],
         "whatsapp_body": (
             "Hello {{1}},\n"
             "Thank you for sharing your business card details.\n"
@@ -254,22 +341,28 @@ def _merge_templates(
 
     base = _empty_templates()
     for key in TEMPLATE_KEYS:
+        if key == "whatsapp_header_media":
+            continue
         if key in existing and existing[key] is not None and str(existing[key]) != "":
             base[key] = str(existing[key])
     if "token_map" in existing:
         base["token_map"] = normalize_token_map(existing.get("token_map"))
+    if "whatsapp_header_media" in existing:
+        base["whatsapp_header_media"] = existing.get("whatsapp_header_media")
 
-    if not incoming:
-        return base
+    if incoming:
+        for key in TEMPLATE_KEYS:
+            if key == "whatsapp_header_media":
+                continue
+            if key not in incoming or incoming[key] is None:
+                continue
+            base[key] = str(incoming[key])
+        if "token_map" in incoming:
+            base["token_map"] = normalize_token_map(incoming.get("token_map"))
+        if "whatsapp_header_media" in incoming:
+            base["whatsapp_header_media"] = incoming.get("whatsapp_header_media")
 
-    for key in TEMPLATE_KEYS:
-        if key not in incoming or incoming[key] is None:
-            continue
-        base[key] = str(incoming[key])
-
-    if "token_map" in incoming:
-        base["token_map"] = normalize_token_map(incoming.get("token_map"))
-    return base
+    return _sync_template_header_media(base)
 
 
 def _public_templates(data: dict[str, Any]) -> dict[str, Any]:
@@ -278,9 +371,17 @@ def _public_templates(data: dict[str, Any]) -> dict[str, Any]:
     defaults = _empty_templates()
     out: dict[str, Any] = {}
     for key in TEMPLATE_KEYS:
+        if key == "whatsapp_header_media":
+            continue
         raw = data.get(key)
         out[key] = str(raw) if raw is not None and str(raw) != "" else defaults[key]
     out["token_map"] = normalize_token_map(data.get("token_map") or defaults["token_map"])
+    synced = _sync_template_header_media({**out, "whatsapp_header_media": data.get("whatsapp_header_media")})
+    out["whatsapp_header_media"] = synced["whatsapp_header_media"]
+    out["whatsapp_header_format"] = synced["whatsapp_header_format"]
+    out["whatsapp_header"] = synced["whatsapp_header"]
+    out["whatsapp_header_media_url"] = synced["whatsapp_header_media_url"]
+    out["whatsapp_header_media_filename"] = synced["whatsapp_header_media_filename"]
     return out
 
 
@@ -438,7 +539,9 @@ def _merge_section(
 def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
     from services.cms_app_access import effective_channel_locks, payment_snapshot
 
-    whatsapp_raw = _apply_legacy(_as_dict(row.get("whatsapp")), _WA_LEGACY)
+    whatsapp_raw = _sync_whatsapp_template_names(
+        _apply_legacy(_as_dict(row.get("whatsapp")), _WA_LEGACY)
+    )
     email_raw = _normalize_email_receive_fields(
         _apply_legacy(_as_dict(row.get("email")), _EMAIL_LEGACY)
     )
@@ -638,7 +741,9 @@ def upsert_admin_env_settings(
         )
         prev = cur.fetchone() or {}
 
-    prev_wa = _apply_legacy(_as_dict(prev.get("whatsapp")), _WA_LEGACY)
+    prev_wa = _sync_whatsapp_template_names(
+        _apply_legacy(_as_dict(prev.get("whatsapp")), _WA_LEGACY)
+    )
     prev_em = _normalize_email_receive_fields(
         _apply_legacy(_as_dict(prev.get("email")), _EMAIL_LEGACY)
     )
@@ -646,7 +751,9 @@ def upsert_admin_env_settings(
     prev_gs = _as_dict(prev.get("google_sheets"))
     prev_locks = normalize_channel_locks(prev.get("channel_locks"))
 
-    merged_wa = _merge_section(prev_wa, whatsapp, WHATSAPP_KEYS)
+    merged_wa = _sync_whatsapp_template_names(
+        _merge_section(prev_wa, whatsapp, WHATSAPP_KEYS)
+    )
     email_incoming = _as_dict(email) if email is not None else None
     if email_incoming is not None and not str(
         email_incoming.get("sender_notification_email") or ""
@@ -718,7 +825,9 @@ def set_admin_channel_locks(
         )
         prev = cur.fetchone() or {}
 
-    prev_wa = _apply_legacy(_as_dict(prev.get("whatsapp")), _WA_LEGACY) or _empty_whatsapp()
+    prev_wa = _sync_whatsapp_template_names(
+        _apply_legacy(_as_dict(prev.get("whatsapp")), _WA_LEGACY) or _empty_whatsapp()
+    )
     prev_em = _apply_legacy(_as_dict(prev.get("email")), _EMAIL_LEGACY) or _empty_email()
     prev_tpl = _as_dict(prev.get("templates")) or _empty_templates()
     prev_gs = _as_dict(prev.get("google_sheets")) or _empty_google_sheets()
@@ -770,13 +879,17 @@ def merge_admin_env_for_test(
         )
         prev = cur.fetchone() or {}
 
-    prev_wa = _apply_legacy(_as_dict(prev.get("whatsapp")), _WA_LEGACY)
+    prev_wa = _sync_whatsapp_template_names(
+        _apply_legacy(_as_dict(prev.get("whatsapp")), _WA_LEGACY)
+    )
     prev_em = _apply_legacy(_as_dict(prev.get("email")), _EMAIL_LEGACY)
     prev_tpl = _as_dict(prev.get("templates"))
 
     return {
         "admin_user_id": admin_user_id,
-        "whatsapp": _merge_section(prev_wa, whatsapp, WHATSAPP_KEYS),
+        "whatsapp": _sync_whatsapp_template_names(
+            _merge_section(prev_wa, whatsapp, WHATSAPP_KEYS)
+        ),
         "email": _merge_section(prev_em, email, EMAIL_KEYS),
         "templates": _merge_templates(prev_tpl, templates),
     }

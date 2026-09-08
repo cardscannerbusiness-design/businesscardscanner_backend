@@ -147,6 +147,10 @@ def use_admin_env(admin_user_id: str | None) -> Iterator[dict[str, Any] | None]:
 
     Disabled WhatsApp/Email sections fall back to global .env credentials.
     Templates still apply when present.
+
+    WhatsApp heal: older CMS builds always saved ``enabled=false``. If credentials are
+    complete and the channel is unlocked for this company, activate CMS WhatsApp so the
+    main app uses the same token/template as CMS Test.
     """
     if not admin_user_id:
         yield None
@@ -158,9 +162,29 @@ def use_admin_env(admin_user_id: str | None) -> Iterator[dict[str, Any] | None]:
         yield None
         return
 
+    wa = dict(raw.get("whatsapp") or {})
+    if wa and not bool(wa.get("enabled")):
+        token = str(wa.get("access_token") or "").strip()
+        phone_id = str(wa.get("phone_number_id") or "").strip()
+        if token and phone_id:
+            try:
+                from services.admin_env_service import get_admin_env_settings
+
+                item = get_admin_env_settings(admin_user_id)
+                locks = (item or {}).get("channel_locks") or {}
+                if item and not bool(locks.get("whatsapp")):
+                    wa = {**wa, "enabled": True}
+                    logger.info(
+                        "WhatsApp CMS credentials auto-activated for admin=%s "
+                        "(unlocked + complete; legacy enabled=false healed)",
+                        admin_user_id,
+                    )
+            except Exception as exc:
+                logger.debug("WhatsApp enable heal skipped for admin=%s: %s", admin_user_id, exc)
+
     with use_admin_env_payload(
         admin_user_id=admin_user_id,
-        whatsapp=raw.get("whatsapp"),
+        whatsapp=wa,
         email=raw.get("email"),
         templates=raw.get("templates"),
         force_channels=False,

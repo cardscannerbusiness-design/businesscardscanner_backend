@@ -2,12 +2,15 @@ import asyncio
 import html
 import logging
 import os
+import re
 import smtplib
 import time
 import uuid
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
+from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from utils.parser_utils import is_valid_email
 
@@ -20,6 +23,15 @@ from services.email_template_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+_ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
+# Filenames that may appear in HTML src= (hosted URL or local) → file under assets/.
+_INLINE_ASSET_ALIASES: dict[str, str] = {
+    "journey-stack-logo.png": "Journey-Stack-Logo.png",
+    "journey-stack-partner-qr.png": "Journey-Stack-Partner-QR.png",
+    "journey stack logo.png": "Journey-Stack-Logo.png",
+    "journey stack partner qr.png": "Journey-Stack-Partner-QR.png",
+}
 
 _RECENT_SENDS: dict[str, float] = {}
 _SEND_DEDUPE_SECONDS = 120
@@ -1440,9 +1452,79 @@ def _send_cc_scanned_details_emails(
 
 
 def _attach_multipart_body(message: EmailMessage, plain: str, html_body: str) -> None:
-    """Attach plain-text and HTML alternatives to an EmailMessage."""
+    """Attach plain-text and HTML alternatives; inline local /assets images as CID parts.
+
+    Production inboxes often cannot load api.namecardscan.com/assets until those
+    files are deployed — embedding as multipart/related keeps Journey Stack (and
+    any other local asset referenced in the HTML) visible in the sent message.
+    """
+    html_out, related = _prepare_inline_asset_images(html_body)
     message.set_content(plain)
-    message.add_alternative(html_body, subtype="html")
+    message.add_alternative(html_out, subtype="html")
+    if not related:
+        return
+    html_part = message.get_body(preferencelist=("html",))
+    if html_part is None:
+        return
+    for cid, data, subtype in related:
+        html_part.add_related(
+            data,
+            maintype="image",
+            subtype=subtype,
+            cid=cid,
+            filename=f"{cid}.{subtype}",
+        )
+
+
+def _prepare_inline_asset_images(html_body: str) -> tuple[str, list[tuple[str, bytes, str]]]:
+    """Rewrite <img src=".../assets/File.png"> to cid: and collect file bytes."""
+    if not html_body or not _ASSETS_DIR.is_dir():
+        return html_body, []
+
+    related: list[tuple[str, bytes, str]] = []
+    used_cids: set[str] = set()
+    pattern = re.compile(
+        r'(<img\b[^>]*?\bsrc=["\'])([^"\']+)(["\'])',
+        re.IGNORECASE,
+    )
+
+    def repl(match: re.Match[str]) -> str:
+        prefix, src, suffix = match.group(1), match.group(2), match.group(3)
+        if src.lower().startswith("cid:") or src.lower().startswith("data:"):
+            return match.group(0)
+        path_part = unquote(src.split("?", 1)[0]).replace("\\", "/")
+        name = path_part.rsplit("/", 1)[-1].strip()
+        if not name:
+            return match.group(0)
+        local_name = _INLINE_ASSET_ALIASES.get(name.lower())
+        if not local_name:
+            # Allow any file that already exists under assets/ (Bhagwati, etc.).
+            candidate = _ASSETS_DIR / name
+            if not candidate.is_file():
+                return match.group(0)
+            local_name = name
+        file_path = _ASSETS_DIR / local_name
+        if not file_path.is_file():
+            return match.group(0)
+        cid = re.sub(r"[^a-zA-Z0-9._-]+", "-", local_name).strip("-").lower()
+        if not cid:
+            return match.group(0)
+        if cid not in used_cids:
+            data = file_path.read_bytes()
+            subtype = "png"
+            lower = local_name.lower()
+            if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+                subtype = "jpeg"
+            elif lower.endswith(".gif"):
+                subtype = "gif"
+            elif lower.endswith(".webp"):
+                subtype = "webp"
+            related.append((cid, data, subtype))
+            used_cids.add(cid)
+            logger.info("Inlining email asset cid=%s file=%s bytes=%s", cid, local_name, len(data))
+        return f"{prefix}cid:{cid}{suffix}"
+
+    return pattern.sub(repl, html_body), related
 
 
 def _log_email_console(

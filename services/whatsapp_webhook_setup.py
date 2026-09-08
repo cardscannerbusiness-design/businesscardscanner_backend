@@ -6,22 +6,39 @@ from typing import Any
 
 import requests
 
-from services.whatsapp_service import ACCESS_TOKEN, GRAPH_API_VERSION, WABA_ID
+from services.whatsapp_service import (
+    ACCESS_TOKEN,
+    GRAPH_API_VERSION,
+    WABA_ID,
+    _active_waba_id,
+    _active_whatsapp_credentials,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _graph_headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+def _graph_auth() -> tuple[str, str, str]:
+    """Prefer CMS runtime credentials when active."""
+    try:
+        token, _phone_id, version = _active_whatsapp_credentials()
+        waba = _active_waba_id()
+        if token and waba:
+            return token, waba, version or GRAPH_API_VERSION
+    except Exception:
+        pass
+    return ACCESS_TOKEN, WABA_ID, GRAPH_API_VERSION
 
 
 def get_waba_subscription_status() -> dict[str, Any]:
-    if not ACCESS_TOKEN or not WABA_ID:
+    token, waba, version = _graph_auth()
+    if not token or not waba:
         return {"subscribed": False, "reason": "WhatsApp not configured."}
 
-    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{WABA_ID}/subscribed_apps"
+    url = f"https://graph.facebook.com/{version}/{waba}/subscribed_apps"
     try:
-        response = requests.get(url, headers=_graph_headers(), timeout=30)
+        response = requests.get(
+            url, headers={"Authorization": f"Bearer {token}"}, timeout=30
+        )
         response.raise_for_status()
         apps = response.json().get("data") or []
         app_ids = [
@@ -49,13 +66,16 @@ def ensure_waba_webhook_subscription() -> dict[str, Any]:
         logger.info("WhatsApp WABA already subscribed to app webhooks (%s).", status.get("app_ids"))
         return {**status, "action": "already_subscribed"}
 
-    if not ACCESS_TOKEN or not WABA_ID:
+    token, waba, version = _graph_auth()
+    if not token or not waba:
         logger.warning("Skipping WABA webhook subscribe — WhatsApp not configured.")
         return {"subscribed": False, "action": "skipped", "reason": "not configured"}
 
-    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{WABA_ID}/subscribed_apps"
+    url = f"https://graph.facebook.com/{version}/{waba}/subscribed_apps"
     try:
-        response = requests.post(url, headers=_graph_headers(), timeout=30)
+        response = requests.post(
+            url, headers={"Authorization": f"Bearer {token}"}, timeout=30
+        )
         response.raise_for_status()
         body = response.json()
         if body.get("success"):

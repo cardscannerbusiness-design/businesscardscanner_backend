@@ -104,13 +104,26 @@ def _active_whatsapp_template_name(fallback: str | None = None) -> str:
     wa = runtime_whatsapp()
     if wa:
         name = str(
-            wa.get("template_name")
-            or wa.get("card_received_template_name")
+            wa.get("card_received_template_name")
+            or wa.get("business_card_template_name")
+            or wa.get("scan_template_name")
+            or wa.get("template_name")
             or ""
         ).strip()
         if name:
             return name
     return (fallback or CARD_RECEIVED_TEMPLATE_NAME or TEMPLATE_NAME or "").strip()
+
+
+def _active_waba_id() -> str:
+    from services.admin_runtime_config import runtime_whatsapp
+
+    wa = runtime_whatsapp()
+    if wa:
+        waba = str(wa.get("business_account_id") or "").strip()
+        if waba:
+            return waba
+    return WABA_ID
 
 
 def _active_whatsapp_template_language(fallback: str | None = None) -> str:
@@ -226,24 +239,62 @@ def resolve_template_language(template_name: str) -> str:
     json_lang = _CARD_RECEIVED_TEMPLATE_DEF.get("language")
     if json_name and json_lang and name == json_name:
         return str(json_lang)
-    if not ACCESS_TOKEN or not WABA_ID:
-        return cms_lang or TEMPLATE_LANGUAGE_CODE
+
+    meta = fetch_waba_message_template(name)
+    if meta and meta.get("language"):
+        lang = str(meta["language"])
+        _TEMPLATE_LANG_CACHE[name] = lang
+        return lang
+    return cms_lang or TEMPLATE_LANGUAGE_CODE
+
+
+def fetch_waba_message_template(template_name: str) -> dict[str, Any] | None:
+    """Load an APPROVED template definition from Meta by name (active CMS/global creds)."""
+    name = (template_name or "").strip()
+    if not name:
+        return None
+    token, _phone_id, version = _active_whatsapp_credentials()
+    waba = _active_waba_id()
+    if not token or not waba:
+        return None
     try:
-        url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{WABA_ID}/message_templates"
+        url = f"https://graph.facebook.com/{version}/{waba}/message_templates"
         response = requests.get(
             url,
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
-            params={"name": name, "limit": 1},
+            headers={"Authorization": f"Bearer {token}"},
+            params={"name": name, "limit": 10},
             timeout=20,
         )
-        data = response.json().get("data") or []
-        if data and data[0].get("language"):
-            lang = str(data[0]["language"])
-            _TEMPLATE_LANG_CACHE[name] = lang
-            return lang
+        response.raise_for_status()
+        rows = response.json().get("data") or []
+        if not rows:
+            logger.warning("Meta template %r not found on WABA %s", name, waba)
+            return None
+        # Prefer APPROVED; otherwise first match.
+        approved = [r for r in rows if str(r.get("status") or "").upper() == "APPROVED"]
+        chosen = approved[0] if approved else rows[0]
+        logger.info(
+            "Loaded Meta template name=%s language=%s status=%s",
+            chosen.get("name"),
+            chosen.get("language"),
+            chosen.get("status"),
+        )
+        return chosen if isinstance(chosen, dict) else None
     except Exception as exc:
-        logger.warning("Could not resolve language for template %s: %s", name, exc)
-    return TEMPLATE_LANGUAGE_CODE
+        logger.warning("Could not fetch Meta template %s: %s", name, exc)
+        return None
+
+
+def _meta_template_to_local_def(meta: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize Meta message_templates payload into the local JSON-ish shape."""
+    if not meta:
+        return {}
+    components = meta.get("components") or []
+    return {
+        "name": meta.get("name"),
+        "language": meta.get("language"),
+        "components": components,
+    }
 
 
 def normalize_whatsapp_phone(phone: str) -> str:
@@ -621,6 +672,58 @@ def _extract_variable_positions(template_def: dict[str, Any]) -> list[int]:
     return sorted(positions)
 
 
+def _meta_header_component(meta_def: dict[str, Any]) -> dict[str, Any] | None:
+    for comp in meta_def.get("components") or []:
+        if not isinstance(comp, dict):
+            continue
+        if str(comp.get("type") or "").upper() == "HEADER":
+            return comp
+    return None
+
+
+def _meta_header_send_spec(meta_def: dict[str, Any]) -> tuple[str | None, bool]:
+    """Return (header_format, needs_send_time_parameter) from Meta's HEADER.
+
+    Static TEXT headers need no send params. IMAGE/VIDEO/DOCUMENT always need media
+    at send time. TEXT with {{N}} needs a text parameter.
+    """
+    comp = _meta_header_component(meta_def)
+    if not comp:
+        return None, False
+    fmt = str(comp.get("format") or "TEXT").strip().upper()
+    if fmt == "TEXT":
+        text = str(comp.get("text") or "")
+        return fmt, bool(re.search(r"\{\{\s*\d+\s*\}\}", text))
+    if fmt in {"IMAGE", "VIDEO", "DOCUMENT"}:
+        return fmt, True
+    return fmt, False
+
+
+def _resolve_body_variable_positions(
+    *,
+    meta_def: dict[str, Any],
+    tpl: dict[str, Any],
+    is_video_template: bool,
+) -> list[int]:
+    """Body {{N}} indices for the send payload.
+
+    When Meta's approved definition is available, trust it even if it has *zero*
+    variables. An empty list must not fall through to card_final_ula's {{1}}/{{2}}
+    (that causes Meta error #132000 for static templates like journey_stack1).
+    """
+    if meta_def:
+        return _extract_variable_positions(meta_def)
+
+    if is_video_template:
+        return _extract_variable_positions(_CARD_RECEIVED_TEMPLATE_DEF) or [1, 2]
+
+    body_text = str(tpl.get("whatsapp_body") or "")
+    found = sorted({int(m) for m in re.findall(r"\{\{\s*(\d+)\s*\}\}", body_text)})
+    if found:
+        return found
+    return _extract_variable_positions(_CARD_RECEIVED_TEMPLATE_DEF) or [1, 2]
+
+
 def _resolve_public_asset_url(url: str | None) -> str | None:
     """Expand __BACKEND_BASE_URL__ placeholders using BACKEND_BASE_URL from env."""
     if not url:
@@ -754,7 +857,28 @@ def _header_media_component(
 
 
 def _build_cms_header_component(templates: dict[str, Any]) -> dict[str, Any] | None:
-    """Build Meta send header from CMS template settings (IMAGE / VIDEO / DOCUMENT / TEXT)."""
+    """Build Meta send header from CMS template settings (IMAGE / VIDEO / DOCUMENT / TEXT).
+
+    If whatsapp_header_media[] is present, use the first non-NONE sample (Meta allows one header).
+    """
+    media_list = templates.get("whatsapp_header_media")
+    if isinstance(media_list, list) and media_list:
+        for item in media_list:
+            if not isinstance(item, dict):
+                continue
+            fmt = str(item.get("format") or "NONE").strip().upper()
+            if fmt in ("", "NONE", "NULL"):
+                continue
+            # Project this sample onto the legacy keys expected below.
+            templates = {
+                **templates,
+                "whatsapp_header_format": fmt,
+                "whatsapp_header": str(item.get("text") or ""),
+                "whatsapp_header_media_url": str(item.get("media_url") or ""),
+                "whatsapp_header_media_filename": str(item.get("media_filename") or ""),
+            }
+            break
+
     fmt = str(templates.get("whatsapp_header_format") or "NONE").strip().upper()
     if fmt in ("", "NONE", "NULL"):
         return None
@@ -908,10 +1032,12 @@ def _build_header_component(template_def: dict[str, Any]) -> dict[str, Any] | No
 def build_card_received_template_components(
     contact: dict[str, Any],
     template_name: str | None = None,
+    meta_template: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Map scanned card fields to Meta template body/header params.
 
     card_final_ula expects: VIDEO header + body {{1}}=name, {{2}}=event.
+    Other CMS templates use Meta's approved definition when provided.
     """
     from services.admin_runtime_config import runtime_email, runtime_templates
     from services.template_token_service import resolve_token_values
@@ -932,19 +1058,25 @@ def build_card_received_template_components(
     ).strip()
     name_l = resolved_name.lower()
 
-    # Prefer body variable count from the approved JSON for card_final_ula family.
-    positions = _extract_variable_positions(_CARD_RECEIVED_TEMPLATE_DEF) or [1, 2]
+    meta_def = _meta_template_to_local_def(meta_template) if meta_template else {}
+    if not meta_def and name_l not in {
+        (CARD_RECEIVED_TEMPLATE_NAME or "").lower(),
+        (BUSINESS_CARD_TEMPLATE_NAME or "").lower(),
+        "card_final_ula",
+    }:
+        meta_def = _meta_template_to_local_def(fetch_waba_message_template(resolved_name))
+
     is_video_template = name_l in {
         (CARD_RECEIVED_TEMPLATE_NAME or "").lower(),
         (BUSINESS_CARD_TEMPLATE_NAME or "").lower(),
         (SCAN_THANKS_TEMPLATE_NAME or "").lower(),
         "card_final_ula",
     }
-    if not is_video_template:
-        body_text = str(tpl.get("whatsapp_body") or "")
-        found = sorted({int(m) for m in re.findall(r"\{\{\s*(\d+)\s*\}\}", body_text)})
-        if found:
-            positions = found
+    positions = _resolve_body_variable_positions(
+        meta_def=meta_def,
+        tpl=tpl,
+        is_video_template=is_video_template,
+    )
 
     defaults = {
         1: _template_param(first_name, "there"),
@@ -976,12 +1108,32 @@ def build_card_received_template_components(
             header = _build_cms_header_component(tpl)
         if header is None:
             header = _build_header_component(_CARD_RECEIVED_TEMPLATE_DEF)
+    elif meta_def:
+        meta_fmt, meta_needs_header = _meta_header_send_spec(meta_def)
+        if meta_needs_header:
+            aligned_tpl = dict(tpl)
+            if meta_fmt:
+                aligned_tpl["whatsapp_header_format"] = meta_fmt
+                media_list = aligned_tpl.get("whatsapp_header_media")
+                if isinstance(media_list, list) and media_list:
+                    first = dict(media_list[0]) if isinstance(media_list[0], dict) else {}
+                    first["format"] = meta_fmt
+                    aligned_tpl["whatsapp_header_media"] = [first, *media_list[1:]]
+            header = _build_cms_header_component(aligned_tpl)
+            if header is None:
+                header = _build_header_component(meta_def)
+        # else: Meta has no dynamic header — omit header params entirely
     else:
         header = _build_cms_header_component(tpl)
 
     if header:
         components.append(header)
-    components.append({"type": "body", "parameters": parameters})
+    if parameters:
+        components.append({"type": "body", "parameters": parameters})
+    elif not components:
+        # Templates with no variables still need an empty body component omitted —
+        # Meta accepts sends with no components when the template has none.
+        pass
     return components
 
 
@@ -1024,14 +1176,6 @@ def _template_components(template_name: str, contact: dict[str, Any]) -> list[di
         return []
     if name == "cardsync_contact_saved":
         return build_contact_saved_template_components(contact)
-    if name in {
-        CARD_RECEIVED_TEMPLATE_NAME,
-        SCAN_THANKS_TEMPLATE_NAME,
-        BUSINESS_CARD_TEMPLATE_NAME,
-        "cardsync_card_received",
-        _CARD_RECEIVED_TEMPLATE_NAME_FROM_JSON,
-    }:
-        return build_card_received_template_components(contact)
     if name == "3p_direct_integration_test_template":
         contact_name = extract_contact_name(contact)
         first_name = (contact_name or "there").strip().split()[0]
@@ -1041,7 +1185,9 @@ def _template_components(template_name: str, contact: dict[str, Any]) -> list[di
                 "parameters": [{"type": "text", "text": _template_param(first_name, "there")}],
             }
         ]
-    return build_scan_thanks_template_components(contact)
+    # card_final_ula, cardsync_*, journey_stack1, and any other CMS/Meta name:
+    # resolve body/header params from the approved Meta definition (0 vars allowed).
+    return build_card_received_template_components(contact, template_name=name)
 
 
 def _ordered_outbound_template_names() -> list[str]:

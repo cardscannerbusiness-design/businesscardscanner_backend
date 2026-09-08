@@ -41,7 +41,9 @@ from services.whatsapp_service import (
     _active_whatsapp_template_language,
     _active_whatsapp_template_name,
     build_card_received_template_components,
+    fetch_waba_message_template,
     is_whatsapp_configured,
+    resolve_template_language,
     send_whatsapp_template,
 )
 
@@ -80,6 +82,10 @@ class CmsWhatsAppTestRequest(BaseModel):
     event_name: str = Field(default="CMS Test")
     whatsapp: dict[str, Any] | None = None
     templates: dict[str, Any] | None = None
+
+
+class CmsWhatsAppInspectRequest(BaseModel):
+    whatsapp: dict[str, Any] | None = None
 
 
 class CmsEmailTestRequest(BaseModel):
@@ -320,21 +326,53 @@ async def test_admin_whatsapp(admin_id: str, body: CmsWhatsAppTestRequest):
             "name": body.full_name,
             "eventName": body.event_name,
         }
-        template_name = _active_whatsapp_template_name(CARD_RECEIVED_TEMPLATE_NAME)
-        # cardscan_intro is not the production approved template on this WABA.
+        # Prefer CMS form/saved template names — never silently substitute card_final_ula
+        # when the Admin has set journey_stack1 (or any other Meta-approved name).
+        wa_name = str(
+            wa.get("card_received_template_name")
+            or wa.get("business_card_template_name")
+            or wa.get("scan_template_name")
+            or wa.get("template_name")
+            or ""
+        ).strip()
+        template_name = wa_name or _active_whatsapp_template_name(CARD_RECEIVED_TEMPLATE_NAME)
         if (template_name or "").strip().lower() in {
             "",
             "cardscan_intro",
             "hello_world",
         }:
             template_name = CARD_RECEIVED_TEMPLATE_NAME or "card_final_ula"
-        language_code = _active_whatsapp_template_language() or "en"
-        if language_code.lower() in {"en_us", "english"}:
-            # Meta approved card_final_ula as "en"
+
+        meta_template = fetch_waba_message_template(template_name)
+        if meta_template is None and wa_name:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Template '{template_name}' was not found (or not APPROVED) on this "
+                    "WhatsApp Business Account. Check the name in Meta Business Manager, "
+                    "then Save Environment and test again."
+                ),
+            )
+
+        language_code = (
+            str(wa.get("template_language_code") or "").strip()
+            or (str(meta_template.get("language") or "").strip() if meta_template else "")
+            or resolve_template_language(template_name)
+            or _active_whatsapp_template_language()
+            or "en"
+        )
+        if language_code.lower() in {"en_us", "english"} and (
+            template_name or ""
+        ).strip().lower() in {
+            (CARD_RECEIVED_TEMPLATE_NAME or "").lower(),
+            "card_final_ula",
+        }:
             language_code = "en"
 
         components = build_card_received_template_components(
-            contact, template_name=template_name
+            contact,
+            template_name=template_name,
+            meta_template=meta_template,
         )
         try:
             result = await asyncio.to_thread(
@@ -345,59 +383,28 @@ async def test_admin_whatsapp(admin_id: str, body: CmsWhatsAppTestRequest):
                 components=components,
             )
         except Exception as exc:
-            # Last resort: known working production template
-            fallback = CARD_RECEIVED_TEMPLATE_NAME or "card_final_ula"
-            if template_name != fallback:
-                logger.warning(
-                    "CMS WhatsApp test %s failed (%s); retrying %s/en",
-                    template_name,
-                    exc,
-                    fallback,
+            logger.error(
+                "CMS WhatsApp test failed for admin=%s template=%s: %s",
+                admin_id,
+                template_name,
+                exc,
+                exc_info=True,
+            )
+            detail = str(exc)
+            if "132000" in detail or "132001" in detail:
+                detail = (
+                    f"{detail} — Template '{template_name}' parameter count/header does not "
+                    "match Meta. Fix the CMS Templates section (header format + body {{N}} "
+                    "tokens) to match the approved Meta template, Save, then Test again."
                 )
-                try:
-                    result = await asyncio.to_thread(
-                        send_whatsapp_template,
-                        body.contact_phone,
-                        template_name=fallback,
-                        language_code="en",
-                        components=build_card_received_template_components(
-                            contact, template_name=fallback
-                        ),
-                    )
-                    template_name = fallback
-                except Exception as exc2:
-                    logger.error(
-                        "CMS WhatsApp test failed for admin=%s: %s",
-                        admin_id,
-                        exc2,
-                        exc_info=True,
-                    )
-                    detail = str(exc2)
-                    if "132000" in detail or "132001" in detail:
-                        detail = (
-                            f"{detail} — Set Message template name to '{fallback}' "
-                            "and Template language to 'en', Save, then Test again. "
-                            "card_final_ula needs VIDEO header + exactly 2 body vars."
-                        )
-                    raise HTTPException(status_code=502, detail=detail) from exc2
-            else:
-                logger.error(
-                    "CMS WhatsApp test failed for admin=%s: %s", admin_id, exc, exc_info=True
-                )
-                detail = str(exc)
-                if "132000" in detail:
-                    detail = (
-                        f"{detail} — Template '{template_name}' expects a different number of "
-                        "body/header params. For card_final_ula use language 'en', VIDEO header, "
-                        "and body variables {{1}} name + {{2}} event only."
-                    )
-                raise HTTPException(status_code=502, detail=detail) from exc
+            raise HTTPException(status_code=502, detail=detail) from exc
 
     message_id = (result.get("messages") or [{}])[0].get("id")
     return {
         "success": True,
         "message_id": message_id,
         "template": template_name,
+        "language": language_code,
         "to": body.contact_phone,
     }
 
@@ -592,6 +599,194 @@ def patch_tenant_user_scan_entitlement(
         },
     )
     return result
+
+
+@router.post(
+    "/admin-env/{admin_id}/check-environment",
+    summary="Check CMS env is stored and loadable into the project runtime",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def check_admin_environment_route(admin_id: str):
+    from services.cms_environment_check import check_admin_environment
+
+    try:
+        return check_admin_environment(admin_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/admin-env/{admin_id}/whatsapp-inspect",
+    summary="Inspect WhatsApp CMS credentials, template, and Graph connectivity",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def inspect_admin_whatsapp(admin_id: str, body: CmsWhatsAppInspectRequest | None = None):
+    """Non-send health checklist for the WhatsApp tab / setup checker."""
+    from services.cms_environment_check import _probe_whatsapp_graph, _wa_creds_complete
+
+    payload = body or CmsWhatsAppInspectRequest()
+    try:
+        merged = merge_admin_env_for_test(admin_id, whatsapp=payload.whatsapp)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    item = get_admin_env(admin_id) or {}
+    locks = item.get("channel_locks") or {}
+    wa = dict(merged.get("whatsapp") or {})
+    checklist: list[dict[str, Any]] = []
+
+    def add(check_id: str, label: str, status: str, detail: str, fix: str | None = None) -> None:
+        checklist.append(
+            {
+                "id": check_id,
+                "label": label,
+                "status": status,
+                "detail": detail,
+                **({"fix": fix} if fix else {}),
+            }
+        )
+
+    complete = _wa_creds_complete(wa)
+    add(
+        "credentials",
+        "Access token + Phone number ID",
+        "ok" if complete else "error",
+        "CMS credentials present." if complete else "Missing access_token or phone_number_id.",
+        None if complete else "Save both fields on the WhatsApp tab.",
+    )
+    add(
+        "enabled",
+        "WhatsApp enabled flag",
+        "ok" if bool(wa.get("enabled")) else "warn",
+        "enabled=true" if bool(wa.get("enabled")) else "enabled=false (unlocked + complete still auto-activates).",
+    )
+    locked = bool(locks.get("whatsapp"))
+    add(
+        "channel_lock",
+        "Channel unlocked for main app",
+        "error" if locked else "ok",
+        "Locked — main app skips WhatsApp." if locked else "Unlocked — main app may send.",
+        "Turn Enabled ON (or Unlock on Environment)." if locked else None,
+    )
+
+    probe = _probe_whatsapp_graph(wa) if complete else {
+        "ok": False,
+        "status": "fail",
+        "message": "Skipped — credentials incomplete.",
+        "phone": None,
+        "template": None,
+    }
+    add(
+        "graph",
+        "Meta Graph API",
+        "ok" if probe.get("ok") and probe.get("status") == "pass" else (
+            "warn" if probe.get("status") == "warn" else "error"
+        ),
+        str(probe.get("message") or ""),
+        None if probe.get("ok") else "Fix token / phone_number_id / WABA and retry.",
+    )
+
+    tpl = str(
+        wa.get("card_received_template_name")
+        or wa.get("business_card_template_name")
+        or wa.get("template_name")
+        or ""
+    ).strip()
+    tpl_meta = probe.get("template") if isinstance(probe.get("template"), dict) else None
+    if tpl:
+        approved = str((tpl_meta or {}).get("status") or "").upper() == "APPROVED"
+        add(
+            "template",
+            f"Template '{tpl}'",
+            "ok" if approved else ("warn" if tpl_meta else "error"),
+            (
+                f"APPROVED ({(tpl_meta or {}).get('language')})"
+                if approved
+                else (
+                    f"Found status={(tpl_meta or {}).get('status')}"
+                    if tpl_meta
+                    else "Not found on WABA (set business_account_id + template name)."
+                )
+            ),
+        )
+    else:
+        add(
+            "template",
+            "Outbound template name",
+            "warn",
+            "No card_received / business_card template name set in CMS.",
+            "Set the template name to match Meta (e.g. journey_stack1).",
+        )
+
+    errors = sum(1 for c in checklist if c["status"] == "error")
+    warns = sum(1 for c in checklist if c["status"] == "warn")
+    oks = sum(1 for c in checklist if c["status"] == "ok")
+    overall = "error" if errors else ("warn" if warns else "ok")
+
+    return {
+        "success": overall != "error",
+        "overall": overall,
+        "summary": {
+            "checks_total": len(checklist),
+            "checks_ok": oks,
+            "checks_error": errors,
+        },
+        "checklist": checklist,
+        "phone": probe.get("phone"),
+        "waba": {"id": wa.get("business_account_id") or None},
+        "waba_phones": [],
+        "webhook": {"subscribed": None, "reason": "Use subscribe endpoint to verify."},
+        "templates": [tpl_meta] if tpl_meta else [],
+        "configured_templates": [
+            {
+                "label": "Primary outbound",
+                "configured_name": tpl or "",
+                "configured_language": str(wa.get("template_language_code") or ""),
+                "found": bool(tpl_meta),
+                "meta_status": (tpl_meta or {}).get("status"),
+                "meta_language": (tpl_meta or {}).get("language"),
+                "approved": str((tpl_meta or {}).get("status") or "").upper() == "APPROVED",
+            }
+        ]
+        if tpl
+        else [],
+        "meta_console_links": {
+            "whatsapp_manager": "https://business.facebook.com/wa/manage/",
+            "developer_app": None,
+            "api_setup": None,
+        },
+        "still_requires_meta_console": [
+            "Approve templates in Meta WhatsApp Manager",
+            "Confirm delivery statuses in Meta message logs when wamid is accepted but not received",
+        ],
+    }
+
+
+@router.post(
+    "/admin-env/{admin_id}/whatsapp-subscribe-webhook",
+    summary="Subscribe the Meta app to this WABA's webhooks",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def subscribe_admin_whatsapp_webhook(admin_id: str, body: dict[str, Any] | None = None):
+    from services.whatsapp_webhook_setup import ensure_waba_webhook_subscription
+    from services.admin_runtime_config import use_admin_env_payload
+
+    body = body or {}
+    try:
+        merged = merge_admin_env_for_test(admin_id, whatsapp=body.get("whatsapp"))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    wa = dict(merged.get("whatsapp") or {})
+    wa["enabled"] = True
+    with use_admin_env_payload(
+        admin_user_id=admin_id,
+        whatsapp=wa,
+        templates=merged.get("templates"),
+        force_channels=True,
+    ):
+        result = ensure_waba_webhook_subscription()
+    return {"success": bool(result.get("subscribed")), **result}
 
 
 @router.post(
