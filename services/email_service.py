@@ -1467,12 +1467,18 @@ def _attach_multipart_body(message: EmailMessage, plain: str, html_body: str) ->
     if html_part is None:
         return
     for cid, data, subtype in related:
+        # filename= alone makes Python's content manager default to
+        # Content-Disposition: attachment — Gmail/Outlook then show broken
+        # images instead of embedding them. Force inline.
+        safe_name = cid if "." in cid else f"{cid}.{subtype}"
+        cid_header = cid if cid.startswith("<") and cid.endswith(">") else f"<{cid}>"
         html_part.add_related(
             data,
             maintype="image",
             subtype=subtype,
-            cid=cid,
-            filename=f"{cid}.{subtype}",
+            cid=cid_header,
+            filename=safe_name,
+            disposition="inline",
         )
 
 
