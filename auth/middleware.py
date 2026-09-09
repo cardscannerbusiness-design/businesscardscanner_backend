@@ -135,7 +135,7 @@ async def _lookup_user(user_id: str) -> dict | None:
             # User + role
             cur.execute(
                 """
-                SELECT u.id, u.email, u.first_name, u.last_name, u.username,
+                SELECT u.id, u.email, u.first_name, u.last_name, u.display_name, u.username,
                        u.phone, u.is_active, u.is_verified, u.company_id, u.admin_id,
                        u.profile_image, COALESCE(u.scans_unlimited, FALSE) AS scans_unlimited,
                        u.user_card_limit, COALESCE(u.user_cards_used, 0) AS user_cards_used,
@@ -154,6 +154,15 @@ async def _lookup_user(user_id: str) -> dict | None:
             user = dict(user)
             role_name = user["role"]
             user["scans_unlimited"] = bool(user.get("scans_unlimited"))
+            user["display_name"] = str(user.get("display_name") or "").strip()
+            from services.user_profile_identity import effective_display_name, public_profile_image_url
+
+            user["effective_display_name"] = effective_display_name(
+                display_name=user.get("display_name"),
+                first_name=user.get("first_name"),
+                last_name=user.get("last_name"),
+            )
+            user["profile_image"] = public_profile_image_url(user.get("profile_image"))
             raw_limit = user.get("user_card_limit")
             user["user_card_limit"] = int(raw_limit) if raw_limit is not None else None
             user["user_cards_used"] = max(0, int(user.get("user_cards_used") or 0))

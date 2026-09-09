@@ -97,8 +97,12 @@ def load_admin_env_raw(admin_user_id: str) -> dict[str, Any] | None:
             return dict(value)
         return {}
 
+    # Keep template_name / card_received / business / scan fields aligned so
+    # Manish's journey_stack1 (or any single CMS name) is visible to all send paths.
+    from services.admin_env_service import sync_whatsapp_template_names
+
     return {
-        "whatsapp": _as_dict(row.get("whatsapp")),
+        "whatsapp": sync_whatsapp_template_names(_as_dict(row.get("whatsapp"))),
         "email": _as_dict(row.get("email")),
         "templates": _as_dict(row.get("templates")),
     }
@@ -118,7 +122,9 @@ def use_admin_env_payload(
     force_channels: bool = False,
 ) -> Iterator[dict[str, Any]]:
     """Activate an explicit CMS payload (used by CMS Test buttons)."""
-    wa = dict(whatsapp or {})
+    from services.admin_env_service import sync_whatsapp_template_names
+
+    wa = sync_whatsapp_template_names(dict(whatsapp or {}))
     em = dict(email or {})
     tpl = dict(templates or {})
 

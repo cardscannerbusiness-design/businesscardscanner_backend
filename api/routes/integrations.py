@@ -45,17 +45,49 @@ router = APIRouter(tags=["Integrations"])
 logger = logging.getLogger(__name__)
 
 
+def _company_display_name_for_user(user: dict | None) -> str | None:
+    if not user:
+        return None
+    try:
+        from services.user_profile_identity import get_user_profile_identity
+
+        identity = get_user_profile_identity(str(user.get("id") or ""))
+        if identity and identity.get("effective_display_name"):
+            return str(identity["effective_display_name"])
+    except Exception:
+        pass
+    company_id = user.get("company_id")
+    if not company_id:
+        return None
+    try:
+        from services.admin_env_service import get_company_display_name
+
+        return get_company_display_name(str(company_id))
+    except Exception:
+        return None
+
+
 @router.get(
     "/integrations/whatsapp/chat-link",
     summary="wa.me link for user-initiated WhatsApp chat (Chats inbox)",
 )
-async def get_whatsapp_chat_link(prefill: str = "Hi, verify my number"):
+async def get_whatsapp_chat_link(
+    request: Request,
+    prefill: str = "Hi, verify my number",
+):
     if not is_whatsapp_configured():
         raise HTTPException(
             status_code=503,
             detail="WhatsApp is not configured.",
         )
-    config = get_whatsapp_chat_link_config(prefill_text=prefill)
+    display_name = None
+    user = getattr(request.state, "auth_user", None)
+    if isinstance(user, dict):
+        display_name = _company_display_name_for_user(user)
+    config = get_whatsapp_chat_link_config(
+        prefill_text=prefill,
+        company_display_name=display_name,
+    )
     if not config.get("configured"):
         raise HTTPException(
             status_code=503,

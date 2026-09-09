@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from auth.audit_service import log_action
@@ -30,6 +30,10 @@ from services.admin_env_service import (
     set_cms_tenant_user_scans_unlimited,
     set_cms_tenant_user_scan_entitlement,
     upsert_admin_env_settings as upsert_admin_env,
+)
+from services.user_profile_identity import (
+    set_user_display_name,
+    set_user_profile_picture,
 )
 from services.cms_app_access import update_channel_locks
 from services.company_lifecycle import CompanyNotFoundError, remove_cms_client
@@ -74,6 +78,12 @@ class EmailDisplayNameUpdateRequest(BaseModel):
     """From header display name only. Empty string restores the default."""
 
     email_display_name: str = ""
+
+
+class DisplayNameUpdateRequest(BaseModel):
+    """Business / WhatsApp identity display name. Empty clears custom name."""
+
+    display_name: str = ""
 
 
 class CmsWhatsAppTestRequest(BaseModel):
@@ -244,6 +254,109 @@ def put_admin_email_display_name(
         "item": item,
         "company_id": item.get("company_id"),
         "email_display_name": item.get("email_display_name") or "",
+    }
+
+
+@router.put(
+    "/admin-env/{admin_id}/display-name",
+    summary="Set Display Name for this Admin user account",
+    description=(
+        "Stores users.display_name for the selected Admin's user_id only. "
+        "Does not change other users, company rows, or Email Display Name."
+    ),
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def put_admin_display_name(
+    admin_id: str,
+    body: DisplayNameUpdateRequest,
+    request: Request,
+):
+    actor = get_current_user(request)
+    item = get_admin_env(admin_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Admin not found.")
+    try:
+        identity = set_user_display_name(admin_id, body.display_name)
+    except ValueError as exc:
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=status, detail=msg) from exc
+
+    refreshed = get_admin_env(admin_id) or item
+    log_action(
+        str(actor["id"]),
+        "cms_display_name_updated",
+        ip=request.client.host if request.client else "",
+        new_value={
+            "admin_id": admin_id,
+            "user_id": admin_id,
+            "display_name": identity.get("display_name"),
+        },
+    )
+    return {
+        "success": True,
+        "item": refreshed,
+        "user_id": admin_id,
+        "display_name": identity.get("display_name") or "",
+        "profile_image": identity.get("profile_image") or "",
+    }
+
+
+@router.put(
+    "/admin-env/{admin_id}/display-picture",
+    summary="Upload Profile Picture for this Admin user account",
+    description=(
+        "Stores under profile-pictures/{admin_user_id}/ and updates that Admin's "
+        "users.profile_image only. Does not change other users' pictures."
+    ),
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+async def put_admin_display_picture(
+    admin_id: str,
+    request: Request,
+    file: UploadFile = File(..., description="Profile picture (JPEG, PNG, or WebP, max 5 MB)"),
+):
+    actor = get_current_user(request)
+    item = get_admin_env(admin_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Admin not found.")
+    raw = await file.read()
+    try:
+        identity = set_user_profile_picture(
+            admin_id,
+            image_bytes=raw,
+            filename=file.filename,
+            content_type=file.content_type,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=status, detail=msg) from exc
+    except OSError as exc:
+        logger.error("Failed to store display picture for admin=%s: %s", admin_id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Could not store the profile picture on the server.",
+        ) from exc
+
+    refreshed = get_admin_env(admin_id) or item
+    log_action(
+        str(actor["id"]),
+        "cms_display_picture_updated",
+        ip=request.client.host if request.client else "",
+        new_value={
+            "admin_id": admin_id,
+            "user_id": admin_id,
+            "profile_image": identity.get("profile_image"),
+        },
+    )
+    return {
+        "success": True,
+        "item": refreshed,
+        "user_id": admin_id,
+        "display_picture_url": identity.get("profile_image") or "",
+        "profile_image": identity.get("profile_image") or "",
+        "display_name": identity.get("display_name") or "",
     }
 
 

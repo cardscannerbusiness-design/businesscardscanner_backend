@@ -258,6 +258,11 @@ class UpdateProfileRequest(BaseModel):
     first_name: str | None = None
     last_name: str | None = None
     phone: str | None = None
+    display_name: str | None = None
+
+
+class DisplayNameUpdateRequest(BaseModel):
+    display_name: str = ""
 
 
 class DeleteAccountRequest(BaseModel):

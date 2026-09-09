@@ -1,0 +1,3 @@
+# Per-user profile pictures — keep directory, ignore uploaded files.
+*
+!.gitignore

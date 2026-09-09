@@ -241,6 +241,9 @@ def login(
     audit_service.log_action(user_id, AUDIT_LOGIN, ip=ip, user_agent=user_agent,
                              new_value={"session_id": session_id, "device": info["device"]})
 
+    from services.user_profile_identity import effective_display_name, public_profile_image_url
+
+    display_name = str(user.get("display_name") or "").strip()
     return {
         "access_token": access_token,
         "refresh_token": refresh_token_raw,
@@ -251,6 +254,14 @@ def login(
             "email": user["email"],
             "first_name": user["first_name"],
             "last_name": user["last_name"],
+            "display_name": display_name,
+            "effective_display_name": effective_display_name(
+                display_name=display_name,
+                first_name=user.get("first_name"),
+                last_name=user.get("last_name"),
+            ),
+            "profile_image": public_profile_image_url(user.get("profile_image")),
+            "phone": str(user.get("phone") or ""),
             "role": role_name,
             "company_id": company_id,
         },

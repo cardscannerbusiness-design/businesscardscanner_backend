@@ -1,0 +1,3 @@
+# Keep uploaded company profile pictures out of empty-dir issues in git.
+*
+!.gitignore

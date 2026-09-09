@@ -137,7 +137,7 @@ def _active_whatsapp_template_language(fallback: str | None = None) -> str:
     return (fallback or TEMPLATE_LANGUAGE_CODE or "en_US").strip()
 
 
-_BUSINESS_PHONE_CACHE: dict[str, Any] = {"fetched_at": 0.0, "data": None}
+_BUSINESS_PHONE_CACHE: dict[str, Any] = {}
 
 
 def get_whatsapp_config_summary() -> dict[str, Any]:
@@ -157,14 +157,31 @@ def _digits_only(phone: str) -> str:
     return re.sub(r"\D", "", phone or "")
 
 
+def _is_builtin_ula_video_template(template_name: str) -> bool:
+    """True only for Ula's hardcoded VIDEO template (card_final_ula).
+
+    Never treat CMS names like journey_stack1 as video just because
+    WHATSAPP_CARD_RECEIVED_TEMPLATE_NAME in .env was pointed at them.
+    """
+    name_l = (template_name or "").strip().lower()
+    if not name_l:
+        return False
+    names = {"card_final_ula"}
+    json_name = str(_CARD_RECEIVED_TEMPLATE_NAME_FROM_JSON or "").strip().lower()
+    if json_name:
+        names.add(json_name)
+    return name_l in names
+
+
 def _fetch_business_phone_from_graph() -> dict[str, Any] | None:
-    if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
+    token, phone_id, version = _active_whatsapp_credentials()
+    if not token or not phone_id:
         return None
     try:
-        url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}"
+        url = f"https://graph.facebook.com/{version}/{phone_id}"
         response = requests.get(
             url,
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+            headers={"Authorization": f"Bearer {token}"},
             params={
                 "fields": "display_phone_number,verified_name,status,name_status,quality_rating",
             },
@@ -192,19 +209,30 @@ def _fetch_business_phone_from_graph() -> dict[str, Any] | None:
 
 def get_whatsapp_chat_link_config(
     prefill_text: str = "Hi, verify my number",
+    *,
+    company_display_name: str | None = None,
 ) -> dict[str, Any]:
     """Config for wa.me user-initiated chat (opens in recipient Chats, not Updates)."""
+    from services.admin_runtime_config import runtime_whatsapp
+
+    wa = runtime_whatsapp()
+    cms_phone = _digits_only(str((wa or {}).get("business_phone") or ""))
     env_phone = _digits_only(_normalize_env(os.getenv("WHATSAPP_BUSINESS_PHONE")))
+    _, active_phone_id, _ = _active_whatsapp_credentials()
+    cache_key = active_phone_id or "global"
     now = time.time()
-    cached = _BUSINESS_PHONE_CACHE.get("data")
-    if cached and now - float(_BUSINESS_PHONE_CACHE.get("fetched_at") or 0) < 3600:
-        meta = cached
+    cache_bucket = _BUSINESS_PHONE_CACHE.get(cache_key)
+    if (
+        isinstance(cache_bucket, dict)
+        and cache_bucket.get("data")
+        and now - float(cache_bucket.get("fetched_at") or 0) < 3600
+    ):
+        meta = cache_bucket.get("data")
     else:
         meta = _fetch_business_phone_from_graph()
-        _BUSINESS_PHONE_CACHE["data"] = meta
-        _BUSINESS_PHONE_CACHE["fetched_at"] = now
+        _BUSINESS_PHONE_CACHE[cache_key] = {"data": meta, "fetched_at": now}
 
-    business_phone = env_phone or (meta or {}).get("business_phone") or ""
+    business_phone = cms_phone or env_phone or (meta or {}).get("business_phone") or ""
     prefill = (prefill_text or "Hi, verify my number").strip() or "Hi, verify my number"
     wa_me_url = ""
     if business_phone:
@@ -212,14 +240,203 @@ def get_whatsapp_chat_link_config(
 
         wa_me_url = f"https://wa.me/{business_phone}?text={quote(prefill)}"
 
+    identity = (company_display_name or "").strip() or "BusinessCardScanner"
     return {
         "business_phone": business_phone,
         "display_phone_number": (meta or {}).get("display_phone_number"),
-        "verified_name": (meta or {}).get("verified_name") or "BusinessCardScanner",
+        "verified_name": (meta or {}).get("verified_name") or identity,
         "prefill_text": prefill,
         "wa_me_url": wa_me_url,
         "configured": bool(business_phone and is_whatsapp_configured()),
     }
+
+
+def _active_whatsapp_app_id() -> str:
+    from services.admin_runtime_config import runtime_whatsapp
+
+    wa = runtime_whatsapp()
+    if wa:
+        app_id = str(wa.get("app_id") or "").strip()
+        if app_id:
+            return app_id
+    return _normalize_env(os.getenv("WHATSAPP_APP_ID"))
+
+
+def _graph_error_message(response: requests.Response) -> str:
+    try:
+        data = response.json()
+    except Exception:
+        return (response.text or f"HTTP {response.status_code}")[:500]
+    err = data.get("error") if isinstance(data, dict) else None
+    if isinstance(err, dict):
+        msg = str(err.get("message") or err.get("error_user_msg") or "").strip()
+        code = err.get("code")
+        if msg and code is not None:
+            return f"{msg} (code {code})"
+        if msg:
+            return msg
+    return str(data)[:500]
+
+
+def upload_profile_picture_handle(
+    image_bytes: bytes,
+    *,
+    content_type: str,
+    filename: str = "profile.jpg",
+) -> str:
+    """Upload image via Meta Resumable Upload API; return profile_picture_handle."""
+    token, _, version = _active_whatsapp_credentials()
+    app_id = _active_whatsapp_app_id()
+    if not token:
+        raise RuntimeError("WhatsApp access token is not configured.")
+    if not app_id:
+        raise RuntimeError(
+            "WhatsApp App ID is required to upload a profile picture. "
+            "Set app_id in CMS WhatsApp settings."
+        )
+    if not image_bytes:
+        raise ValueError("Image file is empty.")
+
+    session_url = f"https://graph.facebook.com/{version}/{app_id}/uploads"
+    session_resp = requests.post(
+        session_url,
+        headers={"Authorization": f"Bearer {token}"},
+        params={
+            "file_name": filename,
+            "file_length": len(image_bytes),
+            "file_type": content_type,
+        },
+        timeout=60,
+    )
+    if session_resp.status_code >= 400:
+        raise RuntimeError(
+            f"WhatsApp upload session failed: {_graph_error_message(session_resp)}"
+        )
+    session_data = session_resp.json()
+    session_id = str(session_data.get("id") or "").strip()
+    if not session_id:
+        raise RuntimeError("WhatsApp upload session did not return an id.")
+
+    upload_url = f"https://graph.facebook.com/{version}/{session_id}"
+    upload_resp = requests.post(
+        upload_url,
+        headers={
+            "Authorization": f"OAuth {token}",
+            "file_offset": "0",
+            "Content-Type": content_type,
+        },
+        data=image_bytes,
+        timeout=120,
+    )
+    if upload_resp.status_code >= 400:
+        raise RuntimeError(
+            f"WhatsApp profile picture upload failed: {_graph_error_message(upload_resp)}"
+        )
+    handle = str((upload_resp.json() or {}).get("h") or "").strip()
+    if not handle:
+        raise RuntimeError("WhatsApp upload did not return a file handle.")
+    return handle
+
+
+def update_whatsapp_business_profile(
+    *,
+    about: str | None = None,
+    profile_picture_handle: str | None = None,
+) -> dict[str, Any]:
+    """POST /{phone-number-id}/whatsapp_business_profile (Cloud API).
+
+    Note: Meta verified display name cannot be changed via this endpoint;
+    only about/description-style fields and profile_picture_handle are supported.
+    """
+    token, phone_id, version = _active_whatsapp_credentials()
+    if not token or not phone_id:
+        raise RuntimeError("WhatsApp is not configured (access token / phone number id).")
+
+    payload: dict[str, Any] = {"messaging_product": "whatsapp"}
+    if about is not None:
+        text = " ".join(str(about).split()).strip()
+        if text:
+            # Meta About: 1–139 characters
+            payload["about"] = text[:139]
+    if profile_picture_handle:
+        payload["profile_picture_handle"] = profile_picture_handle
+
+    if set(payload.keys()) == {"messaging_product"}:
+        raise ValueError("Nothing to update on WhatsApp business profile.")
+
+    url = f"https://graph.facebook.com/{version}/{phone_id}/whatsapp_business_profile"
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=60,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"WhatsApp business profile update failed: {_graph_error_message(response)}"
+        )
+    try:
+        data = response.json()
+    except Exception:
+        data = {"success": True}
+    # Bust cached phone metadata so verified_name / profile refresh on next read
+    cache_key = phone_id or "global"
+    _BUSINESS_PHONE_CACHE.pop(cache_key, None)
+    return data if isinstance(data, dict) else {"success": True}
+
+
+def sync_whatsapp_business_display(
+    *,
+    display_name: str | None = None,
+    image_bytes: bytes | None = None,
+    content_type: str | None = None,
+    filename: str = "profile.jpg",
+) -> dict[str, Any]:
+    """Best-effort sync of CMS identity to WhatsApp Business profile.
+
+    - Profile picture: uploaded via Resumable Upload API when image_bytes provided.
+    - Display name: applied to WhatsApp 'about' (verified_name requires Meta review).
+    """
+    result: dict[str, Any] = {
+        "attempted": False,
+        "updated": False,
+        "about_updated": False,
+        "picture_updated": False,
+        "verified_name_note": (
+            "WhatsApp verified display name cannot be changed via Cloud API; "
+            "request name changes in Meta WhatsApp Manager. CMS Display Name is "
+            "stored locally and applied to the WhatsApp About field when possible."
+        ),
+        "error": None,
+    }
+    if not is_whatsapp_configured():
+        result["error"] = "WhatsApp is not configured for this Admin."
+        return result
+
+    handle: str | None = None
+    try:
+        result["attempted"] = True
+        if image_bytes:
+            handle = upload_profile_picture_handle(
+                image_bytes,
+                content_type=content_type or "image/jpeg",
+                filename=filename,
+            )
+        about = (display_name or "").strip() or None
+        if not handle and not about:
+            result["error"] = "Nothing to sync to WhatsApp."
+            return result
+        update_whatsapp_business_profile(about=about, profile_picture_handle=handle)
+        result["updated"] = True
+        result["about_updated"] = bool(about)
+        result["picture_updated"] = bool(handle)
+    except Exception as exc:
+        logger.warning("WhatsApp business profile sync failed: %s", exc, exc_info=True)
+        result["error"] = str(exc)
+    return result
 
 
 def resolve_template_language(template_name: str) -> str:
@@ -721,6 +938,12 @@ def _resolve_body_variable_positions(
     found = sorted({int(m) for m in re.findall(r"\{\{\s*(\d+)\s*\}\}", body_text)})
     if found:
         return found
+    # CMS / static templates (e.g. journey_stack1): no {{N}} → zero body params.
+    # Do not fall through to card_final_ula's {{1}}/{{2}} (Meta #132000).
+    from services.admin_runtime_config import runtime_whatsapp
+
+    if runtime_whatsapp() or ("whatsapp_body" in (tpl or {})):
+        return []
     return _extract_variable_positions(_CARD_RECEIVED_TEMPLATE_DEF) or [1, 2]
 
 
@@ -797,8 +1020,14 @@ def _mime_for_media_file(file_path: Path) -> str:
 
 def _get_or_upload_header_media(file_path: Path) -> str | None:
     """Upload a local media file to Meta once and reuse the returned media id."""
+    token, phone_id, version = _active_whatsapp_credentials()
+    if not token or not phone_id:
+        return None
+
     cache = _load_media_cache()
-    entry = cache.get(file_path.name) or {}
+    # Key by phone_number_id so CMS (Manish) and global .env don't share media ids.
+    cache_key = f"{phone_id}:{file_path.name}"
+    entry = cache.get(cache_key) or cache.get(file_path.name) or {}
     media_id = str(entry.get("media_id") or "")
     uploaded_at = float(entry.get("uploaded_at") or 0)
     if media_id and (time.time() - uploaded_at) < _MEDIA_ID_TTL_SECONDS:
@@ -808,11 +1037,11 @@ def _get_or_upload_header_media(file_path: Path) -> str | None:
         return None
     mime = _mime_for_media_file(file_path)
     try:
-        url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/media"
+        url = f"https://graph.facebook.com/{version}/{phone_id}/media"
         with file_path.open("rb") as f:
             response = requests.post(
                 url,
-                headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+                headers={"Authorization": f"Bearer {token}"},
                 data={"messaging_product": "whatsapp", "type": mime},
                 files={"file": (file_path.name, f, mime)},
                 timeout=120,
@@ -823,12 +1052,13 @@ def _get_or_upload_header_media(file_path: Path) -> str | None:
             return None
         media_id = str(data.get("id") or "")
         if media_id:
-            cache[file_path.name] = {"media_id": media_id, "uploaded_at": time.time()}
+            cache[cache_key] = {"media_id": media_id, "uploaded_at": time.time()}
             _save_media_cache(cache)
             logger.info(
-                "[WhatsApp] Uploaded header media %s as media id %s",
+                "[WhatsApp] Uploaded header media %s as media id %s (phone_id=%s)",
                 file_path.name,
                 media_id,
+                phone_id,
             )
         return media_id or None
     except Exception as exc:
@@ -1056,22 +1286,16 @@ def build_card_received_template_components(
         or _active_whatsapp_template_name(CARD_RECEIVED_TEMPLATE_NAME)
         or CARD_RECEIVED_TEMPLATE_NAME
     ).strip()
-    name_l = resolved_name.lower()
 
     meta_def = _meta_template_to_local_def(meta_template) if meta_template else {}
-    if not meta_def and name_l not in {
-        (CARD_RECEIVED_TEMPLATE_NAME or "").lower(),
-        (BUSINESS_CARD_TEMPLATE_NAME or "").lower(),
-        "card_final_ula",
-    }:
+    # Always load Meta for CMS templates (journey_stack1, etc.). Only skip the
+    # network call for the builtin Ula VIDEO template which has a local JSON def.
+    if not meta_def and not _is_builtin_ula_video_template(resolved_name):
         meta_def = _meta_template_to_local_def(fetch_waba_message_template(resolved_name))
 
-    is_video_template = name_l in {
-        (CARD_RECEIVED_TEMPLATE_NAME or "").lower(),
-        (BUSINESS_CARD_TEMPLATE_NAME or "").lower(),
-        (SCAN_THANKS_TEMPLATE_NAME or "").lower(),
-        "card_final_ula",
-    }
+    # Builtin Ula VIDEO path only — CMS templates (journey_stack1 IMAGE/static)
+    # always follow Meta's approved definition below.
+    is_video_template = _is_builtin_ula_video_template(resolved_name)
     positions = _resolve_body_variable_positions(
         meta_def=meta_def,
         tpl=tpl,
@@ -1191,8 +1415,32 @@ def _template_components(template_name: str, contact: dict[str, Any]) -> list[di
 
 
 def _ordered_outbound_template_names() -> list[str]:
+    """Template fallback order for outbound thank-you sends.
+
+    When CMS WhatsApp runtime is active (per-Admin credentials), only use that
+    Admin's template names — never fall through to global .env templates such as
+    card_final_ula that belong to a different WABA (breaks Manish / journey_stack1).
+    """
+    from services.admin_runtime_config import runtime_whatsapp
+
     seen: set[str] = set()
     ordered: list[str] = []
+
+    def _add(raw: Any) -> None:
+        name = str(raw or "").strip()
+        if not name or name in seen:
+            return
+        seen.add(name)
+        ordered.append(name)
+
+    wa = runtime_whatsapp()
+    if wa:
+        _add(wa.get("card_received_template_name"))
+        _add(wa.get("business_card_template_name"))
+        _add(wa.get("scan_template_name"))
+        _add(wa.get("template_name"))
+        return ordered
+
     for raw in (
         CARD_RECEIVED_TEMPLATE_NAME,
         SCAN_THANKS_TEMPLATE_NAME,
@@ -1200,11 +1448,7 @@ def _ordered_outbound_template_names() -> list[str]:
         "cardsync_contact_saved",
         TEMPLATE_NAME,
     ):
-        name = (raw or "").strip()
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        ordered.append(name)
+        _add(raw)
     return ordered
 
 

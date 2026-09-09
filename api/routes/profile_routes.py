@@ -9,13 +9,14 @@ import string
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from api.schemas import (
     ChangeEmailRequest,
     ChangePasswordRequest,
     DeleteAccountRequest,
+    DisplayNameUpdateRequest,
     UpdateProfileRequest,
 )
 from auth import audit_service
@@ -27,6 +28,13 @@ from auth.email_service import (
 )
 from auth.service import AuthError, change_password, request_email_change
 from db.pool import db_cursor
+from services.user_profile_identity import (
+    effective_display_name,
+    get_user_profile_identity,
+    public_profile_image_url,
+    set_user_display_name,
+    set_user_profile_picture,
+)
 
 router = APIRouter(prefix="/api/profile", tags=["Profile"])
 logger = logging.getLogger(__name__)
@@ -60,6 +68,31 @@ def _purge_mobile_otps() -> None:
         _MOBILE_OTP.pop(uid, None)
 
 
+def _serialize_profile_row(row: dict) -> dict:
+    out = dict(row)
+    for k in ("id", "company_id"):
+        if out.get(k) is not None:
+            out[k] = str(out[k])
+    updated = out.get("updated_at")
+    bust = ""
+    if updated is not None and hasattr(updated, "timestamp"):
+        bust = str(int(updated.timestamp()))
+    for k in ("last_login", "last_password_change", "created_at", "updated_at"):
+        if out.get(k) and hasattr(out[k], "isoformat"):
+            out[k] = out[k].isoformat()
+    out["display_name"] = str(out.get("display_name") or "").strip()
+    out["effective_display_name"] = effective_display_name(
+        display_name=out.get("display_name"),
+        first_name=out.get("first_name"),
+        last_name=out.get("last_name"),
+    )
+    out["profile_image"] = public_profile_image_url(
+        out.get("profile_image"),
+        cache_bust=bust or None,
+    )
+    return out
+
+
 @router.get(
     "",
     summary="Get own profile",
@@ -70,7 +103,7 @@ def get_profile(request: Request):
     with db_cursor(commit=False) as cur:
         cur.execute(
             """
-            SELECT u.id, u.email, u.first_name, u.last_name, u.username, u.phone,
+            SELECT u.id, u.email, u.first_name, u.last_name, u.display_name, u.username, u.phone,
                    u.profile_image, u.is_active, u.is_verified, u.company_id,
                    u.last_login, u.last_password_change, u.created_at, u.updated_at,
                    r.name AS role
@@ -83,24 +116,27 @@ def get_profile(request: Request):
     if not row:
         raise HTTPException(status_code=404, detail="Profile not found.")
 
-    row = dict(row)
-    for k in ("id", "company_id"):
-        if row.get(k) is not None:
-            row[k] = str(row[k])
-    for k in ("last_login", "last_password_change", "created_at", "updated_at"):
-        if row.get(k) and hasattr(row[k], "isoformat"):
-            row[k] = row[k].isoformat()
-    return row
+    return _serialize_profile_row(dict(row))
 
 
 @router.put(
     "",
     summary="Update own profile",
-    description="Update first name, last name, and phone number.",
+    description="Update first name, last name, display name, and phone number for the authenticated user only.",
 )
 def update_profile(body: UpdateProfileRequest, request: Request):
     user = get_current_user(request)
     updates = body.model_dump(exclude_none=True)
+    if not updates:
+        return {"success": True, "message": "No fields to update."}
+
+    if "display_name" in updates:
+        from services.user_profile_identity import normalize_display_name
+
+        updates["display_name"] = normalize_display_name(updates.get("display_name"))
+
+    allowed = {"first_name", "last_name", "phone", "display_name"}
+    updates = {k: v for k, v in updates.items() if k in allowed}
     if not updates:
         return {"success": True, "message": "No fields to update."}
 
@@ -113,11 +149,69 @@ def update_profile(body: UpdateProfileRequest, request: Request):
     params.append(user["id"])
 
     with db_cursor() as cur:
-        cur.execute(f"UPDATE users SET {', '.join(set_parts)} WHERE id = %s AND deleted_at IS NULL", params)
+        cur.execute(
+            f"UPDATE users SET {', '.join(set_parts)} WHERE id = %s AND deleted_at IS NULL",
+            params,
+        )
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="Profile not found.")
 
-    return {"success": True, "message": "Profile updated."}
+    identity = get_user_profile_identity(str(user["id"]))
+    return {
+        "success": True,
+        "message": "Profile updated.",
+        "display_name": (identity or {}).get("display_name") or "",
+        "effective_display_name": (identity or {}).get("effective_display_name") or "",
+        "profile_image": (identity or {}).get("profile_image") or "",
+    }
+
+
+@router.put(
+    "/display-name",
+    summary="Update own Display Name",
+    description="Stores users.display_name for the authenticated user_id only.",
+)
+def put_own_display_name(body: DisplayNameUpdateRequest, request: Request):
+    user = get_current_user(request)
+    try:
+        identity = set_user_display_name(str(user["id"]), body.display_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"success": True, **identity}
+
+
+@router.put(
+    "/picture",
+    summary="Upload own Profile Picture",
+    description=(
+        "Stores the image under profile-pictures/{user_id}/ and updates "
+        "users.profile_image for the authenticated user only."
+    ),
+)
+async def put_own_profile_picture(
+    request: Request,
+    file: UploadFile = File(..., description="Profile picture (JPEG, PNG, or WebP, max 5 MB)"),
+):
+    user = get_current_user(request)
+    raw = await file.read()
+    try:
+        identity = set_user_profile_picture(
+            str(user["id"]),
+            image_bytes=raw,
+            filename=file.filename,
+            content_type=file.content_type,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=status, detail=msg) from exc
+    except OSError as exc:
+        logger.error("Failed to store profile picture for user=%s: %s", user["id"], exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Could not store the profile picture on the server.",
+        ) from exc
+    return {"success": True, **identity}
 
 
 @router.post(

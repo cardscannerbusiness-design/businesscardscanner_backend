@@ -100,6 +100,8 @@ SCHEMA_STATEMENTS: list[str] = [
     # Per-user numeric cap (NULL = inherit company card_limit). Unlimited uses scans_unlimited.
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS user_card_limit INTEGER;",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS user_cards_used INTEGER NOT NULL DEFAULT 0;",
+    # Per-user Display Name (profile identity; not company / email From name)
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(255) NOT NULL DEFAULT '';",
     f"""
     UPDATE users
     SET user_card_limit = {int(DEFAULT_FREEMIUM_CARD_LIMIT)}
@@ -110,6 +112,9 @@ SCHEMA_STATEMENTS: list[str] = [
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS google_sheet_id VARCHAR(128);",
     # CMS "Email Display Name" — From header only; mailbox/SMTP unchanged
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS email_display_name VARCHAR(255) NOT NULL DEFAULT '';",
+    # CMS business Display Name + Display Picture (WhatsApp / brand identity)
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS display_name VARCHAR(255) NOT NULL DEFAULT '';",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS display_picture_url TEXT NOT NULL DEFAULT '';",
     # Company storage quota (defaults from StorageService constants)
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS plan_name VARCHAR(64) NOT NULL DEFAULT '{DEFAULT_PLAN_NAME}';",
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS storage_limit_bytes BIGINT NOT NULL DEFAULT {int(DEFAULT_STORAGE_LIMIT_BYTES)};",

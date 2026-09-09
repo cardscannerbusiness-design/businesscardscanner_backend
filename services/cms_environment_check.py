@@ -299,6 +299,7 @@ def check_admin_environment(admin_id: str) -> dict[str, Any]:
             "admin_id": item.get("admin_id"),
             "tenant_id": item.get("tenant_id") or item.get("company_id"),
             "company_name": item.get("company_name"),
+            "display_name": item.get("display_name") or "",
             "email": item.get("email"),
         },
         "versions": {

@@ -13,10 +13,22 @@ from psycopg2.extras import Json
 
 from auth.constants import ROLE_ADMIN, ROLE_SUPER_ADMIN, ROLE_USER
 from db.pool import db_cursor
+from services.company_display_identity import (
+    COMPANY_PROFILES_DIR,
+    absolute_profile_path,
+    company_profile_relative_path,
+    normalize_display_name,
+    public_display_picture_url,
+    validate_display_picture,
+)
 from services.email_display_name import normalize_email_display_name
 from services.entitlement_service import (
     DEFAULT_FREEMIUM_CARD_LIMIT,
     is_default_user_card_limit,
+)
+from services.user_profile_identity import (
+    effective_display_name,
+    public_profile_image_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -256,7 +268,7 @@ def _apply_legacy(raw: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any
     return out
 
 
-def _sync_whatsapp_template_names(wa: dict[str, Any]) -> dict[str, Any]:
+def sync_whatsapp_template_names(wa: dict[str, Any]) -> dict[str, Any]:
     """Keep CMS template fields and runtime template_name in sync.
 
     CMS UI edits business_card_template_name / card_received_template_name /
@@ -280,6 +292,10 @@ def _sync_whatsapp_template_names(wa: dict[str, Any]) -> dict[str, Any]:
         if not scan:
             out["scan_template_name"] = preferred
     return out
+
+
+# Back-compat alias for internal callers.
+_sync_whatsapp_template_names = sync_whatsapp_template_names
 
 
 def _empty_whatsapp() -> dict[str, Any]:
@@ -494,6 +510,134 @@ def set_admin_company_email_display_name(
     return result
 
 
+def get_company_display_name(company_id: str | None) -> str | None:
+    """CMS Display Name for business identity; falls back to company_name."""
+    if not company_id:
+        return None
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT display_name, company_name
+            FROM companies
+            WHERE id = %s
+              AND COALESCE(status, 'active') <> 'deleted'
+            """,
+            (company_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    custom = str(row.get("display_name") or "").strip()
+    if custom:
+        return custom
+    name = str(row.get("company_name") or "").strip()
+    return name or None
+
+
+def get_company_display_picture_url(company_id: str | None) -> str | None:
+    if not company_id:
+        return None
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT display_picture_url
+            FROM companies
+            WHERE id = %s
+              AND COALESCE(status, 'active') <> 'deleted'
+            """,
+            (company_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    url = public_display_picture_url(row.get("display_picture_url"))
+    return url or None
+
+
+def set_admin_company_display_name(
+    admin_user_id: str,
+    display_name: str | None,
+) -> dict[str, Any]:
+    """Store companies.display_name (business identity; not Email Display Name)."""
+    existing = get_admin_env_settings(admin_user_id)
+    if not existing:
+        raise ValueError("Admin not found")
+    company_id = existing.get("company_id")
+    if not company_id:
+        raise ValueError("Admin has no company")
+    cleaned = normalize_display_name(display_name)
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE companies
+            SET display_name = %s, updated_at = NOW()
+            WHERE id = %s
+              AND COALESCE(status, 'active') <> 'deleted'
+            """,
+            (cleaned, company_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError("Company not found")
+    result = get_admin_env_settings(admin_user_id)
+    if not result:
+        raise RuntimeError("Failed to reload Admin after saving display name")
+    return result
+
+
+def set_admin_company_display_picture(
+    admin_user_id: str,
+    *,
+    image_bytes: bytes,
+    filename: str | None,
+    content_type: str | None,
+) -> dict[str, Any]:
+    """Validate, store, and persist companies.display_picture_url for this Admin."""
+    existing = get_admin_env_settings(admin_user_id)
+    if not existing:
+        raise ValueError("Admin not found")
+    company_id = existing.get("company_id")
+    if not company_id:
+        raise ValueError("Admin has no company")
+
+    ctype = validate_display_picture(
+        filename=filename,
+        content_type=content_type,
+        size=len(image_bytes or b""),
+    )
+    relative = company_profile_relative_path(str(company_id), ctype)
+    dest = absolute_profile_path(relative)
+    COMPANY_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Remove prior extensions for this company so stale files are not left behind.
+    safe_stem = dest.stem
+    for old in COMPANY_PROFILES_DIR.glob(f"{safe_stem}.*"):
+        try:
+            if old.resolve() != dest.resolve():
+                old.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove old profile picture %s", old)
+
+    dest.write_bytes(image_bytes)
+
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE companies
+            SET display_picture_url = %s, updated_at = NOW()
+            WHERE id = %s
+              AND COALESCE(status, 'active') <> 'deleted'
+            """,
+            (relative, company_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError("Company not found")
+
+    result = get_admin_env_settings(admin_user_id)
+    if not result:
+        raise RuntimeError("Failed to reload Admin after saving display picture")
+    return result
+
+
 def _mask_section(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key in keys:
@@ -570,6 +714,16 @@ def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
         "tenant_id": str(row["company_id"]) if row.get("company_id") else str(row["id"]),
         "company_name": row.get("company_name") or "",
         "email_display_name": str(row.get("email_display_name") or "").strip(),
+        # Per-Admin-user profile identity (users.display_name / users.profile_image)
+        "display_name": str(row.get("user_display_name") or "").strip(),
+        "display_picture_url": public_profile_image_url(
+            row.get("user_profile_image"),
+            cache_bust=(
+                str(int(row["updated_at"].timestamp()))
+                if row.get("updated_at") is not None and hasattr(row.get("updated_at"), "timestamp")
+                else None
+            ),
+        ),
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
         "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
         "has_settings": bool(row.get("settings_id")),
@@ -619,6 +773,8 @@ def list_admin_env_settings() -> list[dict[str, Any]]:
                 c.plan_name,
                 c.cms_channel_locks,
                 c.email_display_name AS email_display_name,
+                u.display_name AS user_display_name,
+                u.profile_image AS user_profile_image,
                 pi.status AS payment_intent_status,
                 pi.updated_at AS payment_intent_at,
                 pi.package_id AS payment_package_id,
@@ -668,6 +824,8 @@ def get_admin_env_settings(admin_user_id: str) -> dict[str, Any] | None:
                 c.plan_name,
                 c.cms_channel_locks,
                 c.email_display_name AS email_display_name,
+                u.display_name AS user_display_name,
+                u.profile_image AS user_profile_image,
                 pi.status AS payment_intent_status,
                 pi.updated_at AS payment_intent_at,
                 pi.package_id AS payment_package_id,
