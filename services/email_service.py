@@ -1496,16 +1496,39 @@ def _prepare_inline_asset_images(html_body: str) -> tuple[str, list[tuple[str, b
         name = path_part.rsplit("/", 1)[-1].strip()
         if not name:
             return match.group(0)
-        local_name = _INLINE_ASSET_ALIASES.get(name.lower())
-        if not local_name:
-            # Allow any file that already exists under assets/ (Bhagwati, etc.).
-            candidate = _ASSETS_DIR / name
-            if not candidate.is_file():
+
+        # Prefer nested paths under /assets/... (cms-media/{admin}/file.png).
+        rel_under_assets = ""
+        marker = "/assets/"
+        idx = path_part.lower().find(marker)
+        if idx != -1:
+            rel_under_assets = path_part[idx + len(marker) :].lstrip("/")
+        if rel_under_assets and ".." not in rel_under_assets.split("/"):
+            nested = _ASSETS_DIR / rel_under_assets
+            if nested.is_file():
+                local_name = rel_under_assets.replace("\\", "/")
+                file_path = nested
+            else:
+                local_name = ""
+                file_path = None
+        else:
+            local_name = ""
+            file_path = None
+
+        if not file_path:
+            aliased = _INLINE_ASSET_ALIASES.get(name.lower())
+            if aliased:
+                local_name = aliased
+            else:
+                # Allow any file that already exists under assets/ root (Bhagwati, etc.).
+                candidate = _ASSETS_DIR / name
+                if not candidate.is_file():
+                    return match.group(0)
+                local_name = name
+            file_path = _ASSETS_DIR / local_name
+            if not file_path.is_file():
                 return match.group(0)
-            local_name = name
-        file_path = _ASSETS_DIR / local_name
-        if not file_path.is_file():
-            return match.group(0)
+
         cid = re.sub(r"[^a-zA-Z0-9._-]+", "-", local_name).strip("-").lower()
         if not cid:
             return match.group(0)

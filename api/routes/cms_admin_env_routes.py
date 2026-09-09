@@ -35,6 +35,11 @@ from services.user_profile_identity import (
     set_user_display_name,
     set_user_profile_picture,
 )
+from services.cms_media_service import (
+    delete_cms_media,
+    list_cms_media,
+    save_cms_media,
+)
 from services.cms_app_access import update_channel_locks
 from services.company_lifecycle import CompanyNotFoundError, remove_cms_client
 from services.admin_runtime_config import use_admin_env_payload
@@ -358,6 +363,108 @@ async def put_admin_display_picture(
         "profile_image": identity.get("profile_image") or "",
         "display_name": identity.get("display_name") or "",
     }
+
+
+@router.get(
+    "/admin-env/{admin_id}/media",
+    summary="List CMS media library files for this Admin",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def get_admin_cms_media(admin_id: str):
+    item = get_admin_env(admin_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Admin not found.")
+    try:
+        items = list_cms_media(admin_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "items": items}
+
+
+@router.post(
+    "/admin-env/{admin_id}/media",
+    summary="Upload a file to this Admin's CMS media library",
+    description=(
+        "Stores under assets/cms-media/{admin_id}/. Use the returned public URL in "
+        "email HTML or WhatsApp header media. JPEG, PNG, WebP, GIF, MP4, PDF · max 25 MB."
+    ),
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+async def post_admin_cms_media(
+    admin_id: str,
+    request: Request,
+    file: UploadFile = File(..., description="Image, video, or PDF for templates"),
+):
+    actor = get_current_user(request)
+    item = get_admin_env(admin_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Admin not found.")
+    raw = await file.read()
+    try:
+        media = save_cms_media(
+            admin_id,
+            file_bytes=raw,
+            filename=file.filename,
+            content_type=file.content_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        logger.error("Failed to store CMS media for admin=%s: %s", admin_id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Could not store the media file on the server.",
+        ) from exc
+
+    log_action(
+        str(actor["id"]),
+        "cms_media_uploaded",
+        ip=request.client.host if request.client else "",
+        new_value={
+            "admin_id": admin_id,
+            "filename": media.get("filename"),
+            "url": media.get("url"),
+            "content_type": media.get("content_type"),
+            "size": media.get("size"),
+        },
+    )
+    return {"success": True, "item": media}
+
+
+@router.delete(
+    "/admin-env/{admin_id}/media/{filename}",
+    summary="Delete a file from this Admin's CMS media library",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def delete_admin_cms_media(admin_id: str, filename: str, request: Request):
+    actor = get_current_user(request)
+    item = get_admin_env(admin_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Admin not found.")
+    try:
+        deleted = delete_cms_media(admin_id, filename)
+    except ValueError as exc:
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=status, detail=msg) from exc
+    except OSError as exc:
+        logger.error("Failed to delete CMS media admin=%s file=%s: %s", admin_id, filename, exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Could not delete the media file on the server.",
+        ) from exc
+
+    log_action(
+        str(actor["id"]),
+        "cms_media_deleted",
+        ip=request.client.host if request.client else "",
+        new_value={
+            "admin_id": admin_id,
+            "filename": deleted.get("filename"),
+            "url": deleted.get("url"),
+        },
+    )
+    return {"success": True, "item": deleted}
 
 
 @router.delete(

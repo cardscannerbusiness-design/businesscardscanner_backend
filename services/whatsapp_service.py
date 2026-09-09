@@ -969,17 +969,22 @@ def _is_publicly_reachable_url(url: str) -> bool:
 
 
 def _local_path_for_static_url(url: str) -> Path | None:
-    """Map a /static/... URL back to the file inside the backend static folder."""
-    marker = "/static/"
-    idx = url.find(marker)
-    if idx == -1:
-        return None
-    rel = url[idx + len(marker):].split("?")[0]
-    static_root = (_BACKEND_ROOT / "static").resolve()
-    path = (static_root / rel).resolve()
-    if not str(path).startswith(str(static_root)):
-        return None
-    return path if path.is_file() else None
+    """Map /static/... or /assets/... URLs back to files on this API host."""
+    raw = str(url or "").strip().replace("\\", "/")
+    for marker, folder in (("/assets/", "assets"), ("/static/", "static")):
+        idx = raw.find(marker)
+        if idx == -1:
+            continue
+        rel = raw[idx + len(marker) :].split("?", 1)[0]
+        if not rel or ".." in rel.split("/"):
+            return None
+        root = (_BACKEND_ROOT / folder).resolve()
+        path = (root / rel).resolve()
+        if not str(path).startswith(str(root)):
+            return None
+        if path.is_file():
+            return path
+    return None
 
 
 _MEDIA_CACHE_PATH = _BACKEND_ROOT / "data" / "whatsapp_media_cache.json"
