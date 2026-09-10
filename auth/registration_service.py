@@ -544,13 +544,14 @@ def create_admin_registration(
                 raise RegistrationError(ERR_DUPLICATE_EMAIL, "This email is already registered.", 409)
 
             password_hash = hash_password(password)
+            phone_to_store = phone if phone.startswith("+") else f"+{phone_normalized}"
             user_id, created_company_id, created_company_code = _create_admin_and_company(
                 cur,
                 email=email,
                 first_name=first_name,
                 last_name=last_name,
                 password_hash=password_hash,
-                phone=phone,
+                phone=phone_to_store,
                 designation=designation,
                 department=department,
                 username_requested=username,

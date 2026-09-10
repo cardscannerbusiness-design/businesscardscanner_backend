@@ -30,12 +30,19 @@ class SmsOtpError(Exception):
 
 
 def to_e164(digits: str) -> str:
-    raw = re.sub(r"\D", "", digits or "")
+    cleaned = (digits or "").strip()
+    if cleaned.startswith("+"):
+        raw = re.sub(r"\D", "", cleaned)
+        if not raw:
+            raise SmsOtpError("INVALID_PHONE", "Enter a valid mobile number.", 422)
+        return f"+{raw}"
+    raw = re.sub(r"\D", "", cleaned)
     if not raw:
         raise SmsOtpError("INVALID_PHONE", "Enter a valid mobile number.", 422)
     if len(raw) == 10 and raw[0] in "6789":
         raw = f"91{raw}"
     return f"+{raw}"
+
 
 
 def mask_phone(e164: str) -> str:

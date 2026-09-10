@@ -37,7 +37,22 @@ class PhoneOtpError(Exception):
 
 
 def normalize_phone(raw: str) -> str:
-    digits = re.sub(r"\D", "", raw or "")
+    cleaned = (raw or "").strip()
+    if not cleaned:
+        raise PhoneOtpError("INVALID_PHONE", "Enter a valid mobile number.", 422)
+
+    from utils.international_phone import normalize_international_phone
+
+    if cleaned.startswith("+") or cleaned.startswith("00"):
+        res = normalize_international_phone(cleaned)
+        if res.get("is_valid"):
+            return str(res["whatsapp_recipient"])
+        digits = re.sub(r"\D", "", cleaned)
+        if 7 <= len(digits) <= 15:
+            return digits
+        raise PhoneOtpError("INVALID_PHONE", res.get("error") or "Enter a valid mobile number.", 422)
+
+    digits = re.sub(r"\D", "", cleaned)
     if not digits:
         raise PhoneOtpError("INVALID_PHONE", "Enter a valid mobile number.", 422)
     if len(digits) == 10 and digits[0] in "6789":
@@ -45,6 +60,7 @@ def normalize_phone(raw: str) -> str:
     if len(digits) < 7 or len(digits) > 15:
         raise PhoneOtpError("INVALID_PHONE", "Enter a valid mobile number.", 422)
     return digits
+
 
 
 def _hash(value: str) -> str:
