@@ -188,13 +188,27 @@ def use_admin_env(admin_user_id: str | None) -> Iterator[dict[str, Any] | None]:
             except Exception as exc:
                 logger.debug("WhatsApp enable heal skipped for admin=%s: %s", admin_user_id, exc)
 
+    # Keep inbox / Reply-To meta even when CMS SMTP override is disabled (SES from .env).
+    em_raw = dict(raw.get("email") or {})
+    email_meta = {
+        key: str(em_raw.get(key) or "").strip()
+        for key in ("sender_notification_email", "reply_to", "receive_email")
+        if str(em_raw.get(key) or "").strip()
+    }
+
     with use_admin_env_payload(
         admin_user_id=admin_user_id,
         whatsapp=wa,
-        email=raw.get("email"),
+        email=em_raw,
         templates=raw.get("templates"),
         force_channels=False,
     ) as payload:
+        if email_meta and not payload.get("email"):
+            payload["email"] = dict(email_meta)
+        elif email_meta and isinstance(payload.get("email"), dict):
+            for key, value in email_meta.items():
+                if not str(payload["email"].get(key) or "").strip():
+                    payload["email"][key] = value
         logger.info(
             "Using CMS env for admin_user_id=%s (wa=%s email=%s templates=%s)",
             admin_user_id,

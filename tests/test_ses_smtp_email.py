@@ -218,6 +218,41 @@ class TestRoleBasedOutreachTransport(unittest.TestCase):
             "email-smtp.ap-south-1.amazonaws.com",
         )
 
+    @patch("services.email_service._send_via_smtp_relay")
+    @patch("services.email_service._check_recipient_mx", return_value=(True, ""))
+    def test_deliver_email_uses_cms_reply_to(
+        self, _mx: MagicMock, relay: MagicMock
+    ) -> None:
+        relay.return_value = {"success": True, "recipient_email": "to@example.com"}
+        with patch(
+            "services.admin_runtime_config.runtime_email",
+            return_value={"reply_to": "client@skyline.example"},
+        ):
+            result = outreach._deliver_email(
+                "to@example.com",
+                subject="Hello",
+                plain_body="hi",
+                html_body="<p>hi</p>",
+                sender_role="ADMIN",
+            )
+        self.assertTrue(result["success"])
+        kwargs = relay.call_args.kwargs
+        self.assertEqual(kwargs["from_address"], "external@example.com")
+        self.assertEqual(kwargs["reply_to"], "client@skyline.example")
+
+    def test_smtp_reply_to_falls_back_to_business_email(self) -> None:
+        with patch(
+            "services.admin_runtime_config.runtime_email",
+            return_value={},
+        ), patch(
+            "services.admin_runtime_config.get_runtime",
+            return_value=None,
+        ):
+            self.assertEqual(
+                outreach.smtp_reply_to_email(sender_role="ADMIN"),
+                "reply@example.com",
+            )
+
 
 class TestRoleBasedAuthEmail(unittest.TestCase):
     @patch("auth.email_service.smtplib.SMTP")

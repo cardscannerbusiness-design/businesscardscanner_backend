@@ -59,6 +59,7 @@ EMAIL_KEYS = (
     "smtp_password",
     "smtp_from",
     "sender_notification_email",  # CMS "Receive email" — scanned-details copy inbox
+    "reply_to",  # CMS "Reply-To" — where recipients land when they reply
     "enabled",
 )
 
@@ -438,6 +439,30 @@ def get_cms_receive_email(admin_user_id: str | None) -> str | None:
     return str(em.get("receive_email") or "").strip() or None
 
 
+def get_cms_reply_to_email(admin_user_id: str | None) -> str | None:
+    """Per-Admin CMS Reply-To for outbound thank-you mail (ignores SMTP enabled flag)."""
+    if not admin_user_id:
+        return None
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT s.email
+            FROM admin_env_settings s
+            JOIN users u ON u.id = s.admin_user_id
+            JOIN roles r ON r.id = u.role_id
+            WHERE s.admin_user_id = %s
+              AND u.deleted_at IS NULL
+              AND r.name = %s
+            """,
+            (admin_user_id, ROLE_ADMIN),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    em = _normalize_email_receive_fields(_as_dict(row.get("email") if isinstance(row, dict) else None))
+    return str(em.get("reply_to") or "").strip() or None
+
+
 def get_company_email_display_name(company_id: str | None) -> str | None:
     """Saved From display name for this company; None means use the default."""
     if not company_id:
@@ -740,6 +765,7 @@ def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
             EMAIL_KEYS,
         ),
         "receive_email": str(email_raw.get("receive_email") or ""),
+        "reply_to": str(email_raw.get("reply_to") or "").strip(),
         "templates": _public_templates(templates_raw),
         "google_sheets": _mask_section(
             {
