@@ -18,6 +18,7 @@ from auth.registration_service import (
     list_admin_registrations,
     reject_admin_registration,
 )
+from services.recaptcha_service import RecaptchaError, verify_recaptcha_v2
 
 router = APIRouter(prefix="/api/registrations", tags=["Registrations"])
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ class AdminRegistrationRequest(BaseModel):
     company_website: str = ""
     username: str = ""
     phone_verification_token: str = ""
+    recaptcha_token: str = Field(..., description="Google reCAPTCHA v2 response token")
 
 
 class PhoneOtpSendRequest(BaseModel):
@@ -107,6 +109,14 @@ def submit_admin_registration(body: AdminRegistrationRequest, request: Request):
             detail={"code": "PASSWORD_MISMATCH", "message": "Passwords do not match."},
         )
     meta = _meta(request)
+    try:
+        verify_recaptcha_v2(body.recaptcha_token, remote_ip=meta["ip"])
+    except RecaptchaError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+
     try:
         return create_admin_registration(
             full_name=body.full_name,

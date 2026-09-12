@@ -155,6 +155,7 @@ class WipeAllDataBody(BaseModel):
 class LoginRequest(BaseModel):
     identifier: str = Field(..., description="Email or username")
     password: str = Field(..., min_length=1, description="Account password")
+    recaptcha_token: str = Field(..., description="Google reCAPTCHA v2 response token")
 
 
 class RefreshTokenRequest(BaseModel):

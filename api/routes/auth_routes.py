@@ -15,6 +15,7 @@ from api.schemas import (
 )
 from auth.dependencies import get_current_user
 from auth.service import AuthError, forgot_password, login, logout, logout_all, refresh_tokens, reset_password, verify_email
+from services.recaptcha_service import RecaptchaError, verify_recaptcha_v2
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 logger = logging.getLogger(__name__)
@@ -34,6 +35,14 @@ def _request_meta(request: Request) -> dict[str, str]:
 )
 def login_route(body: LoginRequest, request: Request):
     meta = _request_meta(request)
+    try:
+        verify_recaptcha_v2(body.recaptcha_token, remote_ip=meta["ip"])
+    except RecaptchaError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+
     try:
         return login(
             body.identifier, body.password, ip=meta["ip"], user_agent=meta["user_agent"],
