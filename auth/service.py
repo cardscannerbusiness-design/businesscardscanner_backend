@@ -28,6 +28,7 @@ from auth.constants import (
     ERR_ACCOUNT_REGISTRATION_REJECTED,
     ERR_DUPLICATE_EMAIL,
     ERR_DUPLICATE_USERNAME,
+    ERR_FORBIDDEN,
     ERR_INVALID_CREDENTIALS,
     ERR_TOKEN_EXPIRED,
     ERR_TOKEN_INVALID,
@@ -125,6 +126,7 @@ def login(
     *,
     ip: str = "",
     user_agent: str = "",
+    required_role: str | None = None,
 ) -> dict[str, Any]:
     """Authenticate by email or username + password. Returns token pair + user info."""
     identifier = identifier.strip().lower()
@@ -211,6 +213,17 @@ def login(
             )
             raise AuthError(ERR_INVALID_CREDENTIALS, "Invalid email/username or password.", 401)
 
+        # ── Check role restriction before resetting failed attempts or minting tokens ──
+        role_name = user["role_name"]
+        if required_role and role_name != required_role:
+            audit_service.log_action(user_id, AUDIT_LOGIN_FAILED, ip=ip, user_agent=user_agent,
+                                     new_value={"reason": f"Required role {required_role}, got {role_name}"})
+            raise AuthError(
+                ERR_FORBIDDEN,
+                f"Access denied. Only {required_role} accounts can log into this portal.",
+                403,
+            )
+
         # ── Successful login ──────────────────────────────────────────────
         # Reset failed attempts
         cur.execute(
@@ -219,7 +232,6 @@ def login(
         )
 
     # Generate tokens (outside transaction)
-    role_name = user["role_name"]
     company_id = str(user["company_id"]) if user.get("company_id") else None
 
     # Mint session_id first so both access + refresh JWTs carry a valid binding.

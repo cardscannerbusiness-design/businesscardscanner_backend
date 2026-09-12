@@ -7,12 +7,14 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 
 from api.schemas import (
+    CMSLoginRequest,
     ForgotPasswordRequest,
     LoginRequest,
     RefreshTokenRequest,
     ResetPasswordRequest,
     VerifyEmailRequest,
 )
+from auth.constants import ROLE_SUPER_ADMIN
 from auth.dependencies import get_current_user
 from auth.service import AuthError, forgot_password, login, logout, logout_all, refresh_tokens, reset_password, verify_email
 from services.recaptcha_service import RecaptchaError, verify_recaptcha_v2
@@ -46,6 +48,25 @@ def login_route(body: LoginRequest, request: Request):
     try:
         return login(
             body.identifier, body.password, ip=meta["ip"], user_agent=meta["user_agent"],
+        )
+    except AuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": exc.message}) from exc
+
+
+@router.post(
+    "/cms/login",
+    summary="CMS login for Super Admin only (no CAPTCHA)",
+    description="Returns JWT access token and refresh token for SUPER_ADMIN role only. Rejects other roles.",
+)
+def cms_login_route(body: CMSLoginRequest, request: Request):
+    meta = _request_meta(request)
+    try:
+        return login(
+            body.identifier,
+            body.password,
+            ip=meta["ip"],
+            user_agent=meta["user_agent"],
+            required_role=ROLE_SUPER_ADMIN,
         )
     except AuthError as exc:
         raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": exc.message}) from exc

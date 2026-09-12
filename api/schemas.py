@@ -158,6 +158,11 @@ class LoginRequest(BaseModel):
     recaptcha_token: str = Field(..., description="Google reCAPTCHA v2 response token")
 
 
+class CMSLoginRequest(BaseModel):
+    identifier: str = Field(..., description="Email or username")
+    password: str = Field(..., min_length=1, description="Account password")
+
+
 class RefreshTokenRequest(BaseModel):
     refresh_token: str = Field(..., description="Refresh token from login response")
 
