@@ -387,7 +387,8 @@ def _cms_smtp_profile() -> dict[str, Any] | None:
         sender = user
     if not sender:
         sender = SMTP_EXTERNAL_FROM or SMTP_FROM or BUSINESS_EMAIL or ""
-    reply = sender or BUSINESS_EMAIL or SMTP_FROM or ""
+    cms_reply = str(em.get("reply_to") or "").strip()
+    reply = cms_reply or sender or BUSINESS_EMAIL or SMTP_FROM or ""
     return _smtp_profile_from_parts(
         host=host,
         port=port,
@@ -498,13 +499,44 @@ def smtp_sender_email(
     )
 
 
+def _cms_reply_to_override() -> str:
+    """Per-Admin CMS Reply-To when set (runtime meta or DB), else empty."""
+    from services.admin_runtime_config import get_runtime, runtime_email
+
+    em = runtime_email() or {}
+    reply = str(em.get("reply_to") or "").strip()
+    if reply and _looks_like_email(reply):
+        return reply
+
+    rt = get_runtime() or {}
+    admin_id = rt.get("admin_user_id")
+    if not admin_id:
+        return ""
+    try:
+        from services.admin_env_service import get_cms_reply_to_email
+
+        found = get_cms_reply_to_email(str(admin_id))
+    except Exception:
+        return ""
+    found = str(found or "").strip()
+    if found and _looks_like_email(found):
+        return found
+    return ""
+
+
 def smtp_reply_to_email(
     *,
     sender_role: str | None = None,
     contact: dict[str, Any] | None = None,
     smtp_lane: str | None = None,
 ) -> str:
-    """Public reply address; may differ from the authenticated From mailbox."""
+    """Public reply address; may differ from the authenticated From mailbox.
+
+    Prefer per-Admin CMS Reply-To when configured; otherwise BUSINESS_EMAIL / SMTP From.
+    """
+    cms_reply = _cms_reply_to_override()
+    if cms_reply:
+        return cms_reply
     active = _active_smtp(
         sender_role=sender_role, contact=contact, smtp_lane=smtp_lane
     )
@@ -975,7 +1007,8 @@ def _send_via_smtp(
             smtp_password=str(smtp.get("password") or ""),
             from_address=str(smtp.get("from") or ""),
             reply_to=str(
-                smtp.get("reply")
+                _cms_reply_to_override()
+                or smtp.get("reply")
                 or smtp_reply_to_email(
                     sender_role=sender_role, contact=contact, smtp_lane=smtp_lane
                 )
