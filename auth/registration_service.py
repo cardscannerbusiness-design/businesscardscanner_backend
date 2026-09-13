@@ -203,8 +203,8 @@ def _create_admin_and_company(
         INSERT INTO companies (
             id, company_name, company_code, address, phone, email, website,
             status, plan_name, storage_limit_bytes, used_storage_bytes,
-            created_at, updated_at
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,0,%s,%s)
+            storage_unlimited, created_at, updated_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,0,FALSE,%s,%s)
         """,
         (
             company_id,
@@ -726,8 +726,8 @@ def approve_admin_registration(
                 INSERT INTO companies (
                     id, company_name, company_code, address, phone, email, website,
                     status, plan_name, storage_limit_bytes, used_storage_bytes,
-                    created_at, updated_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,0,%s,%s)
+                    storage_unlimited, created_at, updated_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,0,FALSE,%s,%s)
                 """,
                 (
                     company_id,

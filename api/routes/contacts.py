@@ -414,6 +414,7 @@ async def storage_usage(response: Response, user: dict = Depends(get_current_use
             "remaining_mb": None,
             "can_upload": True,
             "warning_level": "NORMAL",
+            "storage_unlimited": True,
         }
         unlimited.update(entitlement_fields_for_usage(None))
         unlimited["plan"] = "UNLIMITED"

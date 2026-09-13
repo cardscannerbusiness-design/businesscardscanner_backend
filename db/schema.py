@@ -119,6 +119,7 @@ SCHEMA_STATEMENTS: list[str] = [
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS plan_name VARCHAR(64) NOT NULL DEFAULT '{DEFAULT_PLAN_NAME}';",
     f"ALTER TABLE companies ADD COLUMN IF NOT EXISTS storage_limit_bytes BIGINT NOT NULL DEFAULT {int(DEFAULT_STORAGE_LIMIT_BYTES)};",
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS used_storage_bytes BIGINT NOT NULL DEFAULT 0;",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS storage_unlimited BOOLEAN NOT NULL DEFAULT FALSE;",
     # Freemium card allowance (default = 10). Existing DBs that still have the
     # original test default of 2 or the previous 25-card default are updated
     # below; SuperAdmin is not billed via companies.card_limit (role check in

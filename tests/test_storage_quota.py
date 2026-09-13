@@ -138,8 +138,9 @@ class TestStorageUpdateAndRelease(unittest.TestCase):
 
 
 class TestGetStorageUsageShape(unittest.TestCase):
+    @patch("services.entitlement_service.entitlement_fields_for_usage", return_value={"card_limit": 10, "cards_used": 0, "cards_remaining": 10, "freemium_exhausted": False, "card_quota_enforced": True, "can_process_card": True, "whatsapp_allowed": True, "email_allowed": True, "google_sheets_allowed": True, "cms_channel_locks": {"whatsapp": False, "email": False, "google_sheets": False}, "cms_whatsapp_locked": False, "cms_email_locked": False, "cms_google_sheets_locked": False, "contacts_allowed": True, "entitlement_started_at": None, "entitlement_exhausted_at": None, "scans_unlimited": False})
     @patch("db.pool.db_cursor")
-    def test_usage_includes_mb_fields(self, db_cursor: MagicMock) -> None:
+    def test_usage_includes_mb_fields(self, db_cursor: MagicMock, mock_entitlements: MagicMock) -> None:
         cur = MagicMock()
         cur.fetchone.return_value = {
             "id": "c1",
@@ -161,8 +162,9 @@ class TestGetStorageUsageShape(unittest.TestCase):
         self.assertTrue(usage["can_upload"])
         self.assertEqual(usage["warning_level"], "NORMAL")
 
+    @patch("services.entitlement_service.entitlement_fields_for_usage", return_value={"card_limit": 10, "cards_used": 0, "cards_remaining": 10, "freemium_exhausted": False, "card_quota_enforced": True, "can_process_card": True, "whatsapp_allowed": True, "email_allowed": True, "google_sheets_allowed": True, "cms_channel_locks": {"whatsapp": False, "email": False, "google_sheets": False}, "cms_whatsapp_locked": False, "cms_email_locked": False, "cms_google_sheets_locked": False, "contacts_allowed": True, "entitlement_started_at": None, "entitlement_exhausted_at": None, "scans_unlimited": False})
     @patch("db.pool.db_cursor")
-    def test_usage_warning_critical_blocked(self, db_cursor: MagicMock) -> None:
+    def test_usage_warning_critical_blocked(self, db_cursor: MagicMock, mock_entitlements: MagicMock) -> None:
         cur = MagicMock()
         db_cursor.return_value.__enter__.return_value = cur
 
@@ -228,5 +230,105 @@ class TestSoftDeleteMissing(unittest.TestCase):
         self.assertFalse(result["success"])
 
 
+class TestStorageUnlimited(unittest.TestCase):
+    def test_normal_company_below_limit_upload_allowed(self) -> None:
+        cur = MagicMock()
+        cur.fetchone.return_value = {
+            "id": "c1",
+            "plan_name": "FREEMIUM",
+            "storage_limit_bytes": 1048576,
+            "used_storage_bytes": 100_000,
+            "storage_unlimited": False,
+        }
+        # Should not raise
+        svc.assert_can_upload_locked(cur, "c1", 50_000)
+
+    def test_normal_company_over_limit_upload_blocked(self) -> None:
+        cur = MagicMock()
+        cur.fetchone.return_value = {
+            "id": "c1",
+            "plan_name": "FREEMIUM",
+            "storage_limit_bytes": 1048576,
+            "used_storage_bytes": 1048576,
+            "storage_unlimited": False,
+        }
+        with self.assertRaises(svc.StorageLimitExceededError):
+            svc.assert_can_upload_locked(cur, "c1", 1)
+
+    def test_unlimited_company_over_limit_upload_allowed(self) -> None:
+        cur = MagicMock()
+        cur.fetchone.return_value = {
+            "id": "c1",
+            "plan_name": "FREEMIUM",
+            "storage_limit_bytes": 1048576,
+            "used_storage_bytes": 2000000,  # exceeds limit
+            "storage_unlimited": True,
+        }
+        # Should not raise because storage_unlimited is True
+        svc.assert_can_upload_locked(cur, "c1", 500_000)
+
+    @patch.object(svc, "get_company_storage")
+    def test_can_upload_unlimited_company(self, get_storage: MagicMock) -> None:
+        get_storage.return_value = {
+            "storage_limit_bytes": 1000,
+            "used_storage_bytes": 5000,
+            "storage_unlimited": True,
+        }
+        self.assertTrue(svc.can_upload("c1", 10_000))
+
+    def test_normalize_row_unlimited_fields(self) -> None:
+        row = {
+            "id": "c1",
+            "plan_name": "FREEMIUM",
+            "storage_limit_bytes": 1048576,
+            "used_storage_bytes": 2000000,
+            "storage_unlimited": True,
+        }
+        norm = svc._normalize_row(row)
+        self.assertTrue(norm["storage_unlimited"])
+        self.assertEqual(norm["warning_level"], "NORMAL")
+        self.assertEqual(norm["used_percentage"], 0.0)
+        self.assertTrue(norm["can_upload"])
+        self.assertEqual(norm["remaining_storage_bytes"], 0)
+        self.assertEqual(norm["used_storage_bytes"], 2000000)
+
+    def test_normalize_row_normal_company(self) -> None:
+        row = {
+            "id": "c1",
+            "plan_name": "FREEMIUM",
+            "storage_limit_bytes": 1048576,
+            "used_storage_bytes": 100000,
+            "storage_unlimited": False,
+        }
+        norm = svc._normalize_row(row)
+        self.assertFalse(norm["storage_unlimited"])
+        self.assertEqual(norm["warning_level"], "NORMAL")
+        self.assertGreater(norm["used_percentage"], 0.0)
+        self.assertTrue(norm["can_upload"])
+
+    def test_tuple_row_with_storage_unlimited(self) -> None:
+        row = ("c1", "FREEMIUM", 1048576, 1000, True)
+        parsed = svc._row_as_dict(row)
+        self.assertEqual(parsed["id"], "c1")
+        self.assertEqual(parsed["storage_limit_bytes"], 1048576)
+        self.assertEqual(parsed["used_storage_bytes"], 1000)
+        self.assertTrue(parsed["storage_unlimited"])
+
+    def test_scans_unlimited_does_not_affect_storage_quota(self) -> None:
+        """scans_unlimited=True must not allow storage quota bypass if storage_unlimited=False."""
+        cur = MagicMock()
+        cur.fetchone.return_value = {
+            "id": "c1",
+            "plan_name": "FREEMIUM",
+            "storage_limit_bytes": 1000,
+            "used_storage_bytes": 1000,
+            "storage_unlimited": False,
+        }
+        # In storage_service, only storage_unlimited grants unlimited storage
+        with self.assertRaises(svc.StorageLimitExceededError):
+            svc.assert_can_upload_locked(cur, "c1", 10)
+
+
 if __name__ == "__main__":
     unittest.main()
+

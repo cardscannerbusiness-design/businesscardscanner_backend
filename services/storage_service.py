@@ -25,7 +25,21 @@ _STATEMENT_TIMEOUT_MS = 15_000
 _WARNING_THRESHOLD_PCT = 75.0
 _CRITICAL_THRESHOLD_PCT = 90.0
 
-_COMPANY_LOCK_COLUMNS = ("id", "plan_name", "storage_limit_bytes", "used_storage_bytes")
+_COMPANY_LOCK_COLUMNS = (
+    "id",
+    "plan_name",
+    "storage_limit_bytes",
+    "used_storage_bytes",
+    "storage_unlimited",
+)
+
+
+_COMPANY_LOCK_COLUMNS_LEGACY = (
+    "id",
+    "plan_name",
+    "storage_limit_bytes",
+    "used_storage_bytes",
+)
 
 
 def _log_step(tag: str, message: str, *, started_at: float | None = None, **fields: Any) -> float:
@@ -46,8 +60,13 @@ def _row_as_dict(row: Any) -> dict[str, Any]:
         raise LookupError("Company row is empty")
     if isinstance(row, dict):
         return dict(row)
-    if isinstance(row, (tuple, list)) and len(row) >= len(_COMPANY_LOCK_COLUMNS):
-        return dict(zip(_COMPANY_LOCK_COLUMNS, row[: len(_COMPANY_LOCK_COLUMNS)]))
+    if isinstance(row, (tuple, list)):
+        if len(row) >= len(_COMPANY_LOCK_COLUMNS):
+            return dict(zip(_COMPANY_LOCK_COLUMNS, row[: len(_COMPANY_LOCK_COLUMNS)]))
+        if len(row) >= len(_COMPANY_LOCK_COLUMNS_LEGACY):
+            d = dict(zip(_COMPANY_LOCK_COLUMNS_LEGACY, row[: len(_COMPANY_LOCK_COLUMNS_LEGACY)]))
+            d["storage_unlimited"] = False
+            return d
     raise TypeError(f"Unsupported company row type: {type(row)!r}")
 
 
@@ -108,7 +127,9 @@ def _bytes_to_mb(value: int | float) -> float:
     return round(float(value) / (1024 * 1024), 2)
 
 
-def _warning_level(used_bytes: int, limit_bytes: int, used_pct: float) -> str:
+def _warning_level(used_bytes: int, limit_bytes: int, used_pct: float, *, storage_unlimited: bool = False) -> str:
+    if storage_unlimited:
+        return "NORMAL"
     if limit_bytes <= 0 or used_bytes >= limit_bytes:
         return "BLOCKED"
     if used_pct >= _CRITICAL_THRESHOLD_PCT:
@@ -118,32 +139,48 @@ def _warning_level(used_bytes: int, limit_bytes: int, used_pct: float) -> str:
     return "NORMAL"
 
 
-def _fits_within_quota(used_bytes: int, limit_bytes: int, image_size_bytes: int) -> bool:
-    """True when used + size fits within the company's storage_limit_bytes."""
+def _fits_within_quota(
+    used_bytes: int,
+    limit_bytes: int,
+    image_size_bytes: int,
+    *,
+    storage_unlimited: bool = False,
+) -> bool:
+    """True when used + size fits within the company's storage_limit_bytes, or storage is unlimited."""
+    if storage_unlimited:
+        return True
     size = max(0, int(image_size_bytes or 0))
     if size == 0:
         return True
     return (max(0, used_bytes) + size) <= max(0, limit_bytes)
 
 
-def _normalize_row(row: dict[str, Any] | None, company_id: str) -> dict[str, Any]:
+def _normalize_row(row: dict[str, Any] | None, company_id: str | None = None) -> dict[str, Any]:
     """Build the canonical storage usage payload from a companies row."""
+    fallback_id = str(company_id or "")
     if not row:
         limit_bytes = DEFAULT_STORAGE_LIMIT_BYTES
         used_bytes = 0
         plan = DEFAULT_PLAN_NAME
-        resolved_id = company_id
+        resolved_id = fallback_id
+        storage_unlimited = False
     else:
         plan = str(row.get("plan_name") or DEFAULT_PLAN_NAME).strip() or DEFAULT_PLAN_NAME
         limit_bytes = int(row.get("storage_limit_bytes") or DEFAULT_STORAGE_LIMIT_BYTES)
         if limit_bytes < 0:
             limit_bytes = DEFAULT_STORAGE_LIMIT_BYTES
         used_bytes = max(0, int(row.get("used_storage_bytes") or 0))
-        resolved_id = str(row.get("id") or company_id)
+        resolved_id = str(row.get("id") or fallback_id)
+        storage_unlimited = bool(row.get("storage_unlimited"))
 
-    remaining = max(0, limit_bytes - used_bytes)
-    used_pct = round((used_bytes / limit_bytes) * 100, 1) if limit_bytes > 0 else 0.0
-    can_upload_more = remaining > 0 and used_bytes < limit_bytes
+    if storage_unlimited:
+        remaining = 0
+        used_pct = 0.0
+        can_upload_more = True
+    else:
+        remaining = max(0, limit_bytes - used_bytes)
+        used_pct = round((used_bytes / limit_bytes) * 100, 1) if limit_bytes > 0 else 0.0
+        can_upload_more = remaining > 0 and used_bytes < limit_bytes
 
     return {
         "company_id": resolved_id,
@@ -157,7 +194,8 @@ def _normalize_row(row: dict[str, Any] | None, company_id: str) -> dict[str, Any
         "limit_mb": _bytes_to_mb(limit_bytes),
         "remaining_mb": _bytes_to_mb(remaining),
         "can_upload": can_upload_more,
-        "warning_level": _warning_level(used_bytes, limit_bytes, used_pct),
+        "warning_level": _warning_level(used_bytes, limit_bytes, used_pct, storage_unlimited=storage_unlimited),
+        "storage_unlimited": storage_unlimited,
     }
 
 
@@ -170,7 +208,7 @@ def get_company_storage(company_id: str) -> dict[str, Any]:
         with db_cursor(commit=False) as cur:
             cur.execute(
                 """
-                SELECT id, plan_name, storage_limit_bytes, used_storage_bytes
+                SELECT id, plan_name, storage_limit_bytes, used_storage_bytes, storage_unlimited
                 FROM companies
                 WHERE id = %s
                 """,
@@ -225,6 +263,7 @@ def can_upload(company_id: str, image_size_bytes: int) -> bool:
         info["used_storage_bytes"],
         info["storage_limit_bytes"],
         size,
+        storage_unlimited=bool(info.get("storage_unlimited")),
     )
 
 
@@ -241,7 +280,7 @@ def _lock_company(cur: Any, company_id: str) -> dict[str, Any]:
         _apply_txn_timeouts(cur)
         cur.execute(
             """
-            SELECT id, plan_name, storage_limit_bytes, used_storage_bytes
+            SELECT id, plan_name, storage_limit_bytes, used_storage_bytes, storage_unlimited
             FROM companies
             WHERE id = %s
             FOR UPDATE
@@ -310,7 +349,12 @@ def assert_can_upload(company_id: str | None, image_size_bytes: int) -> None:
         locked=False,
     )
     info = get_company_storage(company_id)
-    if _fits_within_quota(info["used_storage_bytes"], info["storage_limit_bytes"], size):
+    if _fits_within_quota(
+        info["used_storage_bytes"],
+        info["storage_limit_bytes"],
+        size,
+        storage_unlimited=bool(info.get("storage_unlimited")),
+    ):
         _log_step(
             "STORAGE",
             "Storage Validation Passed",
@@ -339,7 +383,12 @@ def assert_can_upload_locked(cur: Any, company_id: str | None, image_size_bytes:
     )
     row = _lock_company(cur, company_id)
     info = _normalize_row(row, company_id)
-    if _fits_within_quota(info["used_storage_bytes"], info["storage_limit_bytes"], size):
+    if _fits_within_quota(
+        info["used_storage_bytes"],
+        info["storage_limit_bytes"],
+        size,
+        storage_unlimited=bool(info.get("storage_unlimited")),
+    ):
         _log_step(
             "STORAGE",
             "Storage Validation Passed",
