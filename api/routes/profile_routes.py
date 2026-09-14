@@ -407,39 +407,41 @@ def get_assigned_email_template(request: Request):
     from services.admin_env_service import get_admin_env_settings
 
     admin_id = resolve_owner_admin_id(user)
-    if not admin_id:
+    templates = None
+    if admin_id:
+        admin_settings = get_admin_env_settings(admin_id)
+        if admin_settings and admin_settings.get("templates"):
+            templates = admin_settings["templates"]
+
+    if templates:
+        subject = str(templates.get("email_subject") or "").strip()
+        body = str(templates.get("email_body") or "").strip()
+        raw_token_map = templates.get("token_map")
+        token_map: dict[str, str] = {}
+        if isinstance(raw_token_map, dict):
+            token_map = {str(k): str(v) for k, v in raw_token_map.items() if str(k).strip()}
+        has_template = bool(subject or body)
         return {
-            "assigned": False,
-            "email_subject": "",
-            "email_body": "",
-            "token_map": {},
+            "assigned": has_template,
+            "email_subject": subject,
+            "email_body": body,
+            "token_map": token_map,
         }
 
-    admin_settings = get_admin_env_settings(admin_id)
-    if not admin_settings or not admin_settings.get("templates"):
-        return {
-            "assigned": False,
-            "email_subject": "",
-            "email_body": "",
-            "token_map": {},
-        }
+    # Fallback to system approved default email template matching email_service.py flow
+    from services.email_service import SUBJECT
+    from services.email_template_service import get_thank_you_body_cms_default
+    from services.template_token_service import DEFAULT_TOKEN_MAP
 
-    templates = admin_settings["templates"]
-    subject = str(templates.get("email_subject") or "").strip()
-    body = str(templates.get("email_body") or "").strip()
-
-    raw_token_map = templates.get("token_map")
-    token_map: dict[str, str] = {}
-    if isinstance(raw_token_map, dict):
-        token_map = {str(k): str(v) for k, v in raw_token_map.items() if str(k).strip()}
-
-    has_template = bool(subject or body)
+    default_subject = str(SUBJECT or "").strip()
+    default_body = str(get_thank_you_body_cms_default() or "").strip()
+    has_default = bool(default_subject or default_body)
 
     return {
-        "assigned": has_template,
-        "email_subject": subject,
-        "email_body": body,
-        "token_map": token_map,
+        "assigned": has_default,
+        "email_subject": default_subject,
+        "email_body": default_body,
+        "token_map": dict(DEFAULT_TOKEN_MAP),
     }
 
 
