@@ -413,6 +413,18 @@ def get_assigned_email_template(request: Request):
         if admin_settings and admin_settings.get("templates"):
             templates = admin_settings["templates"]
 
+    display_name = ""
+    if admin_id:
+        try:
+            from services.user_profile_identity import get_user_profile_identity
+            prof = get_user_profile_identity(admin_id)
+            if prof:
+                display_name = str(prof.get("effective_display_name") or prof.get("display_name") or "").strip()
+        except Exception:
+            pass
+    if not display_name:
+        display_name = "Dhana"
+
     if templates:
         subject = str(templates.get("email_subject") or "").strip()
         body = str(templates.get("email_body") or "").strip()
@@ -426,6 +438,7 @@ def get_assigned_email_template(request: Request):
             "email_subject": subject,
             "email_body": body,
             "token_map": token_map,
+            "display_name": display_name,
         }
 
     # Fallback to system approved default email template matching email_service.py flow
@@ -442,6 +455,7 @@ def get_assigned_email_template(request: Request):
         "email_subject": default_subject,
         "email_body": default_body,
         "token_map": dict(DEFAULT_TOKEN_MAP),
+        "display_name": display_name,
     }
 
 

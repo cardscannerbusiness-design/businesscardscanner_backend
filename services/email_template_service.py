@@ -115,6 +115,7 @@ def thank_you_email_context(
     email: str = "",
     website: str = "",
     sign_off_name: str = "",
+    display_name: str = "",
     numbered_tokens: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Build escaped placeholder map for the thank-you template."""
@@ -123,8 +124,10 @@ def thank_you_email_context(
     email_esc = html.escape(email)
     website_esc = html.escape(website, quote=True)
     sign_esc = html.escape(sign_off_name or "Team")
+    display_name_esc = html.escape((display_name or "").strip() or "Dhana")
     ctx: dict[str, str] = {
         "GREETING": greeting_esc,
+        "DISPLAY_NAME": display_name_esc,
         "COMPANY": html.escape(company),
         "SUBJECT": html.escape(subject),
         "REPLY_HREF": html.escape(reply_href, quote=True),

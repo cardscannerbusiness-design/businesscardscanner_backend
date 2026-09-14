@@ -1141,17 +1141,43 @@ def _resolve_event_name(event_name: str | None = None, contact: dict[str, Any] |
     return BUSINESS_EVENT_NAME or "the exhibition"
 
 
+def _resolve_admin_display_name(contact: dict[str, Any] | None = None) -> str:
+    """Resolve the active Admin's profile display name, falling back to 'Dhana'."""
+    try:
+        from services.admin_runtime_config import get_runtime, resolve_owner_admin_for_outreach
+        from services.user_profile_identity import get_user_profile_identity
+
+        admin_id = None
+        rt = get_runtime()
+        if rt and rt.get("admin_user_id"):
+            admin_id = str(rt["admin_user_id"]).strip()
+        if not admin_id:
+            admin_id = resolve_owner_admin_for_outreach(contact=contact)
+        if admin_id:
+            profile = get_user_profile_identity(admin_id)
+            if profile:
+                display = str(profile.get("effective_display_name") or profile.get("display_name") or "").strip()
+                if display:
+                    return display
+    except Exception:
+        pass
+    return "Dhana"
+
+
 def build_thank_you_email_plain(
     recipient_name: str | None = None,
     *,
     event_name: str | None = None,
+    contact: dict[str, Any] | None = None,
+    display_name: str | None = None,
 ) -> str:
     """Build the plain-text fallback for the business thank-you email."""
     greeting = _greeting_name(recipient_name)
     resolved_event = _resolve_event_name(event_name)
+    resolved_display = (display_name or "").strip() or _resolve_admin_display_name(contact)
     return (
         f"Hi {greeting},\n\n"
-        f"Dhana here. It was great meeting you at {resolved_event}.\n\n"
+        f"{resolved_display} here. It was great meeting you at {resolved_event}.\n\n"
         "Quick question: After collecting business cards, how many prospects "
         "actually become customers?\n\n"
         "Most businesses at exhibitions and events struggle with:\n"
@@ -1272,8 +1298,11 @@ def build_thank_you_email_html(
 
     token_values = resolve_token_values(contact, tpl, sender_name=sign_off)
 
+    admin_display_name = _resolve_admin_display_name(contact)
+
     context = thank_you_email_context(
         greeting=_greeting_name(recipient_name or token_values.get("1")),
+        display_name=admin_display_name,
         company=BUSINESS_COMPANY_NAME,
         subject=_cms_email_subject(recipient_name, contact=contact),
         reply_href=f"mailto:{reply_addr}",
@@ -1307,7 +1336,7 @@ def build_thank_you_email_body(
 ) -> tuple[str, str]:
     """Return (plain_text, html) bodies for the business thank-you email."""
     return (
-        build_thank_you_email_plain(recipient_name, event_name=event_name),
+        build_thank_you_email_plain(recipient_name, event_name=event_name, contact=contact),
         build_thank_you_email_html(recipient_name, event_name=event_name, contact=contact),
     )
 
