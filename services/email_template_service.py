@@ -52,7 +52,7 @@ def render_thank_you_email_html(context: dict[str, str]) -> str:
     Body comes from context['BODY_HTML'] or thank-you-body-default.html.
     """
     shell = get_thank_you_shell()
-    body = (context.get("BODY_HTML") or "").strip() or get_thank_you_body_default()
+    body = (context.get("BODY_HTML") or "").strip() or get_thank_you_body_cms_default()
     ctx = {k: v for k, v in context.items() if k != "BODY_HTML"}
     body = _apply_tokens(body, ctx)
     return _apply_tokens(shell, {**ctx, "BODY_HTML": body})
