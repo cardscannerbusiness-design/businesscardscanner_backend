@@ -9,14 +9,22 @@
 <body style="margin:0; padding:0; background-color:#f5f5f5; font-family:Arial, Helvetica, sans-serif;">
 
   <!-- MAIN WRAPPER -->
-  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"
+  <table role="presentation"
+    cellpadding="0"
+    cellspacing="0"
+    border="0"
+    width="100%"
     style="background-color:#f5f5f5; margin:0; padding:30px 0;">
 
     <tr>
       <td align="center">
 
         <!-- EMAIL CONTAINER -->
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600"
+        <table role="presentation"
+          cellpadding="0"
+          cellspacing="0"
+          border="0"
+          width="600"
           style="width:100%; max-width:600px; background-color:#ffffff; border-collapse:collapse;">
 
           <!-- HEADER -->
@@ -25,7 +33,7 @@
               style="padding:28px 30px 22px 30px; background-color:#ffffff;">
 
               <div style="font-size:26px; font-weight:bold; color:#111111;">
-                NameCardScan
+                NameCardScan<span style="color:#16a34a;">.com</span>
               </div>
 
               <div style="font-size:12px; color:#777777; margin-top:5px;">
@@ -37,7 +45,10 @@
 
           <!-- GREEN ACCENT -->
           <tr>
-            <td style="height:4px; background-color:#16a34a; font-size:0; line-height:0;">
+            <td style="height:4px;
+                       background-color:#16a34a;
+                       font-size:0;
+                       line-height:0;">
               &nbsp;
             </td>
           </tr>
@@ -56,7 +67,7 @@
 
               <!-- INTRO -->
               <p style="margin:0 0 20px 0;">
-                <strong>{{DISPLAY_NAME}}</strong> here from
+                Dhana here from
                 <strong>NameCardScan.com (NCS)</strong> here 👋
               </p>
 
@@ -91,8 +102,7 @@
                              border-left:4px solid #16a34a;
                              background-color:#ffffff;
                              color:#222222;">
-                    ✓&nbsp; <strong>{{DISPLAY_NAME}}</strong> your business card details
-                    captured with 100% accuracy
+                    ✓&nbsp; Your business card details captured with 100% accuracy
                   </td>
                 </tr>
 
@@ -169,7 +179,7 @@
                     style="background-color:#16a34a;
                            border-radius:5px;">
 
-                    <a href="{{FREEMIUM_URL}}"
+                    <a href="https://www.namecardscan.com/auth/sign-in"
                       target="_blank"
                       style="display:inline-block;
                              padding:13px 25px;
@@ -386,7 +396,7 @@
                     style="padding:18px 18px 18px 8px;">
 
                     <a href="{{PDF_DOWNLOAD_HREF}}"
-                      target="_blank"
+                      download="NCS-Brochure.pdf"
                       style="display:inline-block;
                              background-color:#159bb8;
                              color:#ffffff;
@@ -413,7 +423,6 @@
                 SEE NAME CARD SCAN IN ACTION
               </p>
 
-              <!-- VIDEO THUMBNAIL -->
               <table role="presentation"
                 cellpadding="0"
                 cellspacing="0"
@@ -423,28 +432,31 @@
                        margin-bottom:30px;">
 
                 <tr>
-                  <td align="center" style="padding:0;">
+                  <td align="center"
+                    style="padding:0;">
 
-                    <a href="{{VIDEO_URL}}"
+                    <a href="https://api.namecardscan.com/assets/Promo.mp4"
                       target="_blank"
-                      title="Play video"
+                      title="Play Name Card Scan video"
                       style="display:block;
-                             max-width:528px;
                              width:100%;
+                             max-width:528px;
                              margin:0 auto;
                              text-decoration:none;
                              line-height:0;">
 
-                      <img src="{{VIDEO_THUMBNAIL_URL}}"
+                      <img src="https://api.namecardscan.com/assets/promo-play-thumb.jpg?v=2"
                         width="528"
-                        alt="See Name Card Scan in action - click to play video"
+                        alt="Click to play Name Card Scan video"
+                        border="0"
                         style="display:block;
                                width:100%;
                                max-width:528px;
                                height:auto;
                                border:0;
                                border-radius:12px;
-                               outline:none;" />
+                               outline:none;
+                               text-decoration:none;" />
 
                     </a>
 
@@ -545,7 +557,14 @@
                         font-size:14px;
                         font-weight:bold;
                         color:#ffffff;">
-                NameCardScan.com
+
+                <a href="https://www.namecardscan.com/"
+                  target="_blank"
+                  style="color:#ffffff;
+                         text-decoration:none;">
+                  NameCardScan.com
+                </a>
+
               </p>
 
               <p style="margin:0;
