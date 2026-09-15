@@ -65,7 +65,10 @@ def _probe_whatsapp_graph(wa: dict[str, Any]) -> dict[str, Any]:
             url,
             headers={"Authorization": f"Bearer {token}"},
             params={
-                "fields": "display_phone_number,verified_name,status,name_status,quality_rating",
+                "fields": (
+                    "display_phone_number,verified_name,status,name_status,"
+                    "quality_rating,account_mode,code_verification_status,messaging_limit_tier"
+                ),
             },
             timeout=20,
         )
@@ -115,9 +118,24 @@ def _probe_whatsapp_graph(wa: dict[str, Any]) -> dict[str, Any]:
                 f" · template {template_meta.get('name')} "
                 f"[{template_meta.get('status')}/{template_meta.get('language')}]"
             )
+        status = "pass"
+        code_v = str(phone_meta.get("code_verification_status") or "").upper()
+        name_st = str(phone_meta.get("name_status") or "").upper()
+        extras: list[str] = []
+        if code_v and code_v not in {"VERIFIED", "NOT_VERIFIED"}:
+            # EXPIRED is common and can disrupt trust / delivery.
+            extras.append(f"code_verification={code_v}")
+            if code_v == "EXPIRED":
+                status = "warn"
+        if name_st and name_st not in {"APPROVED", "AVAILABLE_WITHOUT_REVIEW"}:
+            extras.append(f"name_status={name_st}")
+            if name_st in {"PENDING_REVIEW", "DECLINED", "EXPIRED"}:
+                status = "warn"
+        if extras:
+            msg += " · " + ", ".join(extras)
         return {
             "ok": True,
-            "status": "pass",
+            "status": status,
             "message": msg,
             "phone": phone_meta,
             "template": template_meta,

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -831,14 +832,39 @@ def extract_address(contact: dict[str, Any]) -> str:
     return ""
 
 
-def _template_param(text: str, fallback: str = "—", max_len: int = 200) -> str:
+def _template_param(text: str, fallback: str = "N/A", max_len: int = 200) -> str:
     # WhatsApp template parameters must not contain newlines or tabs.
+    # Prefer ASCII-safe fallbacks — Meta can soft-fail delivery on odd Unicode placeholders.
     cleaned = re.sub(r"\s*[\r\n\t]+\s*", ", ", str(text or "")).strip()
-    if not cleaned:
+    if not cleaned or cleaned in {"—", "–", "-", "…"}:
         return fallback
     if len(cleaned) > max_len:
-        return cleaned[: max_len - 1] + "…"
+        return cleaned[: max_len - 1] + "..."
     return cleaned
+
+
+def _meta_body_example_values(meta_def: dict[str, Any]) -> list[str]:
+    """Return Meta's sample body_text values for fallbacks when contact fields are empty."""
+    for comp in meta_def.get("components") or []:
+        if not isinstance(comp, dict):
+            continue
+        if str(comp.get("type") or "").upper() != "BODY":
+            continue
+        example = comp.get("example") or {}
+        rows = example.get("body_text") or example.get("body_text_named_params") or []
+        if isinstance(rows, list) and rows:
+            first = rows[0]
+            if isinstance(first, list):
+                return [str(v or "").strip() for v in first]
+            if isinstance(first, dict):
+                # named params shape — keep insertion order of values
+                return [str(v or "").strip() for v in first.values()]
+    return []
+
+
+def _is_ephemeral_meta_cdn_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return "scontent.whatsapp.net" in lowered or "lookaside.fbsbx.com" in lowered
 
 
 def build_scan_thank_you_text(
@@ -1071,6 +1097,129 @@ def _get_or_upload_header_media(file_path: Path) -> str | None:
         return None
 
 
+def _get_or_upload_remote_header_media(source_url: str, media_type: str) -> str | None:
+    """Download a remote header asset and upload it to Meta as a durable media id.
+
+    Meta template ``example.header_handle`` values are temporary CDN URLs. Passing them
+    as ``link`` at send time often yields a wamid (API accepted) but then fails delivery
+    when Meta cannot re-fetch the expired asset. Re-uploading to a media id avoids that.
+    """
+    token, phone_id, version = _active_whatsapp_credentials()
+    if not token or not phone_id or not source_url:
+        return None
+
+    cache = _load_media_cache()
+    cache_key = f"{phone_id}:remote:{media_type}:{hashlib.sha1(source_url.encode('utf-8')).hexdigest()[:16]}"
+    entry = cache.get(cache_key) or {}
+    media_id = str(entry.get("media_id") or "")
+    uploaded_at = float(entry.get("uploaded_at") or 0)
+    if media_id and (time.time() - uploaded_at) < _MEDIA_ID_TTL_SECONDS:
+        return media_id
+
+    mime = {
+        "image": "image/jpeg",
+        "video": "video/mp4",
+        "document": "application/pdf",
+    }.get(media_type, "application/octet-stream")
+    filename = {
+        "image": "template-header.jpg",
+        "video": "template-header.mp4",
+        "document": "template-header.pdf",
+    }.get(media_type, "template-header.bin")
+
+    try:
+        dl = requests.get(source_url, timeout=60)
+        if dl.status_code >= 400 or not dl.content:
+            logger.warning(
+                "Could not download WhatsApp header media (%s): HTTP %s",
+                media_type,
+                dl.status_code,
+            )
+            return None
+        content_type = (dl.headers.get("Content-Type") or "").split(";")[0].strip()
+        if content_type.startswith(("image/", "video/", "application/")):
+            mime = content_type
+        url = f"https://graph.facebook.com/{version}/{phone_id}/media"
+        response = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            data={"messaging_product": "whatsapp", "type": mime},
+            files={"file": (filename, dl.content, mime)},
+            timeout=120,
+        )
+        data = response.json()
+        if response.status_code >= 400:
+            logger.warning("WhatsApp remote media upload failed: %s", data)
+            return None
+        media_id = str(data.get("id") or "")
+        if media_id:
+            cache[cache_key] = {
+                "media_id": media_id,
+                "uploaded_at": time.time(),
+                "source_url_prefix": source_url[:120],
+            }
+            _save_media_cache(cache)
+            logger.info(
+                "[WhatsApp] Re-uploaded remote %s header as media id %s",
+                media_type,
+                media_id,
+            )
+        return media_id or None
+    except Exception as exc:
+        logger.warning("WhatsApp remote media upload error: %s", exc)
+        return None
+
+
+def _header_media_from_url_or_upload(
+    media_type: str,
+    media_url: str,
+    *,
+    filename: str | None = None,
+) -> dict[str, Any] | None:
+    """Prefer a durable Meta media id; fall back to a stable public link only."""
+    if not media_url:
+        return None
+
+    local_path = _local_path_for_static_url(media_url)
+    if local_path:
+        media_id = _get_or_upload_header_media(local_path)
+        if media_id:
+            return _header_media_component(
+                media_type,
+                media_id=media_id,
+                filename=filename if media_type == "document" else None,
+            )
+
+    if _is_ephemeral_meta_cdn_url(media_url) or not _is_publicly_reachable_url(media_url):
+        media_id = _get_or_upload_remote_header_media(media_url, media_type)
+        if media_id:
+            return _header_media_component(
+                media_type,
+                media_id=media_id,
+                filename=filename if media_type == "document" else None,
+            )
+        logger.warning(
+            "WhatsApp header %s could not be re-uploaded from %s",
+            media_type,
+            media_url[:120],
+        )
+        return None
+
+    # Stable public HTTPS URL Meta can fetch itself.
+    media_id = _get_or_upload_remote_header_media(media_url, media_type)
+    if media_id:
+        return _header_media_component(
+            media_type,
+            media_id=media_id,
+            filename=filename if media_type == "document" else None,
+        )
+    return _header_media_component(
+        media_type,
+        link=media_url,
+        filename=filename if media_type == "document" else None,
+    )
+
+
 def _header_media_component(
     media_type: str,
     *,
@@ -1145,33 +1294,9 @@ def _build_cms_header_component(templates: dict[str, Any]) -> dict[str, Any] | N
     if not filename and media_type == "document":
         filename = media_url.split("/")[-1] or "brochure.pdf"
 
-    if not _is_publicly_reachable_url(media_url):
-        local_path = _local_path_for_static_url(media_url)
-        media_id = _get_or_upload_header_media(local_path) if local_path else None
-        if media_id:
-            return _header_media_component(
-                media_type,
-                media_id=media_id,
-                filename=filename if media_type == "document" else None,
-            )
-        logger.warning(
-            "CMS WhatsApp header %s URL is not public and upload failed: %s",
-            media_type,
-            media_url,
-        )
-        return None
-
-    local_path = _local_path_for_static_url(media_url)
-    media_id = _get_or_upload_header_media(local_path) if local_path else None
-    if media_id:
-        return _header_media_component(
-            media_type,
-            media_id=media_id,
-            filename=filename if media_type == "document" else None,
-        )
-    return _header_media_component(
+    return _header_media_from_url_or_upload(
         media_type,
-        link=media_url,
+        media_url,
         filename=filename if media_type == "document" else None,
     )
 
@@ -1184,27 +1309,14 @@ def _build_header_component(template_def: dict[str, Any]) -> dict[str, Any] | No
         fmt = (comp.get("format") or "").upper()
         if fmt == "DOCUMENT":
             doc_url = _resolve_public_asset_url(
-                template_def.get("header_document_url") or comp.get("document_url")
+                template_def.get("header_document_url")
+                or comp.get("document_url")
+                or (comp.get("example") or {}).get("header_handle", [None])[0]
             )
             if not doc_url:
                 return None
-            filename = str(doc_url).split("/")[-1] or "document.pdf"
-
-            if not _is_publicly_reachable_url(doc_url):
-                # Meta cannot download from localhost — upload the file and send by media id.
-                local_path = _local_path_for_static_url(doc_url)
-                media_id = _get_or_upload_header_media(local_path) if local_path else None
-                if media_id:
-                    return _header_media_component(
-                        "document", media_id=media_id, filename=filename
-                    )
-                logger.warning(
-                    "WhatsApp header document %s is not publicly reachable and media "
-                    "upload failed — sending template without guaranteed delivery.",
-                    doc_url,
-                )
-
-            return _header_media_component("document", link=doc_url, filename=filename)
+            filename = str(doc_url).split("/")[-1].split("?")[0] or "document.pdf"
+            return _header_media_from_url_or_upload("document", doc_url, filename=filename)
         if fmt == "VIDEO":
             video_url = _resolve_public_asset_url(
                 template_def.get("header_video_url")
@@ -1214,25 +1326,7 @@ def _build_header_component(template_def: dict[str, Any]) -> dict[str, Any] | No
             )
             if not video_url:
                 return None
-
-            if not _is_publicly_reachable_url(video_url):
-                local_path = _local_path_for_static_url(video_url)
-                media_id = _get_or_upload_header_media(local_path) if local_path else None
-                if media_id:
-                    return _header_media_component("video", media_id=media_id)
-                logger.warning(
-                    "WhatsApp header video %s is not publicly reachable and media "
-                    "upload failed — sending template without video header.",
-                    video_url,
-                )
-                return None
-
-            # Prefer uploading a local copy when available; otherwise pass the public link.
-            local_path = _local_path_for_static_url(video_url)
-            media_id = _get_or_upload_header_media(local_path) if local_path else None
-            if media_id:
-                return _header_media_component("video", media_id=media_id)
-            return _header_media_component("video", link=video_url)
+            return _header_media_from_url_or_upload("video", video_url)
         if fmt == "IMAGE":
             image_url = _resolve_public_asset_url(
                 template_def.get("header_image_url")
@@ -1242,17 +1336,7 @@ def _build_header_component(template_def: dict[str, Any]) -> dict[str, Any] | No
             )
             if not image_url:
                 return None
-            if not _is_publicly_reachable_url(image_url):
-                local_path = _local_path_for_static_url(image_url)
-                media_id = _get_or_upload_header_media(local_path) if local_path else None
-                if media_id:
-                    return _header_media_component("image", media_id=media_id)
-                return None
-            local_path = _local_path_for_static_url(image_url)
-            media_id = _get_or_upload_header_media(local_path) if local_path else None
-            if media_id:
-                return _header_media_component("image", media_id=media_id)
-            return _header_media_component("image", link=image_url)
+            return _header_media_from_url_or_upload("image", image_url)
         if fmt == "TEXT":
             text = comp.get("text")
             if text is None:
@@ -1284,7 +1368,16 @@ def build_card_received_template_components(
     tpl = runtime_templates() or {}
     em = runtime_email() or {}
     sender = str(em.get("sender_name") or "").strip()
-    cms_tokens = resolve_token_values(contact, tpl, sender_name=sender) if tpl else {}
+    # Only apply CMS token_map when the Admin explicitly configured it.
+    # normalize_token_map({}) falls back to email-oriented DEFAULT_TOKEN_MAP
+    # (fullName/phone/email/…) which corrupts UTEN-style {{3}}/{{4}} date vars.
+    raw_token_map = tpl.get("token_map") if isinstance(tpl, dict) else None
+    has_explicit_token_map = isinstance(raw_token_map, dict) and bool(raw_token_map)
+    cms_tokens = (
+        resolve_token_values(contact, tpl, sender_name=sender)
+        if has_explicit_token_map and tpl
+        else {}
+    )
 
     resolved_name = (
         template_name
@@ -1314,16 +1407,46 @@ def build_card_received_template_components(
         4: _template_param(extract_designation(contact)),
         5: _template_param(extract_website(contact)),
     }
+    # Prefer Meta's approved sample values over "N/A" when contact fields are empty
+    # (e.g. ncs_uten_version_1 {{3}}/{{4}} are event dates, not company/title).
+    meta_examples = _meta_body_example_values(meta_def)
+    for idx, sample in enumerate(meta_examples, start=1):
+        sample_clean = _template_param(sample, "")
+        if not sample_clean:
+            continue
+        current = defaults.get(idx, "N/A")
+        if current in {"N/A", "—", "–", "-", ""}:
+            defaults[idx] = sample_clean
+
+    # Common 4-var UTEN-style templates: {{3}}/{{4}} = event day range.
+    event_day = str(
+        contact.get("eventDay")
+        or contact.get("event_day")
+        or contact.get("eventStart")
+        or contact.get("event_start")
+        or ""
+    ).strip()
+    event_end = str(
+        contact.get("eventEnd")
+        or contact.get("event_end")
+        or contact.get("eventEndDay")
+        or ""
+    ).strip()
+    if event_day and defaults.get(3) in {"N/A", "—", "–", "-"}:
+        defaults[3] = _template_param(event_day)
+    if event_end and defaults.get(4) in {"N/A", "—", "–", "-"}:
+        defaults[4] = _template_param(event_end)
 
     field_by_position: dict[int, str] = {}
     for pos in positions:
         from_cms = str(cms_tokens.get(str(pos)) or "").strip()
-        field_by_position[pos] = (
-            _template_param(from_cms) if from_cms else defaults.get(pos, "—")
-        )
+        if from_cms and from_cms not in {"—", "–", "-"}:
+            field_by_position[pos] = _template_param(from_cms)
+        else:
+            field_by_position[pos] = defaults.get(pos, "N/A")
 
     parameters = [
-        {"type": "text", "text": field_by_position.get(pos, "—")}
+        {"type": "text", "text": field_by_position.get(pos, "N/A")}
         for pos in positions
     ]
 
@@ -1332,6 +1455,8 @@ def build_card_received_template_components(
     # card_final_ula is VIDEO-header in Meta — never send TEXT/IMAGE/DOCUMENT for it.
     header = None
     cms_fmt = str(tpl.get("whatsapp_header_format") or "NONE").strip().upper()
+    meta_fmt = None
+    meta_needs_header = False
     if is_video_template:
         if cms_fmt == "VIDEO":
             header = _build_cms_header_component(tpl)
@@ -1354,6 +1479,14 @@ def build_card_received_template_components(
         # else: Meta has no dynamic header — omit header params entirely
     else:
         header = _build_cms_header_component(tpl)
+
+    if meta_needs_header and header is None:
+        raise RuntimeError(
+            f"Template '{resolved_name}' requires a {meta_fmt or 'media'} header, but no "
+            "usable header media was found. In CMS → Templates, set a public IMAGE/VIDEO/"
+            "DOCUMENT URL (or upload media), Save Environment, then send again. "
+            "Expired Meta sample CDN links are no longer used as send-time links."
+        )
 
     if header:
         components.append(header)

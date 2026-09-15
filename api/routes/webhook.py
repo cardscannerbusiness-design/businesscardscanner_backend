@@ -8,6 +8,7 @@ import os
 from fastapi import APIRouter, Header, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 
+from services.whatsapp_delivery_store import record_message_status
 from services.whatsapp_inbound import handle_inbound_whatsapp_message
 
 logger = logging.getLogger(__name__)
@@ -43,12 +44,30 @@ def _log_whatsapp_events(payload: dict) -> None:
         for change in entry.get("changes") or []:
             value = change.get("value") or {}
             for status in value.get("statuses") or []:
-                if status.get("status") == "failed":
+                mid = str(status.get("id") or "").strip()
+                state = str(status.get("status") or "").strip().lower()
+                errors = status.get("errors") or []
+                if mid and state:
+                    record_message_status(
+                        mid,
+                        state,
+                        recipient_id=str(status.get("recipient_id") or "") or None,
+                        errors=errors if isinstance(errors, list) else [errors],
+                        timestamp=str(status.get("timestamp") or "") or None,
+                    )
+                if state == "failed":
                     logger.error(
                         "WhatsApp delivery failed id=%s recipient=%s errors=%s",
-                        status.get("id"),
+                        mid or status.get("id"),
                         status.get("recipient_id"),
-                        status.get("errors") or [],
+                        errors,
+                    )
+                elif state in {"sent", "delivered", "read"}:
+                    logger.info(
+                        "WhatsApp delivery status=%s id=%s recipient=%s",
+                        state,
+                        mid or status.get("id"),
+                        status.get("recipient_id"),
                     )
 
 

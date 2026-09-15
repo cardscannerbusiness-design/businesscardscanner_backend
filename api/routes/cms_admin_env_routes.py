@@ -55,6 +55,7 @@ from services.whatsapp_service import (
     resolve_template_language,
     send_whatsapp_template,
 )
+from services.whatsapp_delivery_store import wait_for_terminal_status
 
 logger = logging.getLogger(__name__)
 
@@ -545,6 +546,8 @@ async def test_admin_whatsapp(admin_id: str, body: CmsWhatsAppTestRequest):
             "fullName": body.full_name,
             "name": body.full_name,
             "eventName": body.event_name,
+            "eventDay": "Day 1",
+            "eventEnd": "Day 2",
         }
         # Prefer CMS form/saved template names — never silently substitute card_final_ula
         # when the Admin has set journey_stack1 (or any other Meta-approved name).
@@ -620,12 +623,50 @@ async def test_admin_whatsapp(admin_id: str, body: CmsWhatsAppTestRequest):
             raise HTTPException(status_code=502, detail=detail) from exc
 
     message_id = (result.get("messages") or [{}])[0].get("id")
+    delivery = None
+    if message_id:
+        # Wait briefly for Meta webhook statuses (sent/delivered/failed).
+        delivery = await asyncio.to_thread(
+            wait_for_terminal_status,
+            str(message_id),
+            timeout_seconds=14.0,
+            poll_seconds=0.6,
+        )
+
+    delivery_status = str((delivery or {}).get("status") or "pending_webhook")
+    delivery_errors = (delivery or {}).get("errors") or []
+    success = delivery_status != "failed"
+    hint = None
+    if delivery_status == "failed":
+        hint = (
+            "Meta accepted the API call but delivery failed. Check webhook errors / "
+            "WhatsApp Manager → Message logs. Common causes: expired header media, "
+            "marketing template limits, or recipient not on WhatsApp."
+        )
+    elif delivery_status in {"delivered", "read"}:
+        hint = "Delivered to the handset (or marked read)."
+    elif delivery_status == "sent":
+        hint = (
+            "Meta marked the message as sent to the WhatsApp server. If it is not in "
+            "Chats, check the Updates / Message requests tab and search the business number."
+        )
+    else:
+        hint = (
+            "API accepted the send (wamid returned). Delivery webhook not received yet — "
+            "confirm the public webhook URL is reachable and subscribed. Also check the "
+            "phone's Updates tab for marketing templates."
+        )
+
     return {
-        "success": True,
+        "success": success,
         "message_id": message_id,
         "template": template_name,
         "language": language_code,
         "to": body.contact_phone,
+        "delivery_status": delivery_status,
+        "delivery_errors": delivery_errors,
+        "message": hint,
+        "graph_contacts": (result.get("contacts") or []),
     }
 
 
@@ -905,6 +946,26 @@ def inspect_admin_whatsapp(admin_id: str, body: CmsWhatsAppInspectRequest | None
         str(probe.get("message") or ""),
         None if probe.get("ok") else "Fix token / phone_number_id / WABA and retry.",
     )
+
+    phone_meta = probe.get("phone") if isinstance(probe.get("phone"), dict) else {}
+    code_v = str((phone_meta or {}).get("code_verification_status") or "").upper()
+    name_st = str((phone_meta or {}).get("name_status") or "").upper()
+    if code_v == "EXPIRED":
+        add(
+            "phone_code",
+            "Phone code verification",
+            "warn",
+            "code_verification_status=EXPIRED — re-verify the business number in Meta WhatsApp Manager.",
+            "Meta Business Suite → WhatsApp Manager → Phone numbers → verify / re-register the number.",
+        )
+    if name_st in {"PENDING_REVIEW", "DECLINED", "EXPIRED"}:
+        add(
+            "display_name",
+            "Display name status",
+            "warn",
+            f"name_status={name_st}. Pending/declined names reduce trust and can hurt delivery.",
+            "Submit or fix the WhatsApp display name in Meta WhatsApp Manager.",
+        )
 
     tpl = str(
         wa.get("card_received_template_name")

@@ -172,7 +172,87 @@ class JourneyStackTemplateParamsTests(unittest.TestCase):
         self.assertTrue(body["parameters"][0]["text"])
         self.assertEqual(body["parameters"][1]["text"], "ITB Mumbai")
 
-    def test_does_not_send_cms_image_header_when_meta_has_none(self) -> None:
+    def test_ncs_uten_four_vars_uses_meta_examples_not_emdash(self) -> None:
+        meta = {
+            "name": "ncs_uten_version_1",
+            "language": "en",
+            "components": [
+                {
+                    "type": "HEADER",
+                    "format": "IMAGE",
+                    "example": {
+                        "header_handle": ["https://example.com/header.jpg"],
+                    },
+                },
+                {
+                    "type": "BODY",
+                    "text": "Dear {{1}} at {{2}} from {{3}} to {{4}}.",
+                    "example": {
+                        "body_text": [["sugitha", "ATM 2026", "14th sep", "15th Sep"]]
+                    },
+                },
+            ],
+        }
+        with patch(
+            "services.admin_runtime_config.runtime_templates",
+            return_value={"whatsapp_header_format": "NONE", "token_map": {}},
+        ), patch(
+            "services.admin_runtime_config.runtime_email",
+            return_value={},
+        ), patch(
+            "services.whatsapp_service._header_media_from_url_or_upload",
+            return_value={
+                "type": "header",
+                "parameters": [{"type": "image", "image": {"id": "media123"}}],
+            },
+        ):
+            components = build_card_received_template_components(
+                {"fullName": "Test Contact", "eventName": "CMS Test"},
+                template_name="ncs_uten_version_1",
+                meta_template=meta,
+            )
+
+        body = next(c for c in components if c.get("type") == "body")
+        texts = [p["text"] for p in body["parameters"]]
+        self.assertEqual(len(texts), 4)
+        self.assertEqual(texts[0], "Test")
+        self.assertEqual(texts[1], "CMS Test")
+        self.assertEqual(texts[2], "14th sep")
+        self.assertEqual(texts[3], "15th Sep")
+        self.assertNotIn("—", texts)
+        header = next(c for c in components if c.get("type") == "header")
+        self.assertEqual(header["parameters"][0]["image"]["id"], "media123")
+
+    def test_requires_header_media_when_meta_needs_image(self) -> None:
+        meta = {
+            "name": "needs_image",
+            "language": "en",
+            "components": [
+                {"type": "HEADER", "format": "IMAGE"},
+                {"type": "BODY", "text": "Hello"},
+            ],
+        }
+        with patch(
+            "services.admin_runtime_config.runtime_templates",
+            return_value={"whatsapp_header_format": "NONE", "token_map": {}},
+        ), patch(
+            "services.admin_runtime_config.runtime_email",
+            return_value={},
+        ), patch(
+            "services.whatsapp_service._build_cms_header_component",
+            return_value=None,
+        ), patch(
+            "services.whatsapp_service._build_header_component",
+            return_value=None,
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                build_card_received_template_components(
+                    {"fullName": "Alex"},
+                    template_name="needs_image",
+                    meta_template=meta,
+                )
+        self.assertIn("requires a IMAGE header", str(ctx.exception))
+
         meta = {
             "name": "plain_body",
             "language": "en",
