@@ -6,7 +6,11 @@ from typing import Any
 from fastapi import HTTPException
 
 from services import contact_storage as storage
-from services.admin_runtime_config import resolve_owner_admin_for_outreach, use_admin_env
+from services.admin_runtime_config import (
+    resolve_owner_admin_for_outreach,
+    use_admin_env,
+    use_outreach_sender,
+)
 from services.email_service import is_test_recipient_mode, schedule_email_for_contact
 from services.entitlement_service import (
     OUTREACH_BLOCKED_MESSAGE,
@@ -207,7 +211,7 @@ async def schedule_outreach_for_contact(
         admin_user_id=admin_user_id,
         contact=contact,
     )
-    with use_admin_env(owner_admin_id):
+    with use_admin_env(owner_admin_id), use_outreach_sender(user):
         return await _schedule_outreach_for_contact_inner(
             contact,
             online_mode=online_mode,

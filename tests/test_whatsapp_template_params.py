@@ -10,6 +10,8 @@ from unittest.mock import patch
 os.environ.setdefault("JWT_SECRET_KEY", "unit-test-jwt-secret-not-for-production")
 
 from services.whatsapp_service import (
+    SUPER_ADMIN_WHATSAPP_TEMPLATE_NAME,
+    _active_whatsapp_template_name,
     _is_builtin_ula_video_template,
     _ordered_outbound_template_names,
     build_card_received_template_components,
@@ -280,6 +282,132 @@ class JourneyStackTemplateParamsTests(unittest.TestCase):
             )
 
         self.assertEqual(components, [])
+
+
+class SuperAdminTemplateSelectionTests(unittest.TestCase):
+    def test_super_admin_selects_ncs_own_atm_v3_without_cms(self) -> None:
+        with patch(
+            "services.admin_runtime_config.runtime_whatsapp",
+            return_value={},
+        ), patch(
+            "services.admin_runtime_config.runtime_sender_role",
+            return_value="SUPER_ADMIN",
+        ), patch(
+            "services.whatsapp_service.CARD_RECEIVED_TEMPLATE_NAME",
+            "card_final_ula",
+        ):
+            self.assertEqual(
+                _active_whatsapp_template_name("card_final_ula"),
+                SUPER_ADMIN_WHATSAPP_TEMPLATE_NAME,
+            )
+            names = _ordered_outbound_template_names()
+        self.assertEqual(names[0], "ncs_own_atm_v3")
+        self.assertIn("card_final_ula", names)
+
+    def test_admin_without_cms_keeps_env_template(self) -> None:
+        with patch(
+            "services.admin_runtime_config.runtime_whatsapp",
+            return_value={},
+        ), patch(
+            "services.admin_runtime_config.runtime_sender_role",
+            return_value="ADMIN",
+        ), patch(
+            "services.whatsapp_service.CARD_RECEIVED_TEMPLATE_NAME",
+            "card_final_ula",
+        ):
+            self.assertEqual(
+                _active_whatsapp_template_name("card_final_ula"),
+                "card_final_ula",
+            )
+            names = _ordered_outbound_template_names()
+        self.assertEqual(names[0], "card_final_ula")
+        self.assertNotIn("ncs_own_atm_v3", names)
+
+    def test_user_without_cms_keeps_env_template(self) -> None:
+        with patch(
+            "services.admin_runtime_config.runtime_whatsapp",
+            return_value={},
+        ), patch(
+            "services.admin_runtime_config.runtime_sender_role",
+            return_value="USER",
+        ), patch(
+            "services.whatsapp_service.CARD_RECEIVED_TEMPLATE_NAME",
+            "card_final_ula",
+        ):
+            self.assertEqual(
+                _active_whatsapp_template_name("card_final_ula"),
+                "card_final_ula",
+            )
+
+    def test_cms_admin_runtime_still_wins_over_super_admin_role(self) -> None:
+        """CMS Test / Admin CMS config must not be overridden by SUPER_ADMIN role."""
+        cms_wa = {
+            "enabled": True,
+            "access_token": "tok",
+            "phone_number_id": "pid",
+            "card_received_template_name": "journey_stack1",
+        }
+        with patch(
+            "services.admin_runtime_config.runtime_whatsapp",
+            return_value=cms_wa,
+        ), patch(
+            "services.admin_runtime_config.runtime_sender_role",
+            return_value="SUPER_ADMIN",
+        ):
+            self.assertEqual(
+                _active_whatsapp_template_name("card_final_ula"),
+                "journey_stack1",
+            )
+            self.assertEqual(_ordered_outbound_template_names(), ["journey_stack1"])
+
+    def test_ncs_own_atm_v3_uses_meta_five_body_vars_not_ula_two(self) -> None:
+        meta = {
+            "name": "ncs_own_atm_v3",
+            "language": "en",
+            "components": [
+                {
+                    "type": "HEADER",
+                    "format": "VIDEO",
+                    "example": {
+                        "header_handle": ["https://example.com/header.mp4"],
+                    },
+                },
+                {
+                    "type": "BODY",
+                    "text": "Hi {{1}}, at {{2}} / {{3}} / {{4}} / {{5}}.",
+                    "example": {
+                        "body_text": [["Sugitha", "Atm 2026", "Atm 2026", "Atm 2026", "Atm 2026"]]
+                    },
+                },
+            ],
+        }
+        with patch(
+            "services.admin_runtime_config.runtime_templates",
+            return_value={"whatsapp_header_format": "NONE", "token_map": {}},
+        ), patch(
+            "services.admin_runtime_config.runtime_email",
+            return_value={},
+        ), patch(
+            "services.whatsapp_service._header_media_from_url_or_upload",
+            return_value={
+                "type": "header",
+                "parameters": [{"type": "video", "video": {"id": "vid123"}}],
+            },
+        ):
+            components = build_card_received_template_components(
+                {"fullName": "Sugitha Kumar", "eventName": "ATM 2026"},
+                template_name="ncs_own_atm_v3",
+                meta_template=meta,
+            )
+
+        self.assertFalse(_is_builtin_ula_video_template("ncs_own_atm_v3"))
+        header = next(c for c in components if c.get("type") == "header")
+        self.assertEqual(header["parameters"][0]["type"], "video")
+        body = next(c for c in components if c.get("type") == "body")
+        texts = [p["text"] for p in body["parameters"]]
+        self.assertEqual(len(texts), 5)
+        self.assertEqual(texts[0], "Sugitha")
+        self.assertEqual(texts[1], "ATM 2026")
 
 
 if __name__ == "__main__":

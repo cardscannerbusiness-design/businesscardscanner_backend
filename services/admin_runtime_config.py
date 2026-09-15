@@ -13,6 +13,7 @@ from db.pool import db_cursor
 logger = logging.getLogger(__name__)
 
 _runtime: ContextVar[dict[str, Any] | None] = ContextVar("admin_env_runtime", default=None)
+_sender_role: ContextVar[str | None] = ContextVar("outreach_sender_role", default=None)
 
 
 def resolve_owner_admin_id(user: dict[str, Any] | None) -> str | None:
@@ -110,6 +111,22 @@ def load_admin_env_raw(admin_user_id: str) -> dict[str, Any] | None:
 
 def get_runtime() -> dict[str, Any] | None:
     return _runtime.get()
+
+
+def runtime_sender_role() -> str:
+    """Role of the authenticated scanner for this outreach request (if set)."""
+    return str(_sender_role.get() or "").strip()
+
+
+@contextmanager
+def use_outreach_sender(user: dict[str, Any] | None) -> Iterator[str]:
+    """Bind the acting user's role for SuperAdmin-only WhatsApp template selection."""
+    role = str((user or {}).get("role") or "").strip()
+    token = _sender_role.set(role or None)
+    try:
+        yield role
+    finally:
+        _sender_role.reset(token)
 
 
 @contextmanager

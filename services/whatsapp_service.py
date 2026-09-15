@@ -64,6 +64,8 @@ BUSINESS_CARD_TEMPLATE_NAME = (
 CARD_RECEIVED_TEMPLATE_NAME = (
     _normalize_env(os.getenv("WHATSAPP_CARD_RECEIVED_TEMPLATE_NAME")) or BUSINESS_CARD_TEMPLATE_NAME
 )
+# SUPER_ADMIN production thank-you only — does not change .env / CMS / Admin / User.
+SUPER_ADMIN_WHATSAPP_TEMPLATE_NAME = "ncs_own_atm_v3"
 WABA_ID = _normalize_env(os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID"))
 
 _TEMPLATE_LANG_CACHE: dict[str, str] = {}
@@ -100,7 +102,8 @@ def _active_whatsapp_credentials() -> tuple[str, str, str]:
 
 
 def _active_whatsapp_template_name(fallback: str | None = None) -> str:
-    from services.admin_runtime_config import runtime_whatsapp
+    from auth.constants import ROLE_SUPER_ADMIN
+    from services.admin_runtime_config import runtime_sender_role, runtime_whatsapp
 
     wa = runtime_whatsapp()
     if wa:
@@ -113,6 +116,9 @@ def _active_whatsapp_template_name(fallback: str | None = None) -> str:
         ).strip()
         if name:
             return name
+    # Role-based override: SUPER_ADMIN only (CMS Admin/User path above unchanged).
+    if runtime_sender_role() == ROLE_SUPER_ADMIN:
+        return SUPER_ADMIN_WHATSAPP_TEMPLATE_NAME
     return (fallback or CARD_RECEIVED_TEMPLATE_NAME or TEMPLATE_NAME or "").strip()
 
 
@@ -1559,7 +1565,8 @@ def _ordered_outbound_template_names() -> list[str]:
     Admin's template names — never fall through to global .env templates such as
     card_final_ula that belong to a different WABA (breaks Manish / journey_stack1).
     """
-    from services.admin_runtime_config import runtime_whatsapp
+    from auth.constants import ROLE_SUPER_ADMIN
+    from services.admin_runtime_config import runtime_sender_role, runtime_whatsapp
 
     seen: set[str] = set()
     ordered: list[str] = []
@@ -1578,6 +1585,10 @@ def _ordered_outbound_template_names() -> list[str]:
         _add(wa.get("scan_template_name"))
         _add(wa.get("template_name"))
         return ordered
+
+    # SUPER_ADMIN primary; keep existing .env / builtin names as fallbacks.
+    if runtime_sender_role() == ROLE_SUPER_ADMIN:
+        _add(SUPER_ADMIN_WHATSAPP_TEMPLATE_NAME)
 
     for raw in (
         CARD_RECEIVED_TEMPLATE_NAME,
