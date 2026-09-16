@@ -65,6 +65,14 @@ def _phone_and_country_for_normalize(
     country_iso: str | None,
     dial_code: str,
 ) -> tuple[str, str | None]:
+    """
+    Choose parse mode for normalize_international_phone.
+
+    International (+/00) → let prepare_phone_input handle OCR CC dedupe.
+    National with known ISO → let parse_national_phone handle CC-prefixed nationals.
+    Digits that already include the dial code → treat as international (+digits)
+    so metadata-driven dedupe/validation applies (no country-specific rules).
+    """
     raw = (phone or "").strip()
     if not raw:
         return "", country_iso
@@ -74,6 +82,7 @@ def _phone_and_country_for_normalize(
 
     digits = re.sub(r"\D", "", raw)
     cc_digits = re.sub(r"\D", "", dial_code)
+
     if digits and cc_digits and digits.startswith(cc_digits) and len(digits) > len(cc_digits):
         return f"+{digits}", None
 
