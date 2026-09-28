@@ -43,7 +43,11 @@ def wipe_all_data(
     email_sent = False
     if email:
         try:
-            send_result = send_data_deletion_confirmation(email, "organisation")
+            send_result = send_data_deletion_confirmation(
+                email,
+                "organisation",
+                reason=(body.reason or "").strip(),
+            )
             email_sent = bool(send_result.get("sent"))
         except Exception:
             logger.exception("Organisation deletion confirmation email failed")

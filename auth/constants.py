@@ -80,6 +80,8 @@ PUBLIC_PATHS: set[str] = {
     "/api/registrations/phone/send-otp",
     "/api/registrations/phone/confirm",
     "/api/google/oauth/callback",
+    "/api/billing/webhooks/razorpay",
+    "/api/billing/webhooks/stripe",
 }
 
 # Prefixes that are also public (e.g. /static/anything)

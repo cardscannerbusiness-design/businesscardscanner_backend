@@ -130,6 +130,7 @@ def body_to_outreach_contact(body: LocalContactBody) -> dict[str, Any]:
         "secondaryAddress": body.secondaryAddress,
         "eventName": body.eventName,
         "eventDay": body.eventDay,
+        "eventId": body.eventId,
         "prospect_status": body.prospect_status,
     }
 
@@ -211,7 +212,22 @@ async def schedule_outreach_for_contact(
         admin_user_id=admin_user_id,
         contact=contact,
     )
-    with use_admin_env(owner_admin_id), use_outreach_sender(user):
+    event_id = str(contact.get("eventId") or contact.get("event_id") or "").strip() or None
+    if owner_admin_id and not event_id and contact.get("eventName"):
+        try:
+            from services.email_template_store import (
+                get_admin_scope,
+                resolve_account_event_id_by_name,
+            )
+
+            account_id, _ = get_admin_scope(owner_admin_id)
+            event_id = resolve_account_event_id_by_name(
+                account_id,
+                contact.get("eventName"),
+            )
+        except ValueError:
+            event_id = None
+    with use_admin_env(owner_admin_id, event_id=event_id), use_outreach_sender(user):
         return await _schedule_outreach_for_contact_inner(
             contact,
             online_mode=online_mode,
@@ -376,6 +392,7 @@ def payload_to_outreach_contact(data: dict[str, Any]) -> dict[str, Any]:
         "secondaryAddress": secondary_address,
         "eventName": str(data.get("eventName") or "").strip(),
         "eventDay": str(data.get("eventDay") or "Day 1").strip() or "Day 1",
+        "eventId": str(data.get("eventId") or data.get("event_id") or "").strip(),
     }
 
 

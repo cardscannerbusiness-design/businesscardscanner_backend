@@ -145,6 +145,7 @@ class SyncOutreachOptions(BaseModel):
 
 class WipeAllDataBody(BaseModel):
     confirm: bool = False
+    reason: str = Field(default="", max_length=500)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -273,6 +274,7 @@ class DisplayNameUpdateRequest(BaseModel):
 
 class DeleteAccountRequest(BaseModel):
     confirm: bool = Field(..., description="Must be true to delete the account.")
+    reason: str = Field(default="", max_length=500)
 
 
 class CreateManagedEventRequest(BaseModel):

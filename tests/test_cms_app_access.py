@@ -70,6 +70,7 @@ class TestEntitlementCmsLocks(unittest.TestCase):
         self.assertFalse(info["whatsapp_allowed"])
         self.assertTrue(info["email_allowed"])
         self.assertTrue(info["google_sheets_allowed"])
+        self.assertTrue(info["email_templates_allowed"])
 
     def test_unpaid_freemium_allows_channels_while_cards_remain(self) -> None:
         info = ent._normalize(

@@ -157,12 +157,13 @@ MASK = "••••••••"
 
 # CMS kill-switches: locked=true → channel OFF for that Admin's company in the main app.
 # WhatsApp defaults locked to match the current CMS product stage; Email/Sheets start unlocked.
+from services.cms_app_access import ACTION_KEYS, FEATURE_KEYS, persistable_feature_control
+
 DEFAULT_CHANNEL_LOCKS: dict[str, bool] = {
+    **{key: False for key in FEATURE_KEYS},
     "whatsapp": True,
-    "email": False,
-    "google_sheets": False,
 }
-CHANNEL_LOCK_KEYS = tuple(DEFAULT_CHANNEL_LOCKS.keys())
+CHANNEL_LOCK_KEYS = FEATURE_KEYS
 
 # Old CMS keys → current keys (keep existing saved rows working)
 _WA_LEGACY = {
@@ -195,38 +196,47 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
-def normalize_channel_locks(raw: Any) -> dict[str, bool]:
-    """Return {whatsapp, email, google_sheets} locked flags (True = OFF in app)."""
+def normalize_channel_locks(raw: Any) -> dict[str, Any]:
+    """Return feature/action locked flags (True = OFF in app).
+
+    Settings rows historically default WhatsApp to locked when the key is missing.
+    Company JSONB (cms_channel_locks) still defaults missing keys to unlocked.
+    """
     data = _as_dict(raw)
-    out: dict[str, bool] = {}
-    for key, default in DEFAULT_CHANNEL_LOCKS.items():
-        if key in data:
-            out[key] = bool(data[key])
-        else:
-            out[key] = bool(default)
-    return out
+    seed: dict[str, Any] = dict(DEFAULT_CHANNEL_LOCKS)
+    for key, value in data.items():
+        if key == "actions" and isinstance(value, dict):
+            seed["actions"] = value
+        elif key in FEATURE_KEYS or key in ACTION_KEYS:
+            seed[key] = bool(value)
+    return persistable_feature_control(seed)
 
 
-def get_channel_locks_for_company(company_id: str | None) -> dict[str, bool]:
+def get_channel_locks_for_company(company_id: str | None) -> dict[str, Any]:
     """Resolve CMS channel locks for a company (via its Admin env settings)."""
+    unlocked = {key: False for key in FEATURE_KEYS}
     if not company_id:
-        return dict(DEFAULT_CHANNEL_LOCKS)
-    with db_cursor(commit=False) as cur:
-        cur.execute(
-            """
-            SELECT s.channel_locks
-            FROM admin_env_settings s
-            JOIN users u ON u.id = s.admin_user_id
-            JOIN roles r ON r.id = u.role_id
-            WHERE u.company_id = %s
-              AND u.deleted_at IS NULL
-              AND r.name = %s
-            ORDER BY s.updated_at DESC NULLS LAST
-            LIMIT 1
-            """,
-            (company_id, ROLE_ADMIN),
-        )
-        row = cur.fetchone()
+        return unlocked
+    try:
+        with db_cursor(commit=False) as cur:
+            cur.execute(
+                """
+                SELECT s.channel_locks
+                FROM admin_env_settings s
+                JOIN users u ON u.id = s.admin_user_id
+                JOIN roles r ON r.id = u.role_id
+                WHERE u.company_id = %s
+                  AND u.deleted_at IS NULL
+                  AND r.name = %s
+                ORDER BY s.updated_at DESC NULLS LAST
+                LIMIT 1
+                """,
+                (company_id, ROLE_ADMIN),
+            )
+            row = cur.fetchone()
+    except Exception:
+        logger.debug("Could not load CMS settings locks for company_id=%s", company_id)
+        return unlocked
     if not row:
         return dict(DEFAULT_CHANNEL_LOCKS)
     return normalize_channel_locks(row.get("channel_locks") if isinstance(row, dict) else row[0])
@@ -237,7 +247,7 @@ def channel_is_locked(company_id: str | None, channel: str) -> bool:
     if key in ("sheets", "google", "gsheets"):
         key = "google_sheets"
     locks = get_channel_locks_for_company(company_id)
-    return bool(locks.get(key, DEFAULT_CHANNEL_LOCKS.get(key, False)))
+    return bool(locks.get(key, False))
 
 
 def apply_channel_locks_to_entitlement(
@@ -246,17 +256,39 @@ def apply_channel_locks_to_entitlement(
 ) -> dict[str, Any]:
     """AND CMS locks onto entitlement whatsapp/email/sheets allowed flags."""
     cid = company_id if company_id is not None else info.get("company_id")
-    locks = get_channel_locks_for_company(str(cid) if cid else None)
+    stored = info.get("cms_feature_locks")
+    if not isinstance(stored, dict):
+        stored = info.get("cms_channel_locks")
+    from services.cms_app_access import normalize_action_locks, normalize_channel_locks as normalize_company_locks
+
+    company_locks = normalize_company_locks(stored if isinstance(stored, dict) else {})
+    settings_locks = get_channel_locks_for_company(str(cid) if cid else None)
+    merged = {
+        key: bool(company_locks.get(key) or settings_locks.get(key))
+        for key in FEATURE_KEYS
+    }
+    actions = normalize_action_locks({**settings_locks, **(stored if isinstance(stored, dict) else {})})
     out = dict(info)
-    out["cms_channel_locks"] = locks
-    out["cms_whatsapp_locked"] = locks["whatsapp"]
-    out["cms_email_locked"] = locks["email"]
-    out["cms_google_sheets_locked"] = locks["google_sheets"]
-    if locks["whatsapp"]:
+    out["cms_channel_locks"] = merged
+    out["cms_feature_locks"] = merged
+    out["cms_action_locks"] = actions
+    out["cms_whatsapp_locked"] = merged["whatsapp"]
+    out["cms_email_locked"] = merged["email"]
+    out["cms_google_sheets_locked"] = merged["google_sheets"]
+    if merged["whatsapp"]:
         out["whatsapp_allowed"] = False
-    if locks["email"]:
+    if merged["email"]:
         out["email_allowed"] = False
-    out["google_sheets_allowed"] = not locks["google_sheets"]
+    out["google_sheets_allowed"] = not merged["google_sheets"]
+    if merged.get("contacts"):
+        out["contacts_allowed"] = False
+    out["capture_allowed"] = not merged.get("capture", False)
+    out["events_allowed"] = not merged.get("events", False)
+    out["email_templates_allowed"] = not merged.get("email_templates", False)
+    out["media_allowed"] = not merged.get("media", False)
+    out["subscription_allowed"] = not merged.get("subscription", False)
+    out["offline_queue_allowed"] = not merged.get("offline_queue", False)
+    out["settings_allowed"] = not merged.get("settings", False)
     return out
 
 
@@ -728,6 +760,16 @@ def _row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
         key: bool(company_locks.get(key) or settings_locks.get(key))
         for key in CHANNEL_LOCK_KEYS
     }
+    from services.cms_app_access import normalize_action_locks
+
+    action_locks = {
+        key: bool(
+            normalize_action_locks(row.get("cms_channel_locks")).get(key)
+            or normalize_action_locks(settings_locks).get(key)
+        )
+        for key in ACTION_KEYS
+    }
+    channel_locks["actions"] = action_locks
     return {
         "admin_id": str(row["id"]),
         "email": row.get("email_addr") or row.get("user_email") or "",
@@ -1015,8 +1057,9 @@ def set_admin_channel_locks(
     prev_em = _apply_legacy(_as_dict(prev.get("email")), _EMAIL_LEGACY) or _empty_email()
     prev_tpl = _as_dict(prev.get("templates")) or _empty_templates()
     prev_gs = _as_dict(prev.get("google_sheets")) or _empty_google_sheets()
-    merged_locks = normalize_channel_locks(
-        {**normalize_channel_locks(prev.get("channel_locks")), **_as_dict(locks)}
+    merged_locks = persistable_feature_control(
+        normalize_channel_locks(prev.get("channel_locks")),
+        _as_dict(locks),
     )
 
     with db_cursor() as cur:

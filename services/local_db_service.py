@@ -718,6 +718,17 @@ def create_contact(
                 skip_storage_quota = entitlement_service.skip_storage_quota_for_creator(
                     created_by_role
                 )
+                if str(created_by_role or "") != "SUPER_ADMIN":
+                    from services.feature_control import FeatureBlockedError, assert_feature_enabled
+
+                    try:
+                        assert_feature_enabled(
+                            {"role": created_by_role, "company_id": owner_company_id},
+                            "capture",
+                            company_id=owner_company_id,
+                        )
+                    except FeatureBlockedError as exc:
+                        raise LocalDbError(exc.message, status_code=403) from exc
                 if owner_company_id and use_user_card_quota and created_by_user_id:
                     entitlement_service.assert_can_process_card_locked(
                         cur,

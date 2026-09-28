@@ -11,6 +11,7 @@ from psycopg2.extras import Json
 
 from auth.dependencies import get_current_user
 from db.pool import db_cursor
+from services.feature_control import require_feature
 
 router = APIRouter(prefix="/api/offline-queue", tags=["Offline Queue"])
 
@@ -34,7 +35,7 @@ def report_queue_snapshot(
     body: QueueSnapshot,
     user: dict = Depends(get_current_user),
 ):
-    """Mirror one user's current queue without changing synchronization."""
+    require_feature(user, "offline_queue")
     user_id = user["id"]
     company_id = user.get("company_id")
     queue_ids = [item.id for item in body.items]
@@ -96,6 +97,7 @@ def list_offline_queue(
     limit: int = Query(10, ge=1, le=200),
 ):
     """SuperAdmin sees all; Admin sees company; User sees their own."""
+    require_feature(user, "offline_queue")
     role = str(user.get("role") or "")
     conditions: list[str] = []
     params: list[Any] = []

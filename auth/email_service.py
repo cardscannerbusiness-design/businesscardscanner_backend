@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import os
 import smtplib
@@ -511,7 +512,7 @@ def send_admin_registration_rejected_email(
     )
 
 
-def send_data_deletion_confirmation(to_email: str, kind: str) -> dict:
+def send_data_deletion_confirmation(to_email: str, kind: str, reason: str = "") -> dict:
     """Notify the user that local or organisation data was deleted."""
     if kind == "organisation":
         subject = "NameCardScan — Organisation data deleted"
@@ -525,13 +526,20 @@ def send_data_deletion_confirmation(to_email: str, kind: str) -> dict:
             "Your Delete My Data request was completed. "
             "All scans stored in your local offline queue on that device have been permanently deleted."
         )
-    html = f"""
+    safe_reason = html.escape((reason or "").strip()[:500])
+    reason_html = (
+        f'<p style="margin-top: 12px;"><strong>Reason:</strong> {safe_reason}</p>'
+        if safe_reason
+        else ""
+    )
+    html_body = f"""
     <div style="font-family: sans-serif; max-width: 480px; margin: auto;">
       <h2 style="color: #0891b2;">Deletion confirmed</h2>
       <p>{body}</p>
+      {reason_html}
       <p style="color: #64748b; font-size: 12px; margin-top: 16px;">
         If you did not request this action, contact support immediately.
       </p>
     </div>
     """
-    return _send_email(to_email, subject, html)
+    return _send_email(to_email, subject, html_body)

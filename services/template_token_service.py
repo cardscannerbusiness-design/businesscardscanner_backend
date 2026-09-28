@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # Keys match BusinessCardScanner_Frontend review / leadFields (+ event/country).
@@ -186,3 +187,53 @@ def apply_numbered_tokens(text: str, values: dict[str, str]) -> str:
     for num, value in sorted(values.items(), key=lambda item: -int(item[0])):
         rendered = rendered.replace(f"{{{{{num}}}}}", value)
     return rendered
+
+
+def named_token_values(
+    contact: dict[str, Any] | None,
+    *,
+    company: str = "",
+    event_name: str = "",
+    sender_name: str = "",
+) -> dict[str, str]:
+    """Build the documented named placeholders from contact and account context."""
+    contact = contact or {}
+    full_name = extract_review_field(contact, "fullName")
+    first_name = extract_review_field(contact, "firstName")
+    last_name = extract_review_field(contact, "lastName")
+    if not first_name and full_name:
+        first_name = full_name.split()[0]
+    return {
+        "name": full_name,
+        "first_name": first_name,
+        "last_name": last_name,
+        "company": str(company or ""),
+        "email": extract_review_field(contact, "emailAddress"),
+        "phone": extract_review_field(contact, "phoneNumber"),
+        "designation": extract_review_field(contact, "designation"),
+        "event_name": str(event_name or extract_review_field(contact, "eventName")),
+        "sender_name": str(sender_name or ""),
+    }
+
+
+def apply_named_tokens(text: str, values: dict[str, str]) -> str:
+    rendered = text or ""
+    for name, value in values.items():
+        rendered = re.sub(
+            r"\{\{\s*" + re.escape(name) + r"\s*\}\}",
+            lambda _match, replacement=str(value or ""): replacement,
+            rendered,
+        )
+    return rendered
+
+
+def unresolved_placeholders(text: str) -> list[str]:
+    return sorted(set(re.findall(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}", text or "")))
+
+
+def missing_named_placeholder_values(
+    text: str,
+    values: dict[str, str],
+) -> list[str]:
+    present = set(re.findall(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", text or ""))
+    return sorted(name for name in present if name in values and not str(values[name]).strip())

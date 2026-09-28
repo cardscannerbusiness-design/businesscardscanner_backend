@@ -75,15 +75,20 @@ def resolve_owner_admin_for_outreach(
     return resolve_owner_admin_id_from_user_id(str(creator) if creator else None)
 
 
-def load_admin_env_raw(admin_user_id: str) -> dict[str, Any] | None:
+def load_admin_env_raw(
+    admin_user_id: str,
+    template_key: str = "CARD_FOLLOW_UP",
+    event_id: str | None = None,
+) -> dict[str, Any] | None:
     with db_cursor(commit=False) as cur:
         cur.execute(
             """
-            SELECT s.whatsapp, s.email, s.templates
-            FROM admin_env_settings s
-            JOIN users u ON u.id = s.admin_user_id
+            SELECT u.company_id, c.company_name, s.whatsapp, s.email, s.templates
+            FROM users u
             JOIN roles r ON r.id = u.role_id
-            WHERE s.admin_user_id = %s
+            LEFT JOIN companies c ON c.id = u.company_id
+            LEFT JOIN admin_env_settings s ON s.admin_user_id = u.id
+            WHERE u.id = %s
               AND u.deleted_at IS NULL
               AND r.name = %s
             """,
@@ -101,11 +106,86 @@ def load_admin_env_raw(admin_user_id: str) -> dict[str, Any] | None:
     # Keep template_name / card_received / business / scan fields aligned so
     # Manish's journey_stack1 (or any single CMS name) is visible to all send paths.
     from services.admin_env_service import sync_whatsapp_template_names
+    from services.email_template_store import (
+        EmailTemplateError,
+        account_has_email_templates,
+        account_has_event_templates,
+        get_email_template_for_event,
+        get_email_template_for_key,
+        validate_account_event,
+    )
+    from services.email_component_service import EmailComponentError, render_components
+
+    templates = _as_dict(row.get("templates"))
+    templates["account_company_name"] = str(row.get("company_name") or "").strip()
+    account_id = str(row.get("company_id") or "")
+    selected = None
+    selection_error = ""
+    if event_id and account_id:
+        try:
+            validate_account_event(account_id, event_id)
+            selected = get_email_template_for_event(admin_user_id, event_id)
+            if not selected and account_has_event_templates(account_id):
+                selection_error = "No email template exists for the selected event."
+        except EmailTemplateError as exc:
+            selection_error = str(exc)
+    if not selected and not selection_error:
+        selected = get_email_template_for_key(admin_user_id, template_key)
+
+    if selected and selected.get("status") == "active":
+        selected_body = selected["body"]
+        if selected.get("components"):
+            try:
+                selected_body = render_components(account_id, selected["components"])
+            except EmailComponentError as exc:
+                selection_error = f"Email template rendering failed: {exc}"
+        templates.update(
+            {
+                "email_subject": selected["subject"],
+                "email_body": selected_body,
+                "token_map": selected["token_map"],
+                "email_template_id": selected["id"],
+                "email_template_key": selected["template_key"],
+                "email_template_name": selected["template_name"],
+                "email_template_event_id": selected.get("event_id"),
+                "email_template_components": selected.get("components") or [],
+            }
+        )
+        if selection_error:
+            templates["_email_template_error"] = selection_error
+    elif selected:
+        templates.update(
+            {
+                "email_subject": "",
+                "email_body": "",
+                "_email_template_error": (
+                    f"Template {selected['template_key']} is inactive for this account."
+                ),
+            }
+        )
+    elif selection_error:
+        templates.update(
+            {
+                "email_subject": "",
+                "email_body": "",
+                "_email_template_error": selection_error,
+            }
+        )
+    elif account_id and account_has_email_templates(account_id):
+        templates.update(
+            {
+                "email_subject": "",
+                "email_body": "",
+                "_email_template_error": (
+                    f"No active {template_key} email template exists for this account."
+                ),
+            }
+        )
 
     return {
         "whatsapp": sync_whatsapp_template_names(_as_dict(row.get("whatsapp"))),
         "email": _as_dict(row.get("email")),
-        "templates": _as_dict(row.get("templates")),
+        "templates": templates,
     }
 
 
@@ -165,7 +245,11 @@ def use_admin_env_payload(
 
 
 @contextmanager
-def use_admin_env(admin_user_id: str | None) -> Iterator[dict[str, Any] | None]:
+def use_admin_env(
+    admin_user_id: str | None,
+    template_key: str = "CARD_FOLLOW_UP",
+    event_id: str | None = None,
+) -> Iterator[dict[str, Any] | None]:
     """Activate CMS env for this Admin (if saved). Nested calls restore previous.
 
     Disabled WhatsApp/Email sections fall back to global .env credentials.
@@ -179,7 +263,7 @@ def use_admin_env(admin_user_id: str | None) -> Iterator[dict[str, Any] | None]:
         yield None
         return
 
-    raw = load_admin_env_raw(admin_user_id)
+    raw = load_admin_env_raw(admin_user_id, template_key, event_id)
     if not raw:
         logger.debug("No CMS admin_env_settings for admin=%s — using global .env", admin_user_id)
         yield None

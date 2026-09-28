@@ -20,6 +20,7 @@ from auth.constants import (
 )
 from auth.dependencies import get_current_user, require_role
 from db.pool import db_cursor
+from services.feature_control import require_feature
 
 router = APIRouter(prefix="/api/events", tags=["Events"])
 logger = logging.getLogger(__name__)
@@ -48,7 +49,7 @@ def _parse_date(value: str | None, field: str) -> date | None:
 
 def _serialize_event(row: dict) -> dict:
     out = dict(row)
-    for key in ("id", "created_by", "updated_by", "company_id"):
+    for key in ("id", "created_by", "updated_by", "company_id", "email_template_id"):
         if out.get(key) is not None:
             out[key] = str(out[key])
     for key in ("start_date", "end_date"):
@@ -60,7 +61,74 @@ def _serialize_event(row: dict) -> dict:
     for key in ("spreadsheet_id", "spreadsheet_url", "google_sheet_id", "google_sheet_url"):
         if out.get(key) is not None:
             out[key] = str(out[key])
+    if "email_template_name" not in out:
+        out["email_template_name"] = None
+    if "email_template_status" not in out:
+        out["email_template_status"] = None
+    if "email_template_id" not in out:
+        out["email_template_id"] = None
     return out
+
+
+def _account_id_for_templates(user: dict) -> str | None:
+    """Resolve the customer account that owns email templates for this caller."""
+    from services.admin_runtime_config import resolve_owner_admin_id
+    from services.email_template_store import EmailTemplateError, get_admin_scope
+
+    admin_id = resolve_owner_admin_id(user)
+    if admin_id:
+        try:
+            account_id, _ = get_admin_scope(admin_id)
+            return account_id
+        except EmailTemplateError:
+            pass
+    return _tenant_company_id(user)
+
+
+def _attach_email_templates(rows: list[dict], user: dict) -> list[dict]:
+    """Attach the current account email-template name for each event.
+
+    Templates are looked up live from email_templates, so a renamed template
+    appears on Event Management immediately on the next list/get. Admin and
+    User callers both see the same account-scoped template.
+    """
+    items = [dict(row) for row in rows]
+    if not items:
+        return items
+    account_id = _account_id_for_templates(user)
+    if not account_id:
+        for item in items:
+            item.setdefault("email_template_id", None)
+            item.setdefault("email_template_name", None)
+            item.setdefault("email_template_status", None)
+        return items
+    event_ids = [str(item["id"]) for item in items if item.get("id")]
+    if not event_ids:
+        return items
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT id, event_id, template_name, status
+            FROM email_templates
+            WHERE deleted_at IS NULL
+              AND account_id = %s
+              AND event_id IN %s
+            """,
+            (account_id, tuple(event_ids)),
+        )
+        templates = cur.fetchall() or []
+    by_event = {str(item["event_id"]): item for item in templates if item.get("event_id")}
+    for item in items:
+        linked = by_event.get(str(item.get("id") or ""))
+        if linked:
+            item["email_template_id"] = linked.get("id")
+            item["email_template_name"] = linked.get("template_name")
+            item["email_template_status"] = linked.get("status")
+        else:
+            item["email_template_id"] = None
+            item["email_template_name"] = None
+            item["email_template_status"] = None
+    return items
 
 
 def _validate_date_range(start: date | None, end: date | None) -> None:
@@ -249,6 +317,7 @@ def list_events(
     status: str = Query("", max_length=32),
     user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER)),
 ):
+    require_feature(user, "events")
     del request
     offset = (page - 1) * limit
     scope_sql, scope_params = _event_scope_sql(user)
@@ -281,8 +350,9 @@ def list_events(
         )
         rows = cur.fetchall()
 
+    attached = _attach_email_templates([dict(row) for row in rows], user)
     return {
-        "items": [_serialize_event(dict(row)) for row in rows],
+        "items": [_serialize_event(row) for row in attached],
         "total": total,
         "page": page,
         "limit": limit,
@@ -311,7 +381,8 @@ def get_active_event(user: dict = Depends(get_current_user)):
     if not row:
         return {"event": None}
     event_row = _ensure_event_workbook_if_missing(dict(row), user)
-    return {"event": _serialize_event(event_row)}
+    attached = _attach_email_templates([event_row], user)
+    return {"event": _serialize_event(attached[0])}
 
 
 @router.get(
@@ -322,6 +393,7 @@ def get_event(
     event_id: str,
     user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER)),
 ):
+    require_feature(user, "events")
     scope_sql, scope_params = _event_scope_sql(user)
     with db_cursor(commit=False) as cur:
         cur.execute(
@@ -335,7 +407,8 @@ def get_event(
         row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Event not found.")
-    return _serialize_event(dict(row))
+    attached = _attach_email_templates([dict(row)], user)
+    return _serialize_event(attached[0])
 
 
 @router.post(
@@ -347,6 +420,7 @@ def create_event(
     request: Request,
     user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_USER)),
 ):
+    require_feature(user, "events", "create")
     name = body.name.strip()
     if not name:
         raise HTTPException(status_code=422, detail="Event name is required.")
@@ -435,7 +509,8 @@ def create_event(
         new_value={"event_id": event_id, "name": name, "company_id": company_id},
     )
     logger.info("Managed event created: %s by %s", event_id, user["id"])
-    return _serialize_event(dict(row))
+    attached = _attach_email_templates([dict(row)], user)
+    return _serialize_event(attached[0])
 
 
 @router.put(
@@ -448,6 +523,7 @@ def update_event(
     request: Request,
     user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN)),
 ):
+    require_feature(user, "events", "edit")
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update.")
@@ -545,7 +621,7 @@ def update_event(
         user_agent=request.headers.get("user-agent", ""),
         new_value={"event_id": event_id, "fields": list(updates.keys())},
     )
-    return _serialize_event(dict(row))
+    return _serialize_event(_attach_email_templates([dict(row)], user)[0])
 
 
 @router.delete(
@@ -557,6 +633,7 @@ def delete_event(
     request: Request,
     user: dict = Depends(require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN)),
 ):
+    require_feature(user, "events", "delete")
     now = datetime.now(timezone.utc)
     scope_sql, scope_params = _event_scope_sql(user)
     with db_cursor() as cur:

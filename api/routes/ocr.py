@@ -11,6 +11,7 @@ import time
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 
 from auth.dependencies import get_current_user
+from services.feature_control import require_feature
 from services.textract_service import extract_text, is_textract_configured
 from utils.parser_utils import parse_business_card
 
@@ -43,6 +44,7 @@ async def ocr_card(
     # Do not gate OCR on Freemium card count — scanning continues after
     # exhaustion; PostgreSQL persist + outreach are enforced elsewhere.
     user = get_current_user(request)
+    require_feature(user, "capture")
     logger.info(
         "[OCR] Auth OK duration_ms=%.1f user_id=%s",
         (time.perf_counter() - req_started) * 1000,

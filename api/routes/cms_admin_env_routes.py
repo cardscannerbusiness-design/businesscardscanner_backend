@@ -7,7 +7,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from auth.audit_service import log_action
 from auth.constants import (
@@ -36,14 +36,28 @@ from services.user_profile_identity import (
     set_user_profile_picture,
 )
 from services.cms_media_service import (
+    delete_account_media,
     delete_cms_media,
+    list_account_media,
     list_cms_media,
+    save_account_media,
     save_cms_media,
 )
 from services.cms_app_access import update_channel_locks
 from services.company_lifecycle import CompanyNotFoundError, remove_cms_client
 from services.admin_runtime_config import use_admin_env_payload
 from services.email_service import is_email_configured, send_business_thank_you_email
+from services.email_template_store import (
+    DEFAULT_TEMPLATE_KEY,
+    EmailTemplateError,
+    create_email_template,
+    delete_email_template,
+    get_admin_scope,
+    get_email_template,
+    list_account_events,
+    list_email_templates,
+    update_email_template,
+)
 from services.email_template_service import get_thank_you_shell
 from services.whatsapp_service import (
     CARD_RECEIVED_TEMPLATE_NAME,
@@ -70,11 +84,22 @@ class AdminEnvUpdateRequest(BaseModel):
 
 
 class ChannelLocksUpdateRequest(BaseModel):
-    """CMS kill-switches: locked=true turns the channel off for that company in the app."""
+    """CMS kill-switches: locked=true turns the module/action off for that company."""
+
+    model_config = ConfigDict(extra="allow")
 
     whatsapp: bool | None = None
     email: bool | None = None
     google_sheets: bool | None = None
+    capture: bool | None = None
+    contacts: bool | None = None
+    events: bool | None = None
+    email_templates: bool | None = None
+    media: bool | None = None
+    subscription: bool | None = None
+    offline_queue: bool | None = None
+    settings: bool | None = None
+    actions: dict[str, bool] | None = None
 
 
 CmsChannelLocksRequest = ChannelLocksUpdateRequest
@@ -108,6 +133,21 @@ class CmsEmailTestRequest(BaseModel):
     contact_email: str = Field(..., min_length=3, description="Recipient email for the test send")
     email: dict[str, Any] | None = None
     templates: dict[str, Any] | None = None
+
+
+class CmsEmailTemplateRequest(BaseModel):
+    template_name: str = Field(min_length=1, max_length=160)
+    template_key: str = Field(default=DEFAULT_TEMPLATE_KEY, min_length=2, max_length=64)
+    subject: str = Field(min_length=1)
+    body: str = ""
+    components: list[dict[str, Any]] = Field(default_factory=list)
+    event_id: str | None = None
+    token_map: dict[str, str] = Field(default_factory=dict)
+    status: str = "active"
+
+
+class CmsEmailTemplateStatusRequest(BaseModel):
+    status: str
 
 
 @router.get(
@@ -149,6 +189,182 @@ def get_one_admin_env(admin_id: str):
     if not item:
         raise HTTPException(status_code=404, detail="Admin not found.")
     return item
+
+
+@router.get(
+    "/admin-env/{admin_id}/email-templates",
+    summary="List email templates for one customer account",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def list_admin_email_templates(admin_id: str):
+    try:
+        account_id, _ = get_admin_scope(admin_id)
+    except EmailTemplateError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    items = list_email_templates(account_id)
+    return {"items": items, "total": len(items)}
+
+
+@router.get(
+    "/admin-env/{admin_id}/events",
+    summary="List events belonging to one customer account",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def list_admin_account_events(admin_id: str):
+    try:
+        account_id, _ = get_admin_scope(admin_id)
+    except EmailTemplateError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    items = list_account_events(account_id)
+    return {"items": items, "total": len(items)}
+
+
+@router.get(
+    "/admin-env/{admin_id}/email-template-media",
+    summary="List structured-template media for one customer account",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def list_admin_email_template_media(admin_id: str):
+    try:
+        account_id, owner_id = get_admin_scope(admin_id)
+    except EmailTemplateError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"items": list_account_media(account_id, admin_user_id=owner_id)}
+
+
+@router.post(
+    "/admin-env/{admin_id}/email-template-media",
+    summary="Upload structured-template media for one customer account",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+async def upload_admin_email_template_media(
+    admin_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+):
+    actor = get_current_user(request)
+    try:
+        account_id, owner_id = get_admin_scope(admin_id)
+        raw = await file.read()
+        return save_account_media(
+            account_id=account_id,
+            admin_user_id=owner_id,
+            actor_id=str(actor["id"]),
+            file_bytes=raw,
+            filename=file.filename,
+            content_type=file.content_type,
+        )
+    except (EmailTemplateError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete(
+    "/admin-env/{admin_id}/email-template-media/{media_id}",
+    summary="Delete structured-template media for one customer account",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def delete_admin_email_template_media(admin_id: str, media_id: str):
+    try:
+        account_id, _ = get_admin_scope(admin_id)
+        delete_account_media(account_id, media_id)
+    except EmailTemplateError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"success": True}
+
+
+@router.post(
+    "/admin-env/{admin_id}/email-templates",
+    summary="Create an email template for one customer account",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def create_admin_email_template(
+    admin_id: str,
+    body: CmsEmailTemplateRequest,
+    request: Request,
+):
+    actor = get_current_user(request)
+    try:
+        account_id, owner_id = get_admin_scope(admin_id)
+        return create_email_template(
+            account_id=account_id,
+            admin_user_id=owner_id,
+            actor_id=str(actor["id"]),
+            **body.model_dump(),
+        )
+    except EmailTemplateError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put(
+    "/admin-env/{admin_id}/email-templates/{template_id}",
+    summary="Update an email template for one customer account",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def update_admin_email_template(
+    admin_id: str,
+    template_id: str,
+    body: CmsEmailTemplateRequest,
+    request: Request,
+):
+    actor = get_current_user(request)
+    try:
+        account_id, _ = get_admin_scope(admin_id)
+        item = update_email_template(
+            account_id,
+            template_id,
+            body.model_dump(),
+            actor_id=str(actor["id"]),
+        )
+    except EmailTemplateError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not item:
+        raise HTTPException(status_code=404, detail="Email template not found.")
+    return item
+
+
+@router.patch(
+    "/admin-env/{admin_id}/email-templates/{template_id}/status",
+    summary="Activate or deactivate an account email template",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def update_admin_email_template_status(
+    admin_id: str,
+    template_id: str,
+    body: CmsEmailTemplateStatusRequest,
+    request: Request,
+):
+    actor = get_current_user(request)
+    try:
+        account_id, _ = get_admin_scope(admin_id)
+        item = update_email_template(
+            account_id,
+            template_id,
+            {"status": body.status},
+            actor_id=str(actor["id"]),
+        )
+    except EmailTemplateError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not item:
+        raise HTTPException(status_code=404, detail="Email template not found.")
+    return item
+
+
+@router.delete(
+    "/admin-env/{admin_id}/email-templates/{template_id}",
+    summary="Delete an email template from one customer account",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def delete_admin_email_template(admin_id: str, template_id: str):
+    try:
+        account_id, _ = get_admin_scope(admin_id)
+    except EmailTemplateError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not get_email_template(account_id, template_id):
+        raise HTTPException(status_code=404, detail="Email template not found.")
+    delete_email_template(account_id, template_id)
+    return {"success": True}
 
 
 @router.put(
@@ -201,16 +417,14 @@ def put_admin_channel_locks(admin_id: str, body: ChannelLocksUpdateRequest, requ
     actor = get_current_user(request)
     payload = {
         key: value
-        for key, value in {
-            "whatsapp": body.whatsapp,
-            "email": body.email,
-            "google_sheets": body.google_sheets,
-        }.items()
+        for key, value in body.model_dump(exclude_none=True).items()
         if value is not None
     }
     if not payload:
         raise HTTPException(status_code=400, detail="Provide at least one channel lock flag.")
     try:
+        previous = get_admin_env(admin_id) or {}
+        old_locks = previous.get("channel_locks")
         update_channel_locks(admin_id, payload)
         item = set_admin_channel_locks(admin_id, payload)
     except ValueError as exc:
@@ -218,11 +432,50 @@ def put_admin_channel_locks(admin_id: str, body: ChannelLocksUpdateRequest, requ
 
     log_action(
         str(actor["id"]),
-        "cms_channel_locks_updated",
+        "cms_feature_control_updated",
         ip=request.client.host if request.client else "",
+        old_value={"admin_id": admin_id, "channel_locks": old_locks},
         new_value={"admin_id": admin_id, "channel_locks": item.get("channel_locks")},
     )
     return {"success": True, "item": item, "channel_locks": item.get("channel_locks")}
+
+
+@router.get(
+    "/admin-env/{admin_id}/feature-controls",
+    summary="List module and action block status for this Admin's company",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def get_admin_feature_controls(admin_id: str):
+    from services.cms_app_access import feature_control_payload
+
+    item = get_admin_env(admin_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Admin not found")
+    control = feature_control_payload(item.get("channel_locks"))
+    return {"success": True, "item": item, **control}
+
+
+@router.get(
+    "/admin-env/{admin_id}/payments",
+    summary="Payment overview and history for this Admin's company",
+    dependencies=[Depends(require_role(ROLE_SUPER_ADMIN))],
+)
+def get_admin_payments(admin_id: str):
+    from services.billing_service import list_company_payments
+
+    item = get_admin_env(admin_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Admin not found")
+    company_id = item.get("company_id")
+    history = list_company_payments(str(company_id) if company_id else None)
+    return {
+        "success": True,
+        "admin_id": admin_id,
+        "company_id": company_id,
+        "payment": item.get("payment"),
+        "plan_name": item.get("plan_name") or (item.get("payment") or {}).get("plan_name"),
+        **history,
+    }
 
 
 @router.put(

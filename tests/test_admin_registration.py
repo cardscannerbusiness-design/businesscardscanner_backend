@@ -41,6 +41,32 @@ class TestAdminRegistrationValidation(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.code, "INVALID_COMPANY")
 
+    def test_empty_designation_is_not_rejected(self) -> None:
+        with self.assertRaises(RegistrationError) as ctx:
+            create_admin_registration(
+                full_name="Ada Lovelace",
+                email="ada@example.com",
+                password="ValidPass1!",
+                company_name="Ulavi",
+                phone="",
+                designation="",
+                ip="designation-empty",
+            )
+        self.assertNotEqual(ctx.exception.code, "INVALID_DESIGNATION")
+        self.assertEqual(ctx.exception.code, "INVALID_PHONE")
+
+        with self.assertRaises(RegistrationError) as withTitle:
+            create_admin_registration(
+                full_name="Ada Lovelace",
+                email="ada@example.com",
+                password="ValidPass1!",
+                company_name="Ulavi",
+                phone="",
+                designation="Director",
+                ip="designation-set",
+            )
+        self.assertEqual(withTitle.exception.code, "INVALID_PHONE")
+
     def test_weak_password(self) -> None:
         with self.assertRaises(RegistrationError) as ctx:
             create_admin_registration(

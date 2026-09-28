@@ -1250,9 +1250,18 @@ def _cms_email_subject(
     contact: dict[str, Any] | None = None,
 ) -> str:
     from services.admin_runtime_config import runtime_email, runtime_templates
-    from services.template_token_service import apply_numbered_tokens, resolve_token_values
+    from services.template_token_service import (
+        apply_named_tokens,
+        apply_numbered_tokens,
+        missing_named_placeholder_values,
+        named_token_values,
+        resolve_token_values,
+        unresolved_placeholders,
+    )
 
     tpl = runtime_templates() or {}
+    if tpl.get("_email_template_error"):
+        raise ValueError(str(tpl["_email_template_error"]))
     raw = str(tpl.get("email_subject") or "").strip()
     if not raw:
         return SUBJECT
@@ -1260,15 +1269,36 @@ def _cms_email_subject(
     smtp = _active_smtp()
     em = runtime_email() or {}
     sender = str(em.get("sender_name") or smtp.get("name") or BUSINESS_COMPANY_NAME or "Team")
+    placeholder_sender = _resolve_admin_display_name(contact) or sender
     token_values = resolve_token_values(contact, tpl, sender_name=sender)
     if "1" not in token_values and recipient_name:
         token_values["1"] = _greeting_name(recipient_name)
 
     rendered = apply_numbered_tokens(raw, token_values)
-    return (
+    named_values = named_token_values(
+        contact,
+        company=str(tpl.get("account_company_name") or BUSINESS_COMPANY_NAME),
+        event_name=_resolve_event_name(contact=contact),
+        sender_name=placeholder_sender,
+    )
+    missing = missing_named_placeholder_values(rendered, named_values)
+    if missing:
+        raise ValueError(
+            "Email subject is missing values for placeholders: "
+            + ", ".join(f"{{{{{name}}}}}" for name in missing)
+        )
+    rendered = apply_named_tokens(rendered, named_values)
+    rendered = (
         rendered.replace("{{GREETING}}", _greeting_name(recipient_name))
         .replace("{{COMPANY}}", BUSINESS_COMPANY_NAME)
     )
+    unresolved = unresolved_placeholders(rendered)
+    if unresolved:
+        raise ValueError(
+            "Email subject contains unresolved placeholders: "
+            + ", ".join(f"{{{{{name}}}}}" for name in unresolved)
+        )
+    return rendered
 
 
 def build_thank_you_email_html(
@@ -1279,10 +1309,18 @@ def build_thank_you_email_html(
 ) -> str:
     """Build a table-based HTML email body compatible with major email clients."""
     from services.admin_runtime_config import runtime_email, runtime_templates
-    from services.template_token_service import resolve_token_values
+    from services.template_token_service import (
+        apply_named_tokens,
+        missing_named_placeholder_values,
+        named_token_values,
+        resolve_token_values,
+        unresolved_placeholders,
+    )
 
     reply_addr = smtp_reply_to_email() or GMAIL_USER or ""
     tpl = runtime_templates() or {}
+    if tpl.get("_email_template_error"):
+        raise ValueError(str(tpl["_email_template_error"]))
     em = runtime_email() or {}
     body_html = str(tpl.get("email_body") or "").strip()
     smtp = _active_smtp()
@@ -1296,9 +1334,25 @@ def build_thank_you_email_html(
         email_addr = str(contact.get("email") or contact.get("emailAddress") or "").strip()
         website = str(contact.get("website") or contact.get("url") or "").strip()
 
-    token_values = resolve_token_values(contact, tpl, sender_name=sign_off)
-
     admin_display_name = _resolve_admin_display_name(contact)
+    token_values = resolve_token_values(contact, tpl, sender_name=admin_display_name or sign_off)
+    resolved_event_name = _resolve_event_name(event_name, contact=contact)
+    named_values = named_token_values(
+        contact,
+        company=str(tpl.get("account_company_name") or BUSINESS_COMPANY_NAME),
+        event_name=resolved_event_name,
+        sender_name=admin_display_name or sign_off,
+    )
+    missing = missing_named_placeholder_values(body_html, named_values)
+    if missing:
+        raise ValueError(
+            "Email body is missing values for placeholders: "
+            + ", ".join(f"{{{{{name}}}}}" for name in missing)
+        )
+    body_html = apply_named_tokens(
+        body_html,
+        {key: html.escape(value) for key, value in named_values.items()},
+    )
 
     context = thank_you_email_context(
         greeting=_greeting_name(recipient_name or token_values.get("1")),
@@ -1317,7 +1371,7 @@ def build_thank_you_email_html(
         brand_border=_BRAND_BORDER,
         pdf_download_href=_pdf_download_href(),
         assets_base=_assets_base(),
-        event_name=_resolve_event_name(event_name, contact=contact),
+        event_name=resolved_event_name,
         body_html=body_html,
         phone=phone,
         email=email_addr,
@@ -1325,7 +1379,14 @@ def build_thank_you_email_html(
         sign_off_name=sign_off,
         numbered_tokens=token_values,
     )
-    return render_thank_you_email_html(context)
+    rendered = render_thank_you_email_html(context)
+    unresolved = unresolved_placeholders(rendered)
+    if unresolved:
+        raise ValueError(
+            "Email body contains unresolved placeholders: "
+            + ", ".join(f"{{{{{name}}}}}" for name in unresolved)
+        )
+    return rendered
 
 
 def build_thank_you_email_body(

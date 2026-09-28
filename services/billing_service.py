@@ -20,6 +20,25 @@ from db.pool import db_cursor
 
 logger = logging.getLogger(__name__)
 
+# Stored on payment_intents for SuperAdmin/CMS diagnostics. Never returned to customers.
+_GATEWAY_CONFIG_ERROR = (
+    "Payment gateway is not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET "
+    "(or STRIPE_SECRET_KEY) on the backend to enable live checkout."
+)
+CUSTOMER_GATEWAY_UNAVAILABLE = (
+    "Payment could not be started. Please try again later or contact support."
+)
+
+
+def _customer_safe_error(message: str) -> str:
+    text = (message or "").strip()
+    if not text:
+        return ""
+    upper = text.upper()
+    if "RAZORPAY_KEY" in upper or "STRIPE_SECRET" in upper or "KEY_SECRET" in upper:
+        return CUSTOMER_GATEWAY_UNAVAILABLE
+    return text
+
 PREPAID_PACKAGES: dict[str, dict[str, Any]] = {
     "PREPAID_STARTER": {"name": "Starter", "amount_inr": 750, "scan_capacity": 1000, "validity_days": 365},
     "PREPAID_GROWTH": {"name": "Growth", "amount_inr": 1500, "scan_capacity": 2000, "validity_days": 10},
@@ -140,10 +159,7 @@ def start_prepaid_checkout(user: dict[str, Any], package_id: str) -> dict[str, A
             error_message = str(exc)[:500]
     else:
         status = "awaiting_gateway"
-        error_message = (
-            "Payment gateway is not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET "
-            "(or STRIPE_SECRET_KEY) on the backend to enable live checkout."
-        )
+        error_message = _GATEWAY_CONFIG_ERROR
 
     with db_cursor(commit=True) as cur:
         cur.execute(
@@ -174,7 +190,7 @@ def start_prepaid_checkout(user: dict[str, Any], package_id: str) -> dict[str, A
 
     message = {
         "pending": f"Checkout started for {pkg['name']}. Complete payment to unlock {pkg['scan_capacity']} scans.",
-        "awaiting_gateway": error_message,
+        "awaiting_gateway": CUSTOMER_GATEWAY_UNAVAILABLE,
         "provider_error": "The payment provider could not start checkout. The request was recorded.",
         "created": "Prepaid request recorded.",
     }.get(status, "Prepaid request recorded.")
@@ -194,3 +210,218 @@ def start_prepaid_checkout(user: dict[str, Any], package_id: str) -> dict[str, A
         "razorpay_key_id": razorpay_key if provider == "razorpay" and status == "pending" else "",
         "message": message,
     }
+
+
+def _row_to_payment_record(row: dict[str, Any]) -> dict[str, Any]:
+    from services.cms_app_access import payment_status_view, classify_payment_status
+
+    pkg = PREPAID_PACKAGES.get(str(row.get("package_id") or "").upper(), {})
+    status = str(row.get("status") or "")
+    view = payment_status_view(classify_payment_status(plan_name=None, intent_status=status))
+    amount = int(row.get("amount_inr") or 0)
+    created = row.get("created_at")
+    updated = row.get("updated_at")
+    validity_days = int(row.get("validity_days") or 0)
+    valid_until = None
+    if view["status_code"] == "paid" and updated and validity_days:
+        try:
+            from datetime import timedelta
+
+            valid_until = (updated + timedelta(days=validity_days)).isoformat()
+        except Exception:
+            valid_until = None
+    return {
+        "id": str(row.get("id") or ""),
+        "package_id": row.get("package_id") or "",
+        "package_name": pkg.get("name") or str(row.get("package_id") or "Plan"),
+        "provider": row.get("provider") or "",
+        "status": status,
+        "status_code": view["status_code"],
+        "status_label": view["status_label"],
+        "status_mark": view["status_mark"],
+        "amount_inr": amount,
+        "scan_capacity": int(row.get("scan_capacity") or 0),
+        "validity_days": validity_days,
+        "provider_ref": row.get("provider_ref") or "",
+        "error_message": _customer_safe_error(str(row.get("error_message") or "")),
+        "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
+        "updated_at": updated.isoformat() if hasattr(updated, "isoformat") else updated,
+        "valid_until": valid_until,
+    }
+
+
+def list_company_payments(company_id: str | None) -> dict[str, Any]:
+    if not company_id:
+        return {"items": [], "total": 0}
+    with db_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT id, company_id, user_id, package_id, provider, status, amount_inr,
+                   scan_capacity, validity_days, provider_ref, checkout_url, error_message,
+                   created_at, updated_at
+            FROM payment_intents
+            WHERE company_id = %s
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            (company_id,),
+        )
+        rows = cur.fetchall() or []
+    items = [_row_to_payment_record(dict(row)) for row in rows]
+    latest_paid = next((item for item in items if item["status_code"] == "paid"), None)
+    return {"items": items, "total": len(items), "latest_paid": latest_paid}
+
+
+def fulfill_paid_intent(
+    *,
+    intent_id: str | None = None,
+    provider_ref: str | None = None,
+    package_id: str | None = None,
+    company_id: str | None = None,
+) -> dict[str, Any]:
+    """Mark an intent paid and apply the package to the company. Idempotent."""
+    with db_cursor(commit=True) as cur:
+        row = None
+        if intent_id:
+            cur.execute("SELECT * FROM payment_intents WHERE id = %s", (intent_id,))
+            row = cur.fetchone()
+        if not row and provider_ref:
+            cur.execute(
+                """
+                SELECT * FROM payment_intents
+                WHERE provider_ref = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (provider_ref,),
+            )
+            row = cur.fetchone()
+        if not row and company_id and package_id:
+            cur.execute(
+                """
+                SELECT * FROM payment_intents
+                WHERE company_id = %s AND package_id = %s
+                  AND status IN ('pending', 'created', 'awaiting_gateway', 'authorized')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (company_id, package_id),
+            )
+            row = cur.fetchone()
+        if not row:
+            raise BillingError("INTENT_NOT_FOUND", "Payment could not be matched.", 404)
+
+        intent = dict(row)
+        pkg_id = str(package_id or intent.get("package_id") or "").strip().upper()
+        pkg = PREPAID_PACKAGES.get(pkg_id)
+        cid = str(company_id or intent.get("company_id") or "")
+        if not pkg or not cid:
+            raise BillingError("INVALID_PACKAGE", "Paid package could not be applied.", 422)
+
+        current_status = str(intent.get("status") or "").lower()
+        already_paid = current_status in {"paid", "captured", "success", "succeeded", "completed"}
+        if not already_paid:
+            cur.execute(
+                """
+                UPDATE payment_intents
+                SET status = 'paid', error_message = '', updated_at = NOW()
+                WHERE id = %s
+                """,
+                (intent["id"],),
+            )
+            cur.execute(
+                """
+                UPDATE companies
+                SET plan_name = %s, card_limit = %s, updated_at = NOW()
+                WHERE id = %s AND COALESCE(status, 'active') <> 'deleted'
+                """,
+                (pkg_id, int(pkg["scan_capacity"]), cid),
+            )
+            logger.info(
+                "Prepaid plan activated company_id=%s package=%s intent=%s",
+                cid,
+                pkg_id,
+                intent["id"],
+            )
+        return {
+            "success": True,
+            "already_paid": already_paid,
+            "intent_id": str(intent["id"]),
+            "company_id": cid,
+            "package_id": pkg_id,
+            "plan_name": pkg_id,
+            "card_limit": int(pkg["scan_capacity"]),
+        }
+
+
+def mark_intent_status(
+    *,
+    provider_ref: str | None,
+    status: str,
+    error_message: str = "",
+) -> None:
+    if not provider_ref:
+        return
+    with db_cursor(commit=True) as cur:
+        cur.execute(
+            """
+            UPDATE payment_intents
+            SET status = %s, error_message = %s, updated_at = NOW()
+            WHERE provider_ref = %s
+              AND status NOT IN ('paid', 'captured', 'success', 'succeeded', 'completed')
+            """,
+            (status, error_message[:500], provider_ref),
+        )
+
+
+def handle_razorpay_webhook(payload: dict[str, Any]) -> dict[str, Any]:
+    event = str(payload.get("event") or "")
+    payment_entity = ((payload.get("payload") or {}).get("payment") or {}).get("entity") or {}
+    order_entity = ((payload.get("payload") or {}).get("order") or {}).get("entity") or {}
+    notes = payment_entity.get("notes") or order_entity.get("notes") or {}
+    if not isinstance(notes, dict):
+        notes = {}
+    order_id = str(payment_entity.get("order_id") or order_entity.get("id") or "")
+    package_id = str(notes.get("package_id") or "")
+    company_id = str(notes.get("company_id") or "")
+    intent_id = str(notes.get("intent_id") or "")
+
+    if event in {"payment.captured", "order.paid", "payment.authorized"}:
+        return fulfill_paid_intent(
+            intent_id=intent_id or None,
+            provider_ref=order_id or None,
+            package_id=package_id or None,
+            company_id=company_id or None,
+        )
+    if event in {"payment.failed", "order.cancelled"}:
+        mark_intent_status(
+            provider_ref=order_id or None,
+            status="failed" if "failed" in event else "cancelled",
+            error_message=str(payment_entity.get("error_description") or event),
+        )
+        return {"success": True, "status": "failed" if "failed" in event else "cancelled"}
+    return {"success": True, "ignored": event}
+
+
+def handle_stripe_webhook(payload: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(payload.get("type") or "")
+    obj = (payload.get("data") or {}).get("object") or {}
+    metadata = obj.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    session_id = str(obj.get("id") or "")
+    if event_type in {"checkout.session.completed", "payment_intent.succeeded"}:
+        return fulfill_paid_intent(
+            intent_id=str(metadata.get("intent_id") or "") or None,
+            provider_ref=session_id or None,
+            package_id=str(metadata.get("package_id") or "") or None,
+            company_id=str(metadata.get("company_id") or "") or None,
+        )
+    if event_type in {"checkout.session.expired", "payment_intent.payment_failed"}:
+        mark_intent_status(
+            provider_ref=session_id,
+            status="expired" if "expired" in event_type else "failed",
+            error_message=event_type,
+        )
+        return {"success": True, "status": "expired" if "expired" in event_type else "failed"}
+    return {"success": True, "ignored": event_type}

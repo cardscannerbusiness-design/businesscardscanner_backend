@@ -55,6 +55,7 @@ class MobileVerifyConfirmBody(BaseModel):
 
 class DataDeletionNoticeBody(BaseModel):
     kind: str = Field(description="local_queue | organisation")
+    reason: str = Field(default="", max_length=500)
 
 
 def _generate_otp(length: int = 6) -> str:
@@ -81,6 +82,8 @@ def _serialize_profile_row(row: dict) -> dict:
         if out.get(k) and hasattr(out[k], "isoformat"):
             out[k] = out[k].isoformat()
     out["display_name"] = str(out.get("display_name") or "").strip()
+    out["designation"] = str(out.get("designation") or "").strip()
+    out["company_name"] = str(out.get("company_name") or "").strip()
     out["effective_display_name"] = effective_display_name(
         display_name=out.get("display_name"),
         first_name=out.get("first_name"),
@@ -104,10 +107,13 @@ def get_profile(request: Request):
         cur.execute(
             """
             SELECT u.id, u.email, u.first_name, u.last_name, u.display_name, u.username, u.phone,
-                   u.profile_image, u.is_active, u.is_verified, u.company_id,
+                   u.profile_image, u.is_active, u.is_verified, u.company_id, u.designation,
                    u.last_login, u.last_password_change, u.created_at, u.updated_at,
-                   r.name AS role
-            FROM users u JOIN roles r ON r.id = u.role_id
+                   r.name AS role,
+                   COALESCE(c.company_name, '') AS company_name
+            FROM users u
+            JOIN roles r ON r.id = u.role_id
+            LEFT JOIN companies c ON c.id = u.company_id
             WHERE u.id = %s AND u.deleted_at IS NULL
             """,
             (user["id"],),
@@ -126,6 +132,9 @@ def get_profile(request: Request):
 )
 def update_profile(body: UpdateProfileRequest, request: Request):
     user = get_current_user(request)
+    from services.feature_control import require_feature
+
+    require_feature(user, "settings")
     updates = body.model_dump(exclude_none=True)
     if not updates:
         return {"success": True, "message": "No fields to update."}
@@ -321,6 +330,7 @@ def data_deletion_notice(body: DataDeletionNoticeBody, request: Request):
     result = send_data_deletion_confirmation(
         email,
         "organisation" if kind == "organisation" else "local_queue",
+        reason=(body.reason or "").strip(),
     )
     return {
         "success": True,
@@ -383,7 +393,7 @@ def delete_own_account(body: DeleteAccountRequest, request: Request):
         AUDIT_ACCOUNT_DELETED,
         ip=meta["ip"],
         user_agent=meta["user_agent"],
-        new_value={"email": row["email"]},
+        new_value={"email": row["email"], "reason": (body.reason or "").strip()[:500]},
     )
     logger.info("User self-deleted account %s", user_id)
     return {"success": True, "message": "Account deleted."}
@@ -394,7 +404,11 @@ def delete_own_account(body: DeleteAccountRequest, request: Request):
     summary="Get assigned email template for authenticated user",
     description="Read-only endpoint returning the email template assigned to the current user's admin.",
 )
-def get_assigned_email_template(request: Request):
+def get_assigned_email_template(
+    request: Request,
+    template_key: str = "CARD_FOLLOW_UP",
+    event_id: str | None = None,
+):
     """Return the email template assigned to the current user's admin.
 
     Strictly read-only; does not send emails or modify configuration.
@@ -405,13 +419,56 @@ def get_assigned_email_template(request: Request):
 
     from services.admin_runtime_config import resolve_owner_admin_id
     from services.admin_env_service import get_admin_env_settings
+    from services.email_template_store import (
+        account_has_email_templates,
+        account_has_event_templates,
+        get_active_email_template,
+        get_admin_scope,
+        get_email_template_for_event,
+        validate_account_event,
+    )
 
     admin_id = resolve_owner_admin_id(user)
     templates = None
+    normalized_templates_exist = False
+    selected_template = None
+    selection_error = ""
+    if admin_id and event_id:
+        try:
+            account_id, _ = get_admin_scope(admin_id)
+            validate_account_event(account_id, event_id)
+            candidate = get_email_template_for_event(admin_id, event_id)
+            if candidate and candidate.get("status") == "active":
+                selected_template = candidate
+            elif candidate:
+                selection_error = "The email template for this event is inactive."
+            elif account_has_event_templates(account_id):
+                selection_error = "No email template exists for the selected event."
+        except ValueError as exc:
+            selection_error = str(exc)
+    if admin_id and not selected_template and not selection_error:
+        selected_template = get_active_email_template(admin_id, template_key)
+    if selected_template:
+        templates = {
+            "email_subject": selected_template["subject"],
+            "email_body": selected_template["body"],
+            "token_map": selected_template["token_map"],
+        }
     if admin_id:
         admin_settings = get_admin_env_settings(admin_id)
-        if admin_settings and admin_settings.get("templates"):
+        if not templates and not selection_error and admin_settings and admin_settings.get("templates"):
             templates = admin_settings["templates"]
+
+        # Once an account has adopted normalized templates, never fall back to
+        # a legacy or unrelated template when the requested key is unavailable.
+        if not selected_template and not selection_error:
+            try:
+                account_id, _ = get_admin_scope(admin_id)
+                if account_has_email_templates(account_id):
+                    normalized_templates_exist = True
+                    templates = None
+            except ValueError:
+                pass
 
     display_name = ""
     if admin_id:
@@ -424,6 +481,20 @@ def get_assigned_email_template(request: Request):
             pass
     if not display_name:
         display_name = "Dhana"
+    company_name = ""
+    if admin_id:
+        with db_cursor(commit=False) as cur:
+            cur.execute(
+                """
+                SELECT c.company_name
+                FROM users u
+                JOIN companies c ON c.id = u.company_id
+                WHERE u.id = %s
+                """,
+                (admin_id,),
+            )
+            company_row = cur.fetchone()
+        company_name = str((company_row or {}).get("company_name") or "").strip()
 
     if templates:
         subject = str(templates.get("email_subject") or "").strip()
@@ -435,10 +506,30 @@ def get_assigned_email_template(request: Request):
         has_template = bool(subject or body)
         return {
             "assigned": has_template,
+            "id": selected_template.get("id") if selected_template else None,
+            "template_name": selected_template.get("template_name") if selected_template else "Legacy template",
+            "template_key": selected_template.get("template_key") if selected_template else template_key,
+            "status": selected_template.get("status") if selected_template else "active",
             "email_subject": subject,
             "email_body": body,
             "token_map": token_map,
             "display_name": display_name,
+            "company_name": company_name,
+        }
+
+    if selection_error or normalized_templates_exist:
+        return {
+            "assigned": False,
+            "id": None,
+            "template_name": "",
+            "template_key": template_key,
+            "status": "missing",
+            "email_subject": "",
+            "email_body": "",
+            "token_map": {},
+            "display_name": display_name,
+            "company_name": company_name,
+            "error": selection_error or f"No active {template_key} email template exists for this account.",
         }
 
     # Fallback to system approved default email template matching email_service.py flow
@@ -452,10 +543,15 @@ def get_assigned_email_template(request: Request):
 
     return {
         "assigned": has_default,
+        "id": None,
+        "template_name": "System default",
+        "template_key": template_key,
+        "status": "active",
         "email_subject": default_subject,
         "email_body": default_body,
         "token_map": dict(DEFAULT_TOKEN_MAP),
         "display_name": display_name,
+        "company_name": company_name,
     }
 
 

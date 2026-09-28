@@ -47,6 +47,7 @@ from services.entitlement_service import (
     assert_can_access_contacts,
     assert_can_process_card,
 )
+from services.feature_control import require_feature
 from utils.file_utils import cleanup_temp_file, save_temp_file, validate_file
 
 router = APIRouter(tags=["Contacts"])
@@ -140,6 +141,12 @@ def _raise_card_limit(exc: CardLimitExceededError) -> None:
 
 
 def _require_contacts_access(user: dict[str, Any]) -> None:
+    from services.feature_control import FeatureBlockedError, assert_feature_enabled
+
+    try:
+        assert_feature_enabled(user, "contacts")
+    except FeatureBlockedError as exc:
+        raise HTTPException(status_code=403, detail=exc.to_response()) from exc
     try:
         assert_can_access_contacts(resolve_company_id_for_user(user), user=user)
     except ContactsFrozenError as exc:
@@ -250,6 +257,8 @@ async def create_contact(
         raise HTTPException(status_code=400, detail="Invalid contact JSON") from exc
 
     contact_data["created_by_user_id"] = user["id"]
+
+    require_feature(user, "capture")
 
     temp_path = None
     try:
@@ -531,6 +540,7 @@ async def create_contact_json(
         # Freeze PostgreSQL persist after Freemium exhaustion (IndexedDB still allowed).
         # Check before duplicate lookup so contact rows are not leaked.
         try:
+            require_feature(user, "capture")
             assert_can_process_card(resolve_company_id_for_user(user), user=user)
         except CardLimitExceededError as exc:
             _raise_card_limit(exc)

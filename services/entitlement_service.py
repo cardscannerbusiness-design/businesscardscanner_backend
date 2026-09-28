@@ -228,7 +228,10 @@ def _normalize(row: dict[str, Any] | None, company_id: str) -> dict[str, Any]:
         plan_name=plan,
         intent_status=(row or {}).get("payment_intent_status"),
     )
+    from services.cms_app_access import normalize_action_locks
+
     locks = effective_channel_locks((row or {}).get("cms_channel_locks"), pay["payment_done"])
+    action_locks = normalize_action_locks((row or {}).get("cms_channel_locks"))
 
     return {
         "company_id": resolved_id,
@@ -242,12 +245,22 @@ def _normalize(row: dict[str, Any] | None, company_id: str) -> dict[str, Any]:
         "can_process_card": (not enforced) or (remaining is not None and remaining > 0),
         "whatsapp_allowed": outreach_ok and not locks["whatsapp"],
         "email_allowed": outreach_ok and not locks["email"],
-        "contacts_allowed": contacts_ok,
+        "contacts_allowed": contacts_ok and not locks.get("contacts", False),
         "google_sheets_allowed": not locks["google_sheets"],
         "cms_channel_locks": locks,
+        "cms_feature_locks": locks,
+        "cms_action_locks": action_locks,
+        "capture_allowed": not locks.get("capture", False),
+        "events_allowed": not locks.get("events", False),
+        "email_templates_allowed": not locks.get("email_templates", False),
+        "media_allowed": not locks.get("media", False),
+        "subscription_allowed": not locks.get("subscription", False),
+        "offline_queue_allowed": not locks.get("offline_queue", False),
+        "settings_allowed": not locks.get("settings", False),
         "entitlement_started_at": started,
         "entitlement_exhausted_at": exhausted_at,
         "scans_unlimited": False,
+        "payment": pay,
     }
 
 
@@ -269,6 +282,27 @@ def get_entitlement(company_id: str | None) -> dict[str, Any]:
             "contacts_allowed": True,
             "google_sheets_allowed": True,
             "cms_channel_locks": {"whatsapp": False, "email": False, "google_sheets": False},
+            "cms_feature_locks": {
+                "capture": False,
+                "contacts": False,
+                "events": False,
+                "email_templates": False,
+                "email": False,
+                "whatsapp": False,
+                "google_sheets": False,
+                "media": False,
+                "subscription": False,
+                "offline_queue": False,
+                "settings": False,
+            },
+            "cms_action_locks": {},
+            "capture_allowed": True,
+            "events_allowed": True,
+            "email_templates_allowed": True,
+            "media_allowed": True,
+            "subscription_allowed": True,
+            "offline_queue_allowed": True,
+            "settings_allowed": True,
             "entitlement_started_at": None,
             "entitlement_exhausted_at": None,
             "scans_unlimited": False,
@@ -895,11 +929,21 @@ def entitlement_fields_for_usage(company_id: str | None) -> dict[str, Any]:
         "google_sheets_allowed": info.get("google_sheets_allowed", True),
         "cms_channel_locks": info.get("cms_channel_locks")
         or {"whatsapp": False, "email": False, "google_sheets": False},
+        "cms_feature_locks": info.get("cms_feature_locks") or info.get("cms_channel_locks") or {},
+        "cms_action_locks": info.get("cms_action_locks") or {},
         "cms_whatsapp_locked": bool(info.get("cms_whatsapp_locked")),
         "cms_email_locked": bool(info.get("cms_email_locked")),
         "cms_google_sheets_locked": bool(info.get("cms_google_sheets_locked")),
         "contacts_allowed": info["contacts_allowed"],
+        "capture_allowed": info.get("capture_allowed", True),
+        "events_allowed": info.get("events_allowed", True),
+        "email_templates_allowed": info.get("email_templates_allowed", True),
+        "media_allowed": info.get("media_allowed", True),
+        "subscription_allowed": info.get("subscription_allowed", True),
+        "offline_queue_allowed": info.get("offline_queue_allowed", True),
+        "settings_allowed": info.get("settings_allowed", True),
         "entitlement_started_at": info["entitlement_started_at"],
         "entitlement_exhausted_at": info["entitlement_exhausted_at"],
         "scans_unlimited": False,
+        "payment": info.get("payment"),
     }
