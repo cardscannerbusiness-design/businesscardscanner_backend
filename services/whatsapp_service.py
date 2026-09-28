@@ -79,7 +79,7 @@ def _normalize_env(value: str | None) -> str:
 ACCESS_TOKEN = _normalize_env(os.getenv("WHATSAPP_ACCESS_TOKEN"))
 PHONE_NUMBER_ID = _normalize_env(os.getenv("WHATSAPP_PHONE_NUMBER_ID"))
 GRAPH_API_VERSION = _normalize_env(os.getenv("WHATSAPP_GRAPH_API_VERSION")) or "v25.0"
-TEMPLATE_NAME = _normalize_env(os.getenv("WHATSAPP_TEMPLATE_NAME")) or "hello_world"
+TEMPLATE_NAME = _normalize_env(os.getenv("WHATSAPP_TEMPLATE_NAME"))
 TEMPLATE_LANGUAGE_CODE = _normalize_env(os.getenv("WHATSAPP_TEMPLATE_LANGUAGE_CODE")) or "en_US"
 SCAN_THANKS_TEMPLATE_NAME = (
     _normalize_env(os.getenv("WHATSAPP_SCAN_TEMPLATE_NAME")) or "cardsync_scan_thanks"
@@ -717,7 +717,12 @@ def send_whatsapp_template(
     language_code: str | None = None,
     components: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    resolved_name = (template_name or TEMPLATE_NAME or "").strip()
+    resolved_name = (
+        template_name
+        or TEMPLATE_NAME
+        or _active_whatsapp_template_name(CARD_RECEIVED_TEMPLATE_NAME)
+        or ""
+    ).strip()
     preferred_lang = language_code or resolve_template_language(resolved_name)
 
     lang_candidates: list[str] = []
@@ -1580,7 +1585,8 @@ def _requires_template_message(error: Exception) -> bool:
 def _template_components(template_name: str, contact: dict[str, Any]) -> list[dict[str, Any]]:
     """Pick body parameters that match the approved template."""
     name = (template_name or "").strip()
-    if name in {TEMPLATE_NAME, "hello_world"}:
+    # WHATSAPP_TEMPLATE_NAME, when set, is sent with no body parameters.
+    if TEMPLATE_NAME and name == TEMPLATE_NAME:
         return []
     if name == "cardsync_contact_saved":
         return build_contact_saved_template_components(contact)
@@ -1635,7 +1641,6 @@ def _ordered_outbound_template_names() -> list[str]:
         SCAN_THANKS_TEMPLATE_NAME,
         BUSINESS_CARD_TEMPLATE_NAME,
         "cardsync_contact_saved",
-        TEMPLATE_NAME,
     ):
         _add(raw)
     return ordered

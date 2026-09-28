@@ -70,14 +70,6 @@ try:
 except Exception as exc:
     print("FAILED:", exc)
 
-print("\n=== SEND hello_world ===")
-try:
-    result2 = send_whatsapp_template(phone, template_name="hello_world", language_code="en_US")
-    mid2 = (result2.get("messages") or [{}])[0].get("id")
-    print("accepted message_id:", mid2)
-except Exception as exc:
-    print("FAILED:", exc)
-
 print("\n=== NOTES ===")
 print(f"Recipient normalized: {normalized}")
 print("If API says accepted but phone has no message:")

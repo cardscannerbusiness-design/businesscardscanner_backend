@@ -31,7 +31,7 @@ def main() -> int:
         "--mode",
         choices=("auto", "text", "template", "business-card"),
         default="auto",
-        help="auto tries text then template; template uses hello_world; business-card uses cardsync_contact_saved.",
+        help="auto tries text then template; template uses WHATSAPP_TEMPLATE_NAME or the active card-received template; business-card uses cardsync_contact_saved.",
     )
     parser.add_argument("--name", default="Yogesh", help="Contact name for business-card template.")
     parser.add_argument("--company", default="CardSync", help="Company for business-card template.")

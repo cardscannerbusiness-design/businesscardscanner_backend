@@ -12,7 +12,7 @@ class WhatsAppTestRequest(BaseModel):
     mode: str = Field(
         default="auto",
         description=(
-            "Send mode: `auto` (text then template fallback), `text`, `template` (hello_world), "
+            "Send mode: `auto` (text then template fallback), `text`, `template` (WHATSAPP_TEMPLATE_NAME, otherwise the active card-received template), "
             "or `business-card` (cardsync_contact_saved from WHATSAPP_*_TEMPLATE_NAME env)."
         ),
     )

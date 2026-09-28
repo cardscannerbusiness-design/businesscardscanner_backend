@@ -42,7 +42,7 @@ def main() -> int:
     found_scan = False
     for t in data.get("data", []):
         name = t.get("name", "")
-        if "cardsync" in name or name == "hello_world":
+        if "cardsync" in name:
             print(
                 f"  {name} | lang={t.get('language')} | status={t.get('status')} | cat={t.get('category')}"
             )
