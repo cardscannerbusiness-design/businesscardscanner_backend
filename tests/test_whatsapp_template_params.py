@@ -14,6 +14,7 @@ from services.whatsapp_service import (
     _active_whatsapp_template_name,
     _is_builtin_ula_video_template,
     _ordered_outbound_template_names,
+    _template_components,
     build_card_received_template_components,
 )
 
@@ -406,8 +407,65 @@ class SuperAdminTemplateSelectionTests(unittest.TestCase):
         body = next(c for c in components if c.get("type") == "body")
         texts = [p["text"] for p in body["parameters"]]
         self.assertEqual(len(texts), 5)
-        self.assertEqual(texts[0], "Sugitha")
+        self.assertEqual(texts[0], "Sugitha Kumar")
         self.assertEqual(texts[1], "ATM 2026")
+
+    def test_template_name_env_does_not_strip_ncs_own_atm_v3_params(self) -> None:
+        """WHATSAPP_TEMPLATE_NAME=ncs_own_atm_v3 must not send an empty component list."""
+        meta = {
+            "name": "ncs_own_atm_v3",
+            "language": "en",
+            "components": [
+                {
+                    "type": "HEADER",
+                    "format": "VIDEO",
+                    "example": {"header_handle": ["https://example.com/header.mp4"]},
+                },
+                {
+                    "type": "BODY",
+                    "text": "Hi {{1}}, at {{2}} / {{3}} / {{4}} / {{5}}.",
+                    "example": {
+                        "body_text": [["Sugitha", "Atm 2026", "Acme", "Founder", "https://acme.example"]]
+                    },
+                },
+            ],
+        }
+        with patch(
+            "services.whatsapp_service.TEMPLATE_NAME",
+            "ncs_own_atm_v3",
+        ), patch(
+            "services.whatsapp_service.fetch_waba_message_template",
+            return_value=meta,
+        ), patch(
+            "services.admin_runtime_config.runtime_templates",
+            return_value={"whatsapp_header_format": "NONE", "token_map": {}},
+        ), patch(
+            "services.admin_runtime_config.runtime_email",
+            return_value={},
+        ), patch(
+            "services.whatsapp_service._header_media_from_url_or_upload",
+            return_value={
+                "type": "header",
+                "parameters": [{"type": "video", "video": {"id": "vid123"}}],
+            },
+        ):
+            components = _template_components(
+                "ncs_own_atm_v3",
+                {
+                    "full_name": "Sugitha Kumar",
+                    "eventName": "ATM 2026",
+                    "company": "Acme",
+                    "designation": "Founder",
+                    "website": "https://acme.example",
+                },
+            )
+
+        self.assertTrue(components)
+        header = next(c for c in components if c.get("type") == "header")
+        self.assertEqual(header["parameters"][0]["type"], "video")
+        body = next(c for c in components if c.get("type") == "body")
+        texts = [p["text"] for p in body["parameters"]]
+        self.assertEqual(texts, ["Sugitha Kumar", "ATM 2026", "Acme", "Founder", "https://acme.example"])
 
     def _card_final_ula_components(self, contact: dict, token_map: dict) -> list:
         meta = {

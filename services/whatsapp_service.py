@@ -1496,6 +1496,11 @@ def build_card_received_template_components(
         if 2 in positions:
             field_by_position[2] = _template_param(event_name, "the exhibition")
 
+    # ncs_own_atm_v3 {{1}} is the stored full name, not the first word.
+    if resolved_name.strip().lower() == SUPER_ADMIN_WHATSAPP_TEMPLATE_NAME.lower() and 1 in positions:
+        stored_full_name = str(contact.get("full_name") or "").strip() or contact_name
+        field_by_position[1] = _template_param(stored_full_name, "there")
+
     parameters = [
         {"type": "text", "text": field_by_position.get(pos, "N/A")}
         for pos in positions
@@ -1583,11 +1588,14 @@ def _requires_template_message(error: Exception) -> bool:
 
 
 def _template_components(template_name: str, contact: dict[str, Any]) -> list[dict[str, Any]]:
-    """Pick body parameters that match the approved template."""
+    """Pick body parameters that match the approved template.
+
+    Do not treat WHATSAPP_TEMPLATE_NAME as a zero-parameter template.
+    That name is ncs_own_atm_v3 in production, which needs a video header
+    and five body parameters. Zero-variable templates still send no body
+    params once their Meta definition is loaded.
+    """
     name = (template_name or "").strip()
-    # WHATSAPP_TEMPLATE_NAME, when set, is sent with no body parameters.
-    if TEMPLATE_NAME and name == TEMPLATE_NAME:
-        return []
     if name == "cardsync_contact_saved":
         return build_contact_saved_template_components(contact)
     if name == "3p_direct_integration_test_template":
@@ -1640,7 +1648,6 @@ def _ordered_outbound_template_names() -> list[str]:
         CARD_RECEIVED_TEMPLATE_NAME,
         SCAN_THANKS_TEMPLATE_NAME,
         BUSINESS_CARD_TEMPLATE_NAME,
-        "cardsync_contact_saved",
     ):
         _add(raw)
     return ordered
