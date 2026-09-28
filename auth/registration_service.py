@@ -34,6 +34,8 @@ from auth.constants import (
     ROLE_USER,
 )
 from auth.email_service import (
+    admin_signup_notification_recipients,
+    send_admin_signup_notification_email,
     send_registration_approved_email,
     send_registration_received_email,
     send_registration_rejected_email,
@@ -586,6 +588,38 @@ def create_admin_registration(
         send_welcome_email(email, full_name_out)
     except Exception as exc:
         logger.warning("Could not send welcome email to %s: %s", email, exc)
+
+    # Additive only: notify staff after commit. Must never fail signup.
+    notify_recipients = admin_signup_notification_recipients()
+    if notify_recipients:
+        try:
+            result = send_admin_signup_notification_email(
+                recipients=notify_recipients,
+                admin_name=full_name_out,
+                company_name=company_name,
+                designation=designation,
+                admin_email=email,
+                phone=phone_to_store,
+                signup_at=now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            )
+            if not result.get("sent"):
+                logger.warning(
+                    "Admin signup notification to %s did not send: %s",
+                    ", ".join(notify_recipients),
+                    result.get("error") or result.get("reason") or "unknown",
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not send Admin signup notification to %s: %s",
+                ", ".join(notify_recipients),
+                exc,
+            )
+    else:
+        logger.warning(
+            "ADMIN_SIGNUP_NOTIFICATION_EMAILS and BUSINESS_EMAIL are empty — "
+            "skipping Admin signup notification for %s",
+            email,
+        )
 
     try:
         from services.google_sheets_service import fire_ensure_company_sheet

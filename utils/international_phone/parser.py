@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import phonenumbers
 
 from utils.international_phone.cc_dedupe import (
@@ -11,9 +13,21 @@ from utils.international_phone.cc_dedupe import (
 )
 
 
+_PHONE_LABEL_PREFIX = re.compile(
+    r"^(?:(?:24\s*[x×]\s*7|24\s*/\s*7)\s+)?"
+    r"(?:telephone|tel|phone|mobile|cell|whatsapp|office|direct|"
+    r"support(?:\s*no\.?)?|helpline|hotline|fax)\s*[:.\-]?\s*",
+    re.IGNORECASE,
+)
+
+
+def strip_phone_label_prefix(raw: str) -> str:
+    return _PHONE_LABEL_PREFIX.sub("", (raw or "").strip(), count=1).strip()
+
+
 def looks_international(raw: str) -> bool:
-    trimmed = (raw or "").strip()
-    return trimmed.startswith("+") or trimmed.startswith("00")
+    trimmed = strip_phone_label_prefix(raw)
+    return trimmed.startswith("+") or trimmed.startswith("00") or bool(re.match(r"^\(\s*\+", trimmed))
 
 
 def _calling_codes_longest_first() -> list[str]:
@@ -50,11 +64,14 @@ def prepare_phone_input(raw: str) -> str:
     - the deduped form is possible, AND
     - the original form is not a valid number (avoid blind edits).
     """
-    trimmed = (raw or "").strip()
+    trimmed = strip_phone_label_prefix(raw)
     if not trimmed:
         return ""
     if trimmed.startswith("00") and len(trimmed) > 2:
         trimmed = f"+{trimmed[2:]}"
+    wrapped = re.match(r"^\(\s*\+(\d{1,4})\s*\)\s*(.*)$", trimmed)
+    if wrapped:
+        trimmed = f"+{wrapped.group(1)}{wrapped.group(2)}"
     if not trimmed.startswith("+"):
         return trimmed
 
@@ -126,3 +143,48 @@ def parse_national_phone(raw: str, country_iso: str) -> phonenumbers.PhoneNumber
     except Exception:
         return as_is
     return as_is
+
+
+_national_infer_cache: dict[str, phonenumbers.PhoneNumber | None] = {}
+
+
+def infer_unique_national_phone(raw: str) -> phonenumbers.PhoneNumber | None:
+    """Return a parsed number when exactly one region is a valid metadata match.
+
+    Every valid region counts. A MOBILE-typed hit is not unique if another
+    region also validates the same digits (min vs full metadata can hide types).
+    Does not rewrite digits. Does not assume India or the US.
+    """
+    digits = digits_only(raw)
+    if len(digits) < 8 or len(digits) > 15:
+        return None
+    if digits in _national_infer_cache:
+        return _national_infer_cache[digits]
+
+    hits: list[phonenumbers.PhoneNumber] = []
+    seen: set[str] = set()
+    for region in phonenumbers.SUPPORTED_REGIONS:
+        if region in ("001", "ZZ"):
+            continue
+        try:
+            parsed = phonenumbers.parse(digits, region)
+        except phonenumbers.NumberParseException:
+            continue
+        if not phonenumbers.is_valid_number(parsed):
+            continue
+        region_of = phonenumbers.region_code_for_number(parsed)
+        if region_of != region:
+            continue
+        national = str(parsed.national_number)
+        if national != digits:
+            continue
+        if region in seen:
+            continue
+        seen.add(region)
+        hits.append(parsed)
+        if len(hits) > 1:
+            break
+
+    unique = hits[0] if len(hits) == 1 else None
+    _national_infer_cache[digits] = unique
+    return unique

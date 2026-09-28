@@ -68,16 +68,107 @@ def is_valid_website(url: str) -> bool:
         
     return True
 
+_PHONE_LABEL = re.compile(
+    r"(?:(?:24\s*[x├ù]\s*7|24\s*/\s*7)\s+)?"
+    r"\b(?:telephone|tel|phone|ph|mobile|mob|cell|whatsapp|"
+    r"office|direct|support(?:\s*no\.?)?|helpline|hotline|fax)\b\s*[:.\-]?\s*"
+    r"|^(?:tel|phone|ph|mobile|mob|cell|whatsapp|office|direct|m|p|t|f|w)\s*[:.\-]\s*",
+    re.IGNORECASE,
+)
+_PHONE_CC_ONLY = re.compile(r"^(?:\+|00)\s*\(?\s*\d{1,4}\s*\)?\s*$")
+_PHONE_DIGIT_RUN = re.compile(
+    r"(?:(?:\+|00)\s*\d{1,4}[\s./-]*)?(?:\(?\s*\+?\d{1,4}\s*\)[\s./-]*)?"
+    r"\d(?:[\s./-]*\d){6,14}"
+)
+_DATE_LIKE = re.compile(
+    r"^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$|^\d{4}[-/]\d{1,2}[-/]\d{1,2}$|^\d{4}$"
+)
+_TAX_OR_ID_CONTEXT = re.compile(
+    r"\b(?:gst|gstin|pan|tin|cin|llpin|udyam|invoice|membership|member\s*id|"
+    r"card\s*id|reg(?:istration)?(?:\s*no\.?)?|emp(?:loyee)?\s*id)\b",
+    re.IGNORECASE,
+)
+_ADDRESS_NUM_CONTEXT = re.compile(
+    r"\b(?:plot|plt|pin|pincode|postal|zip|road|rd|street|st|floor|colony|"
+    r"nagar|house|door|sector|block|mouza|address|unit|building)\b",
+    re.IGNORECASE,
+)
+_OCR_PHONE_CONFUSABLES = str.maketrans("OoIlSsBb", "00115588")
+
+
+def _phone_digits(value: str) -> str:
+    return "".join(c for c in (value or "") if c.isdigit())
+
+
+def _libphone_accepts(raw: str) -> bool:
+    """True when libphonenumber considers the candidate valid or possible."""
+    text = (raw or "").strip()
+    if not text:
+        return False
+    try:
+        from utils.international_phone.parser import (
+            infer_unique_national_phone,
+            looks_international,
+            parse_international_phone,
+            prepare_phone_input,
+        )
+        import phonenumbers
+
+        prepared = prepare_phone_input(text)
+        if looks_international(prepared):
+            parsed = parse_international_phone(prepared)
+            if parsed is None:
+                return False
+            return phonenumbers.is_valid_number(parsed) or phonenumbers.is_possible_number(parsed)
+        digits = _phone_digits(prepared)
+        if infer_unique_national_phone(digits) is not None:
+            return True
+        if not (8 <= len(digits) <= 15):
+            return False
+        try:
+            as_unknown = phonenumbers.parse(f"+{digits}", None)
+            if phonenumbers.is_possible_number(as_unknown):
+                return True
+        except phonenumbers.NumberParseException:
+            pass
+        return 8 <= len(digits) <= 15
+    except Exception:
+        digits = _phone_digits(text)
+        return 8 <= len(digits) <= 15
+
+
+def _try_ocr_digit_fix(raw: str) -> str:
+    """Map O/0 I/1 S/5 B/8 only inside phone-like tokens that fail validation as-is."""
+    text = (raw or "").strip()
+    if not text:
+        return text
+    letters = [c for c in text if c.isalpha()]
+    if not letters or len(letters) > 3:
+        return text
+    if len(_phone_digits(text)) < 7:
+        return text
+    if _libphone_accepts(text):
+        return text
+    fixed = text.translate(_OCR_PHONE_CONFUSABLES)
+    if fixed != text and _libphone_accepts(fixed):
+        return fixed
+    return text
+
+
 def is_valid_phone(phone: str) -> bool:
-    """Validate phone number, enforcing minimum length and rejecting decimals."""
-    if not phone or "." in phone:
+    """Validate a phone candidate using length plus libphonenumber when possible."""
+    if not phone:
         return False
-    # Reject if it has more than one letter (allows for 'x' at the end for extensions, but rejects typos)
+    if "." in phone and not phone.strip().startswith("+"):
+        return False
     letters = [c for c in phone if c.isalpha()]
-    if len(letters) > 1:
+    if len(letters) > 3:
         return False
-    digits = "".join(c for c in phone if c.isdigit())
-    return 7 <= len(digits) <= 15
+    candidate = _try_ocr_digit_fix(phone)
+    digits = _phone_digits(candidate)
+    if not (7 <= len(digits) <= 15):
+        return False
+    return _libphone_accepts(candidate)
 
 def clean_text(text: str) -> List[str]:
     """Clean the raw text, returning a list of normalized non-empty lines."""
@@ -205,123 +296,221 @@ def extract_websites(lines: List[str]) -> tuple[List[str], List[str]]:
             
     return unique_websites, remaining_lines
 
-def extract_phones(lines: List[str]) -> tuple[List[str], List[str]]:
-    """Extract all valid phone numbers and return them along with remaining lines."""
-    phones = []
-    remaining_lines = []
-    
-    # A broad international and domestic phone number pattern (keeps final digits).
-    phone_pattern = re.compile(
-        r'(?:(?:\+|00)\d{1,3}[\s.-]?)?(?:\(?\d{2,5}\)?[\s.-]?)?\d{3,5}[\s.-]?\d{3,5}(?:[\s.-]?\d{1,5})?'
-    )
-    address_context = re.compile(
-        r'\b(?:plot|plt|pin|pincode|postal|zip|road|rd|street|st|floor|colony|nagar|'
-        r'house|door|sector|block|mouza|address)\b|,\s*\w+.*(pin|india)|\b\d{6}\b',
-        re.IGNORECASE,
-    )
+def normalize_ocr_phone_candidate(phone: str) -> str:
+    """Normalize an OCR phone fragment using the shared international normalizer when possible.
 
-    def collapse_digit_spaces(text: str) -> str:
-        """Ignore formatting spaces between digits so spaced OCR phones keep all digits."""
-        return re.sub(r'(\d)[\s.\-]+(?=\d)', r'\1', text)
+    Bare national numbers keep their digits. Country is attached as E.164 only when
+    metadata finds exactly one valid region (never an India-only default).
+    """
+    trimmed = (phone or "").strip()
+    if not trimmed:
+        return ""
 
-    def normalize_phone_digits(phone: str) -> str:
-        """Preserve digits only; keep leading + / 00 country-code marker unchanged in spirit."""
-        trimmed = (phone or "").strip()
-        if not trimmed:
-            return ""
-        has_plus = trimmed.startswith("+") or trimmed.startswith("00") or trimmed.startswith("(+")
-        digits = "".join(c for c in trimmed if c.isdigit())
-        if not digits:
-            return ""
-        return f"+{digits}" if has_plus else digits
+    collapsed = re.sub(r"[\s.\-()]+", " ", trimmed).strip()
+    if collapsed.startswith("00") and len(collapsed) > 2:
+        collapsed = f"+{collapsed[2:]}"
+    wrapped = re.match(r"^\(\s*\+(\d{1,4})\s*\)\s*(.*)$", collapsed)
+    if wrapped:
+        collapsed = f"+{wrapped.group(1)}{wrapped.group(2)}"
+
+    if collapsed.startswith("+"):
+        try:
+            from utils.international_phone import normalize_international_phone
+
+            result = normalize_international_phone(collapsed.replace(" ", ""))
+            if result.get("is_valid") and result.get("e164"):
+                return str(result["e164"])
+        except Exception:
+            logger.debug("International phone normalize skipped for %r", collapsed, exc_info=True)
+
+    digits = "".join(c for c in collapsed if c.isdigit())
+    if not digits:
+        return ""
+    if collapsed.startswith("+"):
+        return f"+{digits}"
+
+    try:
+        from utils.international_phone.parser import infer_unique_national_phone
+        from utils.international_phone.formatter import format_phone_to_e164
+
+        inferred = infer_unique_national_phone(digits)
+        if inferred is not None:
+            formatted = format_phone_to_e164(inferred)
+            if formatted.get("e164"):
+                return str(formatted["e164"])
+    except Exception:
+        logger.debug("National country inference skipped for %r", digits, exc_info=True)
+
+    return digits
+
+
+def _index_line_meta(lines_meta: List[Dict[str, Any]] | None) -> Dict[str, Dict[str, Any]]:
+    """Map LINE text to the first structured meta row, used only for phone proximity."""
+    indexed: Dict[str, Dict[str, Any]] = {}
+    if not lines_meta:
+        return indexed
+    for row in lines_meta:
+        if not isinstance(row, dict):
+            continue
+        text = str(row.get("text") or "").strip()
+        if text and text not in indexed:
+            indexed[text] = row
+    return indexed
+
+
+def extract_phones(
+    lines: List[str],
+    lines_meta: List[Dict[str, Any]] | None = None,
+) -> tuple[List[str], List[str]]:
+    """Extract phone numbers using labels, reconstruction, and libphonenumber."""
+    phones: List[str] = []
+    remaining_lines: List[str] = []
+    meta_by_text = _index_line_meta(lines_meta)
 
     def is_false_phone_match(match: str, line: str) -> bool:
-        """Avoid treating PIN codes / plot numbers as phone numbers."""
-        digits = "".join(c for c in match if c.isdigit())
-        if len(digits) == 6 and not match.strip().startswith("+"):
-            # 6-digit value on an address-like line is almost always a PIN.
-            if address_context.search(line) or re.search(r"[A-Za-z]\s*-\s*" + re.escape(digits), line):
+        digits = _phone_digits(match)
+        stripped = match.strip()
+        if _DATE_LIKE.match(stripped):
+            return True
+        if _TAX_OR_ID_CONTEXT.search(line) and not _PHONE_LABEL.search(line):
+            return True
+        if WEBSITE_IN_LINE_REGEX.search(line) and not _PHONE_LABEL.search(line) and not stripped.startswith("+"):
+            if "www." in line.lower() or "http" in line.lower():
                 return True
-            if len(digits) == 6 and len(match.strip()) <= 8:
+        if len(digits) == 6 and not stripped.startswith("+"):
+            if _ADDRESS_NUM_CONTEXT.search(line) or re.search(r"[A-Za-z]\s*-\s*" + re.escape(digits), line):
+                return True
+            if len(stripped) <= 8:
                 return True
         if len(digits) < 8:
             return True
         idx = line.find(match)
         before = line[:idx] if idx >= 0 else ""
         if re.search(
-            r"(?:plot|plt|pin|pincode|postal|zip|floor|house|door|no\.?|road|street|sector|block)\s*[:.#\-]*\s*$",
+            r"(?:plot|plt|pin|pincode|postal|zip|floor|house|door|no\.?|road|street|sector|block|unit)\s*[:.#\-]*\s*$",
             before,
             re.IGNORECASE,
         ):
             return True
         return False
 
-    for line in lines:
-        clean_line = re.sub(r'^(tel|phone|mobile|cell|m|p|t|f|office|direct)\s*[:\-\.]?\s*', '', line, flags=re.IGNORECASE).strip()
-        # Collapse digit spaces before matching so "98765 43210" keeps all 10 digits.
-        match_line = collapse_digit_spaces(clean_line)
-        
-        matches = phone_pattern.findall(match_line)
-        matched_in_line = False
-        for match in matches:
-            if is_false_phone_match(match, match_line):
-                continue
-            if is_valid_phone(match):
-                phones.append(normalize_phone_digits(match))
-                matched_in_line = True
-                match_line = match_line.replace(match, '').strip()
+    def nearby(a: str, b: str) -> bool:
+        ma, mb = meta_by_text.get(a.strip()), meta_by_text.get(b.strip())
+        if not ma or not mb:
+            return True
+        try:
+            gap = abs(float(ma.get("top") or 0) - float(mb.get("top") or 0))
+            left = abs(float(ma.get("left") or 0) - float(mb.get("left") or 0))
+        except (TypeError, ValueError):
+            return True
+        return gap <= 0.10 and left < 0.20
+
+    def collect_from_line(line: str) -> tuple[List[str], str]:
+        found: List[str] = []
+        working = _PHONE_LABEL.sub(" ", line).strip()
+        working = re.sub(
+            r"^(tel|phone|ph|mobile|mob|cell|m|p|t|f|w|office|direct)\s*[:\-\.]?\s*",
+            "",
+            working,
+            flags=re.IGNORECASE,
+        ).strip()
+        letter_count = sum(1 for c in working if c.isalpha())
+        if letter_count and letter_count <= 3 and ("+" in working or working.startswith("00")):
+            stripped_letters = re.sub(r"(?<=\d)[A-Za-z](?=\d)", "", working)
+            if stripped_letters != working and _libphone_accepts(stripped_letters):
+                working = stripped_letters
             else:
-                logger.info(f"[OCR Noise Filter] Rejected invalid phone candidate: '{match}'")
-                
-        if matched_in_line:
-            clean_line = re.sub(r'^(tel|phone|mobile|cell|m|p|t|f|office|direct|support\s*no\.?)\s*[:\-\.]?\s*', '', match_line, flags=re.IGNORECASE).strip()
-            # Drop leftover labels like "ID:" after email stripping on other paths.
-            if len(clean_line) > 2 and not re.match(r'^(?:id|email|e-?mail|web|www)\s*:?\s*$', clean_line, re.IGNORECASE):
-                remaining_lines.append(clean_line)
+                translated = working.translate(_OCR_PHONE_CONFUSABLES)
+                if translated != working and _libphone_accepts(translated) and not _libphone_accepts(working):
+                    working = translated
+        scan = working
+        try:
+            import phonenumbers
+            for match_obj in phonenumbers.PhoneNumberMatcher(working, "ZZ"):
+                raw_m = match_obj.raw_string
+                if is_false_phone_match(raw_m, working):
+                    continue
+                number = match_obj.number
+                if phonenumbers.is_valid_number(number) or phonenumbers.is_possible_number(number):
+                    found.append(
+                        phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164)
+                    )
+                    scan = scan.replace(raw_m, " ", 1)
+        except Exception:
+            pass
+        for match in _PHONE_DIGIT_RUN.findall(scan):
+            candidate = _try_ocr_digit_fix(match)
+            if is_false_phone_match(candidate, scan):
+                continue
+            if is_valid_phone(candidate):
+                found.append(normalize_ocr_phone_candidate(candidate))
+                scan = scan.replace(match, " ", 1)
+        leftover = re.sub(r"\s+", " ", scan).strip()
+        leftover = re.sub(
+            r"^(tel|phone|ph|mobile|mob|cell|m|p|t|f|office|direct|support\s*no\.?)\s*[:\-\.]?\s*",
+            "",
+            leftover,
+            flags=re.IGNORECASE,
+        ).strip()
+        return found, leftover
+
+    reconstructed: List[str] = []
+    skip_next = False
+    for i, line in enumerate(lines):
+        if skip_next:
+            skip_next = False
+            continue
+        labeled = _PHONE_LABEL.sub(" ", line).strip()
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        nxt_labeled = _PHONE_LABEL.sub(" ", nxt).strip() if nxt else ""
+        if (
+            nxt
+            and _PHONE_CC_ONLY.match(labeled)
+            and len(_phone_digits(nxt_labeled)) >= 6
+            and nearby(line, nxt)
+        ):
+            combined = f"{labeled} {nxt_labeled}".strip()
+            if is_valid_phone(combined) and not is_false_phone_match(combined, combined):
+                reconstructed.append(combined)
+                skip_next = True
+                continue
+        reconstructed.append(line)
+
+    for line in reconstructed:
+        found, leftover = collect_from_line(line)
+        if found:
+            phones.extend(found)
+            if leftover and len(leftover) > 2 and not re.match(
+                r"^(?:id|email|e-?mail|web|www)\s*:?\s*$", leftover, re.IGNORECASE
+            ):
+                remaining_lines.append(leftover)
         else:
             remaining_lines.append(line)
-            
-    # Normalize and deduplicate phone numbers (suffix comparison)
-    unique_phones = []
-    seen_normalized = set()
-    duplicates_removed = 0
-    
+
+    unique_phones: List[str] = []
+    seen_normalized: set[str] = set()
     for phone in phones:
-        # Preserve leading + / 00 country-code prefix exactly as OCR produced it.
-        cleaned = phone.strip()
-        if cleaned.startswith("00"):
-            cleaned = f"+{cleaned[2:]}"
-        # Collapse internal OCR spacing but keep a single space after +CC when present.
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        plus_match = re.match(r"^(\+\d{1,3})\s*(.+)$", cleaned)
-        if plus_match:
-            local_digits = re.sub(r"\D", "", plus_match.group(2))
-            cleaned = f"{plus_match.group(1)} {local_digits}" if local_digits else plus_match.group(1)
-        norm = "".join(c for c in cleaned if c.isdigit())
+        cleaned = normalize_ocr_phone_candidate(phone) or phone.strip()
+        if not cleaned:
+            continue
+        norm = _phone_digits(cleaned)
         is_duplicate = False
         for existing in list(seen_normalized):
-            # Suffix/prefix matching (e.g. 9876543210 is suffix of +919876543210)
             if norm.endswith(existing) or existing.endswith(norm):
                 is_duplicate = True
-                duplicates_removed += 1
                 if len(norm) > len(existing):
-                    # Replace with the more complete number containing country code
                     seen_normalized.remove(existing)
                     seen_normalized.add(norm)
                     for idx, val in enumerate(unique_phones):
-                        val_norm = "".join(c for c in val if c.isdigit())
-                        if val_norm == existing:
+                        if _phone_digits(val) == existing:
                             unique_phones[idx] = cleaned
                             break
                 break
         if not is_duplicate:
             seen_normalized.add(norm)
             unique_phones.append(cleaned)
-            
-    if duplicates_removed > 0:
-        logger.info(f"[Deduplication] Removed {duplicates_removed} duplicate phone number(s).")
-        
     return unique_phones, remaining_lines
+
 
 def is_likely_name_line(line: str) -> bool:
     line = line.strip()
@@ -938,6 +1127,32 @@ def build_confidence(result: Dict[str, Any], raw_text: str) -> Dict[str, float]:
             return 96.0 if direct else 88.0
         return 72.0 if direct else 55.0
 
+    def phone_field_confidence(phones: List[str]) -> float:
+        """Phone extraction confidence, not raw OCR character confidence."""
+        best = 0.0
+        for phone in phones or []:
+            if not phone:
+                continue
+            digits = _phone_digits(phone)
+            explicit = str(phone).strip().startswith("+") or str(phone).strip().startswith("00")
+            if not is_valid_phone(phone):
+                best = max(best, 28.0)
+                continue
+            if explicit:
+                score_p = 86.0
+            else:
+                try:
+                    from utils.international_phone.parser import infer_unique_national_phone
+
+                    inferred = infer_unique_national_phone(digits)
+                    score_p = 72.0 if inferred is not None else 52.0
+                except Exception:
+                    score_p = 52.0
+            if 10 <= len(digits) <= 15:
+                score_p += 4.0
+            best = max(best, min(90.0, score_p))
+        return best
+
     first, last = result.get("firstName", ""), result.get("lastName", "")
     return {
         "fullName": score(result.get("name", "")),
@@ -945,7 +1160,7 @@ def build_confidence(result: Dict[str, Any], raw_text: str) -> Dict[str, float]:
         "lastName": score(last),
         "designation": score(result.get("designation", "")),
         "companyName": score(result.get("company", ""), direct=False),
-        "phoneNumber": max([score(p) for p in result.get("phones", [])] or [0]),
+        "phoneNumber": phone_field_confidence(result.get("phones", [])),
         "emailAddress": max([score(e) for e in result.get("emails", [])] or [0]),
         "website": max([score(w, False) for w in result.get("websites", [])] or [0]),
         "address": score(result.get("address", ""), False),

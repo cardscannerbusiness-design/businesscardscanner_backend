@@ -136,9 +136,11 @@ def login(
         # Lookup by email OR username
         cur.execute(
             """
-            SELECT u.*, r.name AS role_name
+            SELECT u.*, r.name AS role_name,
+                   COALESCE(c.company_name, '') AS company_name
             FROM users u
             JOIN roles r ON r.id = u.role_id
+            LEFT JOIN companies c ON c.id = u.company_id
             WHERE (LOWER(u.email) = %s OR LOWER(u.username) = %s)
               AND u.deleted_at IS NULL
             """,
@@ -276,6 +278,8 @@ def login(
             "phone": str(user.get("phone") or ""),
             "role": role_name,
             "company_id": company_id,
+            "company_name": str(user.get("company_name") or "").strip(),
+            "designation": str(user.get("designation") or "").strip(),
         },
     }
 

@@ -13,6 +13,8 @@ from services.admin_runtime_config import (
 )
 from services.email_service import is_test_recipient_mode, schedule_email_for_contact
 from services.entitlement_service import (
+    CMS_EMAIL_LOCKED_MESSAGE,
+    CMS_WHATSAPP_LOCKED_MESSAGE,
     OUTREACH_BLOCKED_MESSAGE,
     OutreachFrozenError,
     assert_can_send_outreach,
@@ -135,16 +137,59 @@ def body_to_outreach_contact(body: LocalContactBody) -> dict[str, Any]:
     }
 
 
+def resolve_whatsapp_outcome_status(result: dict[str, Any]) -> str:
+    """Structured send outcome for the API (not the DB delivery badge).
+
+    Values: sent | skipped | duplicate | already_sent | disabled | offline | locked | failed
+    """
+    explicit = result.get("status")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+
+    error = str(result.get("error") or "")
+    error_lower = error.lower()
+
+    if result.get("sent") is True and result.get("skipped") is True:
+        return "already_sent"
+    if result.get("sent") is True:
+        return "sent"
+    if "skipwhatsapp" in error_lower.replace(" ", "") or "skipped by request" in error_lower:
+        return "skipped"
+    if "duplicate whatsapp" in error_lower:
+        return "duplicate"
+    if error_lower.strip() == "already sent":
+        return "already_sent"
+    if "auto-send is disabled" in error_lower:
+        return "disabled"
+    if "offline mode" in error_lower:
+        return "offline"
+    if "locked" in error_lower or error == OUTREACH_BLOCKED_MESSAGE:
+        return "locked"
+    if result.get("skipped") is True:
+        return "skipped"
+    if error:
+        return "failed"
+    return "skipped"
+
+
 def whatsapp_response(result: dict[str, Any]) -> dict[str, Any]:
     attempted = result.get("attempted")
     sent = bool(result.get("sent"))
+    status = resolve_whatsapp_outcome_status(result)
     if attempted is None:
-        attempted = sent or bool(result.get("error"))
+        attempted = sent or bool(result.get("error")) or status in {
+            "failed",
+            "already_sent",
+            "duplicate",
+        }
+    # Only expose error text for real failures; intentional skips stay structured via status.
+    error = result.get("error") if status == "failed" else None
     return {
         "whatsapp_attempted": bool(attempted),
         "whatsapp_queued": sent,
         "whatsapp_sent": sent,
-        "whatsapp_error": result.get("error"),
+        "whatsapp_status": status,
+        "whatsapp_error": error,
         "whatsapp_to": result.get("recipient_phone"),
         "whatsapp_recipient_name": result.get("recipient_name"),
         "whatsapp_message": result.get("message"),
@@ -154,6 +199,43 @@ def whatsapp_response(result: dict[str, Any]) -> dict[str, Any]:
         "whatsapp_contact_chat_verified": bool(result.get("contact_chat_verified", False)),
         "whatsapp_wa_id": result.get("wa_id"),
     }
+
+
+def resolve_email_outcome_status(result: dict[str, Any]) -> str:
+    """Structured send outcome for the API (not the DB delivery badge).
+
+    Values: sent | skipped | duplicate | already_sent | disabled | offline | locked | failed
+    """
+    explicit = result.get("status")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+
+    error = str(result.get("error") or "")
+    error_lower = error.lower()
+
+    if result.get("sent") is True and result.get("skipped") is True:
+        return "already_sent"
+    if result.get("sent") is True:
+        return "sent"
+    if "skipemail" in error_lower.replace(" ", "") or (
+        "skipped by request" in error_lower and "email" in error_lower
+    ):
+        return "skipped"
+    if "duplicate email" in error_lower:
+        return "duplicate"
+    if error_lower.strip() == "already sent":
+        return "already_sent"
+    if "auto-send is disabled" in error_lower:
+        return "disabled"
+    if "offline mode" in error_lower:
+        return "offline"
+    if "locked" in error_lower or error == OUTREACH_BLOCKED_MESSAGE:
+        return "locked"
+    if result.get("skipped") is True:
+        return "skipped"
+    if error:
+        return "failed"
+    return "skipped"
 
 
 def email_response(
@@ -166,17 +248,22 @@ def email_response(
     test_override = is_test_recipient_mode()
     sent = bool(result.get("sent"))
     attempted = bool(result.get("attempted"))
-    error = result.get("error")
-    skipped = bool(result.get("skipped")) or (
-        isinstance(error, str)
-        and "skip" in error.lower()
-        and not sent
-    )
+    status = resolve_email_outcome_status(result)
+    error = result.get("error") if status == "failed" else None
+    skipped = bool(result.get("skipped")) or status in {
+        "skipped",
+        "duplicate",
+        "disabled",
+        "offline",
+        "locked",
+        "already_sent",
+    }
     return {
-        "email_attempted": attempted or skipped,
+        "email_attempted": attempted or skipped or status == "failed",
         "email_queued": sent,
         "email_sent": sent,
-        "email_skipped": skipped and not sent,
+        "email_status": status,
+        "email_skipped": skipped and not sent and status != "failed",
         "email_error": error,
         "email_to": delivered_to,
         "email_cc": result.get("cc_emails") or [],
@@ -265,12 +352,16 @@ async def _schedule_outreach_for_contact_inner(
     }
     company_id = resolve_company_id_for_user(user)
     outreach_ok = can_send_outreach(company_id, initial_save=initial_save, user=user)
+    cms_whatsapp_locked = False
+    cms_email_locked = False
     if company_id:
         locks = get_entitlement(company_id).get("cms_channel_locks") or {}
         if locks.get("whatsapp"):
             skip_whatsapp = True
+            cms_whatsapp_locked = True
         if locks.get("email"):
             skip_email = True
+            cms_email_locked = True
     if not outreach_ok:
         logger.info(
             "Outreach blocked by Freemium entitlement company_id=%s context=%s",
@@ -279,30 +370,46 @@ async def _schedule_outreach_for_contact_inner(
         )
         skip_whatsapp = True
         skip_email = True
+    if not outreach_ok:
+        wa_skip_status = "locked"
+        wa_skip_error = OUTREACH_BLOCKED_MESSAGE
+    elif cms_whatsapp_locked:
+        wa_skip_status = "locked"
+        wa_skip_error = CMS_WHATSAPP_LOCKED_MESSAGE
+    elif skip_whatsapp:
+        wa_skip_status = "skipped"
+        wa_skip_error = "Skipped by request (skipWhatsApp=true)."
+    else:
+        wa_skip_status = None
+        wa_skip_error = None
+    if not outreach_ok:
+        email_skip_status = "locked"
+        email_skip_error = OUTREACH_BLOCKED_MESSAGE
+    elif cms_email_locked:
+        email_skip_status = "locked"
+        email_skip_error = CMS_EMAIL_LOCKED_MESSAGE
+    elif skip_email:
+        email_skip_status = "skipped"
+        email_skip_error = (
+            "Skipped by request (skipEmail=true). "
+            "Enable Email notifications in Settings, then save again."
+        )
+    else:
+        email_skip_status = None
+        email_skip_error = None
     whatsapp_result: dict[str, Any] = {
         "attempted": False,
         "sent": False,
         "skipped": bool(skip_whatsapp),
-        "error": (
-            OUTREACH_BLOCKED_MESSAGE
-            if not outreach_ok
-            else ("Skipped by request (skipWhatsApp=true)." if skip_whatsapp else None)
-        ),
+        "status": wa_skip_status,
+        "error": wa_skip_error,
     }
     email_result: dict[str, Any] = {
         "attempted": False,
         "sent": False,
         "skipped": bool(skip_email),
-        "error": (
-            OUTREACH_BLOCKED_MESSAGE
-            if not outreach_ok
-            else (
-                "Skipped by request (skipEmail=true). "
-                "Enable Email notifications in Settings, then save again."
-                if skip_email
-                else None
-            )
-        ),
+        "status": email_skip_status,
+        "error": email_skip_error,
     }
 
     if skip_email:
@@ -322,6 +429,7 @@ async def _schedule_outreach_for_contact_inner(
                     whatsapp_contact,
                     **outreach_kwargs,
                     log_context=log_context,
+                    company_id=company_id,
                 ),
             )
         )
@@ -411,10 +519,14 @@ async def run_post_save_outreach(
     """Run thank-you WhatsApp/email after a contact is saved to PostgreSQL."""
     skipped_whatsapp: dict[str, Any] = {
         "sent": False,
+        "skipped": True,
+        "status": "skipped",
         "error": "Skipped by request (skipWhatsApp=true).",
     }
     skipped_email: dict[str, Any] = {
         "sent": False,
+        "skipped": True,
+        "status": "skipped",
         "error": "Skipped by request (skipEmail=true).",
     }
 

@@ -16,6 +16,35 @@ _RECENT_SENDS: dict[str, float] = {}
 _SEND_DEDUPE_SECONDS = 120
 
 
+def _whatsapp_dedupe_scope(company_id: str | None) -> str:
+    """Tenant scope for the 120s phone dedupe map.
+
+    Prefer company_id so two companies can message the same number independently.
+    When company_id is missing (Super Admin / incomplete user), fall back to the
+    active Meta sender phone_number_id so unrelated senders do not share one
+    global "None:phone" bucket.
+    """
+    cid = str(company_id or "").strip()
+    if cid:
+        return f"company:{cid}"
+    try:
+        _token, phone_id, _version = _active_whatsapp_credentials()
+    except Exception:
+        phone_id = ""
+    pid = str(phone_id or "").strip()
+    if pid:
+        return f"sender:{pid}"
+    return "sender:unconfigured"
+
+
+def _whatsapp_dedupe_key(phone: str, company_id: str | None) -> str | None:
+    try:
+        normalized = normalize_whatsapp_phone(phone)
+    except ValueError:
+        return None
+    return f"{_whatsapp_dedupe_scope(company_id)}:{normalized}"
+
+
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 _CARD_RECEIVED_TEMPLATE_PATH = _BACKEND_ROOT / "scripts" / "whatsapp_card_received_template.json"
 
@@ -581,6 +610,8 @@ def _base_whatsapp_send_result() -> dict[str, Any]:
         "attempted": False,
         "sent": False,
         "queued": False,
+        "skipped": False,
+        "status": None,
         "error": None,
         "message_id": None,
         "recipient_phone": None,
@@ -900,11 +931,11 @@ def build_scan_thank_you_text(
         footer = apply_numbered_tokens(str(tpl.get("whatsapp_footer") or "").strip(), values)
         return "\n\n".join(part for part in (header, body, footer) if part)
 
-    first_name = (contact_name or "there").strip().split()[0]
+    greeting = (contact_name or "there").strip() or "there"
     company_bit = f" from {company}" if company else ""
     title_bit = f" ({designation})" if designation else ""
     return (
-        f"Hi {first_name}, thank you for sharing your business card{company_bit}{title_bit}. "
+        f"Hi {greeting}, thank you for sharing your business card{company_bit}{title_bit}. "
         "We have saved your details in NameCardScan."
     )
 
@@ -1451,6 +1482,15 @@ def build_card_received_template_components(
         else:
             field_by_position[pos] = defaults.get(pos, "N/A")
 
+    # card_final_ula's approved body is "Hi {{1}} … meeting you at {{2}}".
+    # {{1}} is the contact's full name and {{2}} is the event/place.
+    # A saved generic token map ({{2}}=phoneNumber) must not override those slots.
+    if is_video_template:
+        if 1 in positions:
+            field_by_position[1] = _template_param(contact_name, "there")
+        if 2 in positions:
+            field_by_position[2] = _template_param(event_name, "the exhibition")
+
     parameters = [
         {"type": "text", "text": field_by_position.get(pos, "N/A")}
         for pos in positions
@@ -1715,19 +1755,22 @@ def extract_primary_phone(contact: dict[str, Any]) -> str:
     return phone
 
 
-def _should_send_to_phone(phone: str) -> bool:
-    try:
-        normalized = normalize_whatsapp_phone(phone)
-    except ValueError:
+def _should_send_to_phone(phone: str, company_id: str | None = None) -> bool:
+    key = _whatsapp_dedupe_key(phone, company_id)
+    if not key:
         return False
 
     now = time.time()
-    last_sent = _RECENT_SENDS.get(normalized, 0)
+    last_sent = _RECENT_SENDS.get(key, 0)
     if now - last_sent < _SEND_DEDUPE_SECONDS:
-        logger.info("Skipping duplicate WhatsApp send to %s within dedupe window.", normalized)
+        logger.info(
+            "Skipping duplicate WhatsApp send to %s within dedupe window (scope=%s).",
+            key.rsplit(":", 1)[-1],
+            key.rsplit(":", 1)[0] if ":" in key else "?",
+        )
         return False
 
-    _RECENT_SENDS[normalized] = now
+    _RECENT_SENDS[key] = now
     return True
 
 
@@ -1770,26 +1813,32 @@ async def schedule_whatsapp_for_contact(
     contact_id: str | None = None,
     skip_if_already_sent: bool = True,
     log_context: str = "schedule",
+    company_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Send a dummy WhatsApp template to the contact's primary phone.
 
-    Returns a result dict with attempted/sent/error/message_id fields.
+    Returns a result dict with attempted/sent/error/message_id/status fields.
     """
     skipped = _base_whatsapp_send_result()
 
     if not _auto_send_enabled():
         skipped["error"] = "WhatsApp auto-send is disabled."
+        skipped["status"] = "disabled"
+        skipped["skipped"] = True
         _log_whatsapp_line("SKIP", "?", context=log_context, error=skipped["error"])
         return skipped
 
     if not on_zoho_sync and not online_mode:
         skipped["error"] = "Offline mode — WhatsApp will send when you sync to Zoho."
+        skipped["status"] = "offline"
+        skipped["skipped"] = True
         _log_whatsapp_line("SKIP", "?", context=log_context, error=skipped["error"])
         return skipped
 
     if not is_whatsapp_configured():
         skipped["error"] = "WhatsApp is not configured in .env (or CMS Admin WhatsApp env)."
+        skipped["status"] = "failed"
         _log_whatsapp_line("SKIP", "?", context=log_context, error=skipped["error"])
         return skipped
 
@@ -1805,6 +1854,7 @@ async def schedule_whatsapp_for_contact(
             skipped["attempted"] = True
             skipped["sent"] = True
             skipped["skipped"] = True
+            skipped["status"] = "already_sent"
             skipped["error"] = "already sent"
             skipped["recipient_phone"] = phone or extract_primary_phone(existing) or None
             _log_whatsapp_line("SKIP", phone or "?", context=log_context, error="already sent")
@@ -1812,6 +1862,7 @@ async def schedule_whatsapp_for_contact(
 
     if not phone:
         skipped["error"] = "No primary phone number found on the contact."
+        skipped["status"] = "failed"
         _log_whatsapp_line("SKIP", "?", context=log_context, error=skipped["error"])
         return skipped
 
@@ -1827,11 +1878,14 @@ async def schedule_whatsapp_for_contact(
 
     if not recipient_check["can_send"]:
         skipped["error"] = recipient_check["error"] or "Phone cannot receive WhatsApp."
+        skipped["status"] = "failed"
         _log_whatsapp_line("SKIP", phone, context=log_context, error=skipped["error"])
         return skipped
 
-    if not _should_send_to_phone(phone):
+    if not _should_send_to_phone(phone, company_id=company_id):
         skipped["error"] = "Duplicate WhatsApp send skipped for this number."
+        skipped["status"] = "duplicate"
+        skipped["skipped"] = True
         _log_whatsapp_line("SKIP", phone, context=log_context, error=skipped["error"])
         return skipped
 
@@ -1851,6 +1905,8 @@ async def schedule_whatsapp_for_contact(
             "attempted": True,
             "sent": accepted,
             "queued": False,
+            "skipped": False,
+            "status": "sent" if accepted else "failed",
             "error": None if accepted else "Meta accepted send but recipient wa_id missing.",
             "message_id": message_id,
             "recipient_phone": delivery["phone"],
@@ -1885,6 +1941,8 @@ async def schedule_whatsapp_for_contact(
             "attempted": True,
             "sent": False,
             "queued": False,
+            "skipped": False,
+            "status": "failed",
             "error": error_message,
             "message_id": None,
             "recipient_phone": phone,

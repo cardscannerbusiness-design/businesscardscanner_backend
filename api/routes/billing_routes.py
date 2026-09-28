@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/billing", tags=["Billing"])
 
+# Temporary lock. Set PAYMENTS_ENABLED=true to restore checkout without code changes.
+_PAYMENTS_ON = {"1", "true", "yes", "on"}
+
+
+def payments_enabled() -> bool:
+    return os.getenv("PAYMENTS_ENABLED", "").strip().lower() in _PAYMENTS_ON
+
 
 class PrepaidCheckoutRequest(BaseModel):
     package_id: str = Field(..., min_length=3, max_length=64)
@@ -62,6 +69,14 @@ def prepaid_checkout(
     body: PrepaidCheckoutRequest,
     user: dict = Depends(require_role(ROLE_ADMIN)),
 ):
+    if not payments_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "PAYMENTS_DISABLED",
+                "message": "Online payments are currently unavailable.",
+            },
+        )
     require_feature(user, "subscription")
     try:
         return start_prepaid_checkout(user, body.package_id)

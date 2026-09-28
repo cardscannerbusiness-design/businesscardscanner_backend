@@ -116,9 +116,11 @@ async def _await_online_outreach_into_response(
         )
         response["whatsapp_sent"] = False
         response["whatsapp_attempted"] = not body.skipWhatsApp
+        response["whatsapp_status"] = "failed"
         response["whatsapp_error"] = str(exc)
         response["email_sent"] = False
         response["email_attempted"] = not body.skipEmail
+        response["email_status"] = "failed"
         response["email_error"] = str(exc)
 
     # Refresh so nested contact carries emailDeliveryStatus / whatsappDeliveryStatus.

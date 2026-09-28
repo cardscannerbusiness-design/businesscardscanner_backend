@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+    <title>New Admin Registration - NameCardScan</title>
+
+    <style>
+        /* ================================
+           RESET
+        ================================= */
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #f4f7fa;
+            font-family: Arial, Helvetica, sans-serif;
+            color: #172033;
+        }
+
+        table {
+            border-spacing: 0;
+            border-collapse: collapse;
+        }
+
+        img {
+            border: 0;
+            display: block;
+            max-width: 100%;
+        }
+
+        a {
+            text-decoration: none;
+        }
+
+        /* ================================
+           RESPONSIVE
+        ================================= */
+        @media only screen and (max-width: 600px) {
+
+            .email-wrapper {
+                width: 100% !important;
+            }
+
+            .container {
+                width: 94% !important;
+            }
+
+            .main-content {
+                padding: 28px 20px !important;
+            }
+
+            .hero-title {
+                font-size: 28px !important;
+                line-height: 34px !important;
+            }
+
+            .workflow-item {
+                display: block !important;
+                width: 100% !important;
+                margin-bottom: 10px !important;
+            }
+
+            .workflow-arrow {
+                display: none !important;
+            }
+
+            .details-label {
+                width: 42% !important;
+            }
+
+            .details-value {
+                width: 58% !important;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+<table width="100%" cellpadding="0" cellspacing="0" border="0"
+       style="background-color:#f4f7fa; padding:30px 0;">
+
+    <tr>
+        <td align="center">
+
+            <!-- MAIN EMAIL -->
+            <table class="email-wrapper"
+                   width="620"
+                   cellpadding="0"
+                   cellspacing="0"
+                   border="0"
+                   style="
+                       width:620px;
+                       max-width:620px;
+                       background:#ffffff;
+                       border-radius:16px;
+                       overflow:hidden;
+                       box-shadow:0 8px 30px rgba(15, 35, 55, 0.08);
+                   ">
+
+                <!-- =====================================
+                     HEADER
+                ====================================== -->
+
+                <tr>
+                    <td style="
+                        background:#081521;
+                        padding:24px 32px;
+                    ">
+
+                        <table width="100%" cellpadding="0" cellspacing="0">
+                            <tr>
+
+                                <!-- LOGO: same mark as the Sign-in page (AppLogo /logo-mark.png, 40px) -->
+                                <td align="left">
+
+                                    <table cellpadding="0" cellspacing="0" border="0">
+                                        <tr>
+                                            <td valign="middle" style="padding-right:12px;">
+                                                <img
+                                                    src="https://api.namecardscan.com/assets/logo-mark.png"
+                                                    alt="NameCardScan"
+                                                    width="40"
+                                                    height="40"
+                                                    style="
+                                                        width:40px;
+                                                        height:40px;
+                                                        display:block;
+                                                        border:0;
+                                                    "
+                                                >
+                                            </td>
+                                            <td valign="middle"
+                                                style="
+                                                    font-family:Arial, Helvetica, sans-serif;
+                                                    font-size:20px;
+                                                    font-weight:bold;
+                                                    color:#f1f5f9;
+                                                    line-height:24px;
+                                                ">
+                                                Name<span style="color:#079bc3;">Card</span>Scan
+                                            </td>
+                                        </tr>
+                                    </table>
+
+                                </td>
+
+                            </tr>
+
+                            <tr>
+                                <td style="
+                                    padding-top:9px;
+                                    font-size:13px;
+                                    color:#9fb2c4;
+                                    letter-spacing:0.3px;
+                                ">
+                                    Instant Capture, Sync &amp; Connect
+                                </td>
+                            </tr>
+                        </table>
+
+                    </td>
+                </tr>
+
+
+                <!-- =====================================
+                     HERO
+                ====================================== -->
+
+                <tr>
+                    <td class="main-content"
+                        style="
+                            padding:42px 42px 30px 42px;
+                        ">
+
+                        <!-- Small label -->
+                        <table cellpadding="0" cellspacing="0">
+                            <tr>
+                                <td style="
+                                    background:#e9f7fc;
+                                    color:#0794bd;
+                                    padding:7px 12px;
+                                    border-radius:20px;
+                                    font-size:12px;
+                                    font-weight:bold;
+                                    letter-spacing:0.5px;
+                                ">
+                                    ADMIN NOTIFICATION
+                                </td>
+                            </tr>
+                        </table>
+
+                        <!-- Heading -->
+
+                        <div class="hero-title"
+                             style="
+                                 font-size:34px;
+                                 line-height:40px;
+                                 font-weight:700;
+                                 color:#111d2b;
+                                 margin-top:18px;
+                             ">
+
+                            New Admin<br>
+                            <span style="color:#079bc3;">
+                                Registration
+                            </span>
+
+                        </div>
+
+                        <!-- Description -->
+
+                        <div style="
+                            margin-top:16px;
+                            font-size:15px;
+                            line-height:24px;
+                            color:#64748b;
+                        ">
+
+                            A new administrator has successfully joined
+                            <strong style="color:#172033;">
+                                NameCardScan
+                            </strong>.
+                            Their account is ready and they can sign in immediately.
+
+                        </div>
+
+                    </td>
+                </tr>
+
+
+                <!-- =====================================
+                     ADMIN DETAILS
+                ====================================== -->
+
+                <tr>
+                    <td class="main-content"
+                        style="
+                            padding:0 42px 30px 42px;
+                        ">
+
+                        <table width="100%"
+                               cellpadding="0"
+                               cellspacing="0"
+                               border="0"
+                               style="
+                                   border:1px solid #e4eaf0;
+                                   border-radius:12px;
+                                   overflow:hidden;
+                               ">
+
+                            <!-- Card heading -->
+
+                            <tr>
+                                <td colspan="2"
+                                    style="
+                                        background:#f8fafc;
+                                        padding:16px 20px;
+                                        border-bottom:1px solid #e4eaf0;
+                                        font-size:14px;
+                                        font-weight:bold;
+                                        color:#1e293b;
+                                    ">
+
+                                    Administrator Details
+
+                                </td>
+                            </tr>
+
+
+                            <!-- Admin Name -->
+
+                            <tr>
+
+                                <td class="details-label"
+                                    width="40%"
+                                    style="
+                                        padding:13px 20px;
+                                        font-size:13px;
+                                        color:#718096;
+                                        border-bottom:1px solid #edf1f5;
+                                    ">
+
+                                    Admin Name
+
+                                </td>
+
+                                <td class="details-value"
+                                    width="60%"
+                                    style="
+                                        padding:13px 20px;
+                                        font-size:14px;
+                                        font-weight:600;
+                                        color:#172033;
+                                        border-bottom:1px solid #edf1f5;
+                                    ">
+
+                                    {{admin_name}}
+
+                                </td>
+
+                            </tr>
+
+
+                            <!-- Company -->
+
+                            <tr>
+
+                                <td style="
+                                    padding:13px 20px;
+                                    font-size:13px;
+                                    color:#718096;
+                                    border-bottom:1px solid #edf1f5;
+                                ">
+
+                                    Company Name
+
+                                </td>
+
+                                <td style="
+                                    padding:13px 20px;
+                                    font-size:14px;
+                                    font-weight:600;
+                                    color:#172033;
+                                    border-bottom:1px solid #edf1f5;
+                                ">
+
+                                    {{company_name}}
+
+                                </td>
+
+                            </tr>
+
+
+                            <!-- Designation -->
+
+                            <tr>
+
+                                <td style="
+                                    padding:13px 20px;
+                                    font-size:13px;
+                                    color:#718096;
+                                    border-bottom:1px solid #edf1f5;
+                                ">
+
+                                    Designation
+
+                                </td>
+
+                                <td style="
+                                    padding:13px 20px;
+                                    font-size:14px;
+                                    font-weight:600;
+                                    color:#172033;
+                                    border-bottom:1px solid #edf1f5;
+                                ">
+
+                                    {{designation}}
+
+                                </td>
+
+                            </tr>
+
+
+                            <!-- Email -->
+
+                            <tr>
+
+                                <td style="
+                                    padding:13px 20px;
+                                    font-size:13px;
+                                    color:#718096;
+                                    border-bottom:1px solid #edf1f5;
+                                ">
+
+                                    Email
+
+                                </td>
+
+                                <td style="
+                                    padding:13px 20px;
+                                    font-size:14px;
+                                    font-weight:600;
+                                    border-bottom:1px solid #edf1f5;
+                                ">
+
+                                    <a href="mailto:{{email}}"
+                                       style="color:#087fd1;">
+                                        {{email}}
+                                    </a>
+
+                                </td>
+
+                            </tr>
+
+
+                            <!-- Phone -->
+
+                            <tr>
+
+                                <td style="
+                                    padding:13px 20px;
+                                    font-size:13px;
+                                    color:#718096;
+                                    border-bottom:1px solid #edf1f5;
+                                ">
+
+                                    Phone
+
+                                </td>
+
+                                <td style="
+                                    padding:13px 20px;
+                                    font-size:14px;
+                                    font-weight:600;
+                                    border-bottom:1px solid #edf1f5;
+                                ">
+
+                                    <a href="tel:{{phone}}"
+                                       style="color:#087fd1;">
+                                        {{phone}}
+                                    </a>
+
+                                </td>
+
+                            </tr>
+
+
+                            <!-- Signup -->
+
+                            <tr>
+
+                                <td style="
+                                    padding:13px 20px;
+                                    font-size:13px;
+                                    color:#718096;
+                                ">
+
+                                    Registered On
+
+                                </td>
+
+                                <td style="
+                                    padding:13px 20px;
+                                    font-size:14px;
+                                    font-weight:600;
+                                    color:#172033;
+                                ">
+
+                                    {{signup_datetime}}
+
+                                </td>
+
+                            </tr>
+
+                        </table>
+
+                    </td>
+                </tr>
+
+
+                <!-- =====================================
+                     WORKFLOW SECTION
+                ====================================== -->
+
+                <tr>
+                    <td style="
+                        padding:10px 42px 36px 42px;
+                    ">
+
+                        <table width="100%"
+                               cellpadding="0"
+                               cellspacing="0"
+                               border="0"
+                               style="
+                                   background:#081521;
+                                   border-radius:14px;
+                               ">
+
+                            <tr>
+                                <td align="center"
+                                    style="
+                                        padding:24px 20px 10px 20px;
+                                        font-size:12px;
+                                        font-weight:bold;
+                                        color:#7ed7ef;
+                                        letter-spacing:1.2px;
+                                    ">
+
+                                    THE NAMECARDSCAN WORKFLOW
+
+                                </td>
+                            </tr>
+
+                            <tr>
+                                <td align="center"
+                                    style="
+                                        padding:4px 15px 24px 15px;
+                                        font-size:18px;
+                                        font-weight:bold;
+                                        color:#ffffff;
+                                        letter-spacing:0.5px;
+                                    ">
+
+                                    SCAN
+                                    <span style="color:#4baac4;">→</span>
+
+                                    CAPTURE
+                                    <span style="color:#4baac4;">→</span>
+
+                                    SYNC
+                                    <span style="color:#4baac4;">→</span>
+
+                                    CONNECT
+                                    <span style="color:#4baac4;">→</span>
+
+                                    CONVERT
+
+                                </td>
+                            </tr>
+
+
+                            <!-- Workflow descriptions -->
+
+                            <tr>
+
+                                <td style="padding:0 15px 25px 15px;">
+
+                                    <table width="100%"
+                                           cellpadding="0"
+                                           cellspacing="0">
+
+                                        <tr>
+
+                                            <!-- Scan -->
+
+                                            <td class="workflow-item"
+                                                width="20%"
+                                                align="center"
+                                                valign="top">
+
+                                                <div style="
+                                                    font-size:23px;
+                                                    margin-bottom:7px;
+                                                ">
+                                                    📷
+                                                </div>
+
+                                                <div style="
+                                                    color:#ffffff;
+                                                    font-size:12px;
+                                                    font-weight:bold;
+                                                ">
+                                                    Scan
+                                                </div>
+
+                                                <div style="
+                                                    color:#8fa4b6;
+                                                    font-size:10px;
+                                                    line-height:14px;
+                                                    margin-top:4px;
+                                                ">
+                                                    Capture cards
+                                                </div>
+
+                                            </td>
+
+
+                                            <!-- Capture -->
+
+                                            <td class="workflow-item"
+                                                width="20%"
+                                                align="center"
+                                                valign="top">
+
+                                                <div style="
+                                                    font-size:23px;
+                                                    margin-bottom:7px;
+                                                ">
+                                                    ⚡
+                                                </div>
+
+                                                <div style="
+                                                    color:#ffffff;
+                                                    font-size:12px;
+                                                    font-weight:bold;
+                                                ">
+                                                    Capture
+                                                </div>
+
+                                                <div style="
+                                                    color:#8fa4b6;
+                                                    font-size:10px;
+                                                    line-height:14px;
+                                                    margin-top:4px;
+                                                ">
+                                                    Extract details
+                                                </div>
+
+                                            </td>
+
+
+                                            <!-- Sync -->
+
+                                            <td class="workflow-item"
+                                                width="20%"
+                                                align="center"
+                                                valign="top">
+
+                                                <div style="
+                                                    font-size:23px;
+                                                    margin-bottom:7px;
+                                                ">
+                                                    🔄
+                                                </div>
+
+                                                <div style="
+                                                    color:#ffffff;
+                                                    font-size:12px;
+                                                    font-weight:bold;
+                                                ">
+                                                    Sync
+                                                </div>
+
+                                                <div style="
+                                                    color:#8fa4b6;
+                                                    font-size:10px;
+                                                    line-height:14px;
+                                                    margin-top:4px;
+                                                ">
+                                                    Organize contacts
+                                                </div>
+
+                                            </td>
+
+
+                                            <!-- Connect -->
+
+                                            <td class="workflow-item"
+                                                width="20%"
+                                                align="center"
+                                                valign="top">
+
+                                                <div style="
+                                                    font-size:23px;
+                                                    margin-bottom:7px;
+                                                ">
+                                                    🔗
+                                                </div>
+
+                                                <div style="
+                                                    color:#ffffff;
+                                                    font-size:12px;
+                                                    font-weight:bold;
+                                                ">
+                                                    Connect
+                                                </div>
+
+                                                <div style="
+                                                    color:#8fa4b6;
+                                                    font-size:10px;
+                                                    line-height:14px;
+                                                    margin-top:4px;
+                                                ">
+                                                    Build relationships
+                                                </div>
+
+                                            </td>
+
+
+                                            <!-- Convert -->
+
+                                            <td class="workflow-item"
+                                                width="20%"
+                                                align="center"
+                                                valign="top">
+
+                                                <div style="
+                                                    font-size:23px;
+                                                    margin-bottom:7px;
+                                                ">
+                                                    🚀
+                                                </div>
+
+                                                <div style="
+                                                    color:#ffffff;
+                                                    font-size:12px;
+                                                    font-weight:bold;
+                                                ">
+                                                    Convert
+                                                </div>
+
+                                                <div style="
+                                                    color:#8fa4b6;
+                                                    font-size:10px;
+                                                    line-height:14px;
+                                                    margin-top:4px;
+                                                ">
+                                                    Create opportunities
+                                                </div>
+
+                                            </td>
+
+                                        </tr>
+
+                                    </table>
+
+                                </td>
+                            </tr>
+
+                        </table>
+
+                    </td>
+                </tr>
+
+
+                <!-- =====================================
+                     FOOTER
+                ====================================== -->
+
+                <tr>
+
+                    <td align="center"
+                        style="
+                            background:#f8fafc;
+                            border-top:1px solid #e8edf2;
+                            padding:24px 25px;
+                        ">
+
+                        <div style="
+                            font-size:15px;
+                            font-weight:bold;
+                            color:#172033;
+                        ">
+
+                            Name<span style="color:#f6a800;">Card</span>Scan
+
+                        </div>
+
+                        <div style="
+                            margin-top:5px;
+                            font-size:11px;
+                            color:#718096;
+                        ">
+
+                            Instant Capture, Sync &amp; Connect
+
+                        </div>
+
+                        <div style="
+                            margin-top:16px;
+                            font-size:10px;
+                            line-height:16px;
+                            color:#9aa6b2;
+                        ">
+
+                            This is an automated notification from NameCardScan.
+                            Please do not reply to this email.
+
+                        </div>
+
+                    </td>
+
+                </tr>
+
+            </table>
+
+            <!-- END EMAIL -->
+
+        </td>
+    </tr>
+
+</table>
+
+</body>
+</html>

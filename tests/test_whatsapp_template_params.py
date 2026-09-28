@@ -409,6 +409,76 @@ class SuperAdminTemplateSelectionTests(unittest.TestCase):
         self.assertEqual(texts[0], "Sugitha")
         self.assertEqual(texts[1], "ATM 2026")
 
+    def _card_final_ula_components(self, contact: dict, token_map: dict) -> list:
+        meta = {
+            "name": "card_final_ula",
+            "language": "en",
+            "components": [
+                {"type": "HEADER", "format": "VIDEO"},
+                {
+                    "type": "BODY",
+                    "text": "Hi {{1}}, Dhana here. It was great meeting you at {{2}}.",
+                },
+            ],
+        }
+        with patch(
+            "services.admin_runtime_config.runtime_templates",
+            return_value={"whatsapp_header_format": "NONE", "token_map": token_map},
+        ), patch(
+            "services.admin_runtime_config.runtime_email",
+            return_value={},
+        ), patch(
+            "services.whatsapp_service._build_header_component",
+            return_value={
+                "type": "header",
+                "parameters": [{"type": "video", "video": {"link": "https://example.com/v.mp4"}}],
+            },
+        ):
+            return build_card_received_template_components(
+                contact,
+                template_name="card_final_ula",
+                meta_template=meta,
+            )
+
+    def test_card_final_ula_slot_two_is_event_not_phone(self) -> None:
+        """Generic token_map {{2}}=phoneNumber must not fill the place slot."""
+        components = self._card_final_ula_components(
+            {
+                "fullName": "Anand Singh",
+                "firstName": "Anand",
+                "lastName": "Singh",
+                "phone": "917010435975",
+                "phoneNumber": "917010435975",
+                "eventName": "India Expo 2026",
+            },
+            {
+                "1": "fullName",
+                "2": "phoneNumber",
+                "3": "emailAddress",
+                "4": "website",
+                "5": "companyName",
+            },
+        )
+        body = next(c for c in components if c.get("type") == "body")
+        texts = [p["text"] for p in body["parameters"]]
+        self.assertEqual(texts[0], "Anand Singh")
+        self.assertEqual(texts[1], "India Expo 2026")
+        self.assertNotEqual(texts[1], "917010435975")
+
+    def test_card_final_ula_slot_two_falls_back_to_exhibition(self) -> None:
+        with patch.dict(os.environ, {"WHATSAPP_TEMPLATE_EVENT_NAME": ""}, clear=False):
+            components = self._card_final_ula_components(
+                {
+                    "fullName": "Anand Singh",
+                    "phone": "917010435975",
+                },
+                {"1": "fullName", "2": "phoneNumber"},
+            )
+        body = next(c for c in components if c.get("type") == "body")
+        texts = [p["text"] for p in body["parameters"]]
+        self.assertEqual(texts[0], "Anand Singh")
+        self.assertEqual(texts[1], "the exhibition")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ import logging
 import os
 import smtplib
 from email.message import EmailMessage
+from pathlib import Path
 
 from config.urls import get_frontend_base_url
 
@@ -102,31 +103,113 @@ def resolve_auth_smtp_lane(sender_role: str | None = None, smtp_lane: str | None
     return "external"
 
 
-def _send_with_cfg(to: str, subject: str, html_body: str, cfg: dict[str, str]) -> dict:
+_ADMIN_SIGNUP_TEMPLATE = (
+    Path(__file__).resolve().parent.parent / "templates" / "new-admin-registration.html"
+)
+_DEFAULT_ADMIN_SIGNUP_NOTIFICATION_EMAILS = (
+    "onboarding@namecardscan.com,"
+    "sugitha.ulavi@gmail.com,"
+    "nanduja.ulacab@gmail.com,"
+    "dhana@ulavitech.com,"
+    "shwethars.ulavi@gmail.com"
+)
+
+
+def _unique_emails(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        email = str(value or "").strip()
+        if not email:
+            continue
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(email)
+    return unique
+
+
+def parse_notification_emails(raw: str | None) -> list[str]:
+    """Split a comma-separated address list and drop blanks."""
+    return _unique_emails(str(raw or "").split(","))
+
+
+def admin_signup_notification_recipients() -> list[str]:
+    """Recipients for the Admin signup notice.
+
+    ADMIN_SIGNUP_NOTIFICATION_EMAILS is the source of truth. When that variable
+    is unset, the five onboarding addresses are used. An explicit empty value
+    falls back to BUSINESS_EMAIL so older deployments still notify someone.
+    """
+    if "ADMIN_SIGNUP_NOTIFICATION_EMAILS" in os.environ:
+        configured = parse_notification_emails(os.getenv("ADMIN_SIGNUP_NOTIFICATION_EMAILS"))
+        if configured:
+            return configured
+        return parse_notification_emails(os.getenv("BUSINESS_EMAIL"))
+    return parse_notification_emails(_DEFAULT_ADMIN_SIGNUP_NOTIFICATION_EMAILS)
+
+
+def _send_with_cfg(
+    to: str,
+    subject: str,
+    html_body: str,
+    cfg: dict[str, str],
+    bcc: list[str] | None = None,
+) -> dict:
     company = _normalize_env(os.getenv("BUSINESS_COMPANY_NAME")) or "NameCardScan"
     from_header = f"{company} <{cfg['from']}>" if cfg["from"] else company
+    hidden = _unique_emails(bcc or [])
 
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = from_header
-    msg["To"] = to
+    # BCC recipients must not appear in To. A visible To is still required;
+    # use the sender address so the staff list stays off the message.
+    msg["To"] = cfg["from"] if hidden else to
+    if hidden:
+        msg["Bcc"] = ", ".join(hidden)
     if cfg.get("reply_to") and cfg["reply_to"].lower() != cfg["from"].lower():
         msg["Reply-To"] = cfg["reply_to"]
-    msg.set_content(html_body, subtype="html")
+    html_to_send = html_body
+    related: list[tuple[str, bytes, str]] = []
+    if "logo-mark.png" in html_body:
+        from services.email_service import _prepare_inline_asset_images
 
+        html_to_send, related = _prepare_inline_asset_images(html_body)
+    if related:
+        msg.set_content("New Admin Registration - NameCardScan")
+        msg.add_alternative(html_to_send, subtype="html")
+        html_part = msg.get_body(preferencelist=("html",))
+        if html_part is not None:
+            for cid, data, subtype in related:
+                safe_name = cid if "." in cid else f"{cid}.{subtype}"
+                cid_header = cid if cid.startswith("<") and cid.endswith(">") else f"<{cid}>"
+                html_part.add_related(
+                    data,
+                    maintype="image",
+                    subtype=subtype,
+                    cid=cid_header,
+                    filename=safe_name,
+                    disposition="inline",
+                )
+    else:
+        msg.set_content(html_body, subtype="html")
+
+    envelope = hidden or [to]
     with smtplib.SMTP(cfg["host"], int(cfg["port"]), timeout=30) as server:
         server.ehlo()
         server.starttls()
         server.ehlo()
         server.login(cfg["user"], cfg["password"])
-        server.send_message(msg, from_addr=cfg["from"], to_addrs=[to])
+        server.send_message(msg, from_addr=cfg["from"], to_addrs=envelope)
     logger.info(
         "Auth email sent via SMTP (%s) to %s (%s)",
         cfg.get("label") or "smtp",
-        to,
+        ", ".join(envelope),
         subject,
     )
-    return {"sent": True, "smtp_profile": cfg.get("label") or "external"}
+    return {"sent": True, "smtp_profile": cfg.get("label") or "external", "recipients": envelope}
 
 
 def _send_email(
@@ -136,6 +219,7 @@ def _send_email(
     *,
     sender_role: str | None = None,
     smtp_lane: str | None = None,
+    bcc: list[str] | None = None,
 ) -> dict:
     lane = resolve_auth_smtp_lane(sender_role=sender_role, smtp_lane=smtp_lane)
     configs = _smtp_lane_configs(lane)
@@ -154,7 +238,7 @@ def _send_email(
     last_error: str | None = None
     for index, cfg in enumerate(configs):
         try:
-            result = _send_with_cfg(to, subject, html_body, cfg)
+            result = _send_with_cfg(to, subject, html_body, cfg, bcc=bcc)
             result["smtp_lane"] = lane
             return result
         except smtplib.SMTPAuthenticationError as exc:
@@ -202,6 +286,70 @@ def send_welcome_email(to_email: str, full_name: str) -> dict:
     </div>
     """
     return _send_email(to_email, subject, html)
+
+
+def render_admin_signup_notification_html(
+    *,
+    admin_name: str,
+    company_name: str,
+    designation: str,
+    admin_email: str,
+    phone: str,
+    signup_at: str,
+) -> str:
+    """Fill the New Admin Registration template. Values are escaped; no password."""
+    template = _ADMIN_SIGNUP_TEMPLATE.read_text(encoding="utf-8")
+    values = {
+        "admin_name": admin_name,
+        "company_name": company_name,
+        "designation": designation,
+        "email": admin_email,
+        "phone": phone,
+        "signup_datetime": signup_at,
+    }
+    rendered = template
+    for key, value in values.items():
+        safe = html.escape(str(value or "").strip() or "—")
+        rendered = rendered.replace("{{" + key + "}}", safe)
+    return rendered
+
+
+def send_admin_signup_notification_email(
+    *,
+    admin_name: str,
+    company_name: str,
+    designation: str,
+    admin_email: str,
+    phone: str,
+    signup_at: str,
+    recipients: list[str] | None = None,
+    to_email: str | None = None,
+) -> dict:
+    """Notify staff that a public Admin signup completed (account is active)."""
+    targets = _unique_emails(list(recipients or []))
+    if not targets and to_email:
+        targets = parse_notification_emails(to_email)
+    if not targets:
+        logger.warning("Admin signup notification skipped: no recipients configured.")
+        return {"sent": False, "reason": "No notification recipients configured."}
+
+    try:
+        body = render_admin_signup_notification_html(
+            admin_name=admin_name,
+            company_name=company_name,
+            designation=designation,
+            admin_email=admin_email,
+            phone=phone,
+            signup_at=signup_at,
+        )
+    except OSError as exc:
+        logger.error("Admin signup notification template could not be read: %s", exc)
+        return {"sent": False, "error": str(exc)}
+
+    subject = "New Admin Registration - NameCardScan"
+    result = _send_email(targets[0], subject, body, bcc=targets)
+    result["recipients"] = targets
+    return result
 
 
 def send_forgot_password_otp(to_email: str, otp_code: str) -> dict:

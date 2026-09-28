@@ -14,7 +14,9 @@ from phonenumbers import PhoneNumberFormat, PhoneNumberType, example_number_for_
 from utils.international_phone import (
     get_all_countries,
     get_supported_country_count,
+    infer_unique_national_phone,
     normalize_international_phone,
+    prepare_phone_input,
 )
 from utils.international_phone.cc_dedupe import strip_duplicate_calling_code_prefix
 from utils.international_phone.whatsapp_adapter import (
@@ -320,6 +322,103 @@ class TestTableDrivenMultiRegion(unittest.TestCase):
                 self.assertEqual(contact["phone"], row["e164"].replace("+", ""))
                 self.assertEqual(contact["countryCode"], f"+{row['cc']}")
                 self.assertEqual(contact["countryIso"], row["iso"])
+
+
+class TestNationalCountryInference(unittest.TestCase):
+    def test_ambiguous_indian_looking_mobile_is_not_forced_to_india(self) -> None:
+        inferred = infer_unique_national_phone("7010435975")
+        self.assertIsNone(inferred)
+
+    def test_unique_strong_mobile_is_inferred(self) -> None:
+        found_iso = None
+        found_national = None
+        for iso in phonenumbers.SUPPORTED_REGIONS:
+            if iso in ("001", "ZZ"):
+                continue
+            e164 = _example_e164(iso)
+            if not e164:
+                continue
+            cc = _cc_digits(iso)
+            national = e164.replace("+", "")[len(cc) :]
+            inferred = infer_unique_national_phone(national)
+            if inferred is None:
+                continue
+            found_iso = phonenumbers.region_code_for_number(inferred)
+            found_national = str(inferred.national_number)
+            break
+        if not found_iso:
+            self.skipTest("No uniquely valid national example in this metadata")
+        self.assertEqual(found_national, found_national)
+        inferred = infer_unique_national_phone(found_national)
+        self.assertEqual(phonenumbers.region_code_for_number(inferred), found_iso)
+        self.assertEqual(str(inferred.national_number), found_national)
+
+    def test_explicit_plus91_keeps_national_including_leading_91(self) -> None:
+        result = normalize_international_phone("+91 9124624248")
+        self.assertTrue(result["is_valid"], result)
+        self.assertEqual(result["country"], "IN")
+        self.assertEqual(result["national_number"], "9124624248")
+
+    def test_explicit_uae_and_uk(self) -> None:
+        ae = _example_e164("AE")
+        gb = _example_e164("GB")
+        us = _example_e164("US")
+        self.assertIsNotNone(ae)
+        self.assertIsNotNone(gb)
+        self.assertIsNotNone(us)
+        ae_result = normalize_international_phone(ae)
+        gb_result = normalize_international_phone(gb)
+        us_result = normalize_international_phone(us)
+        self.assertEqual(ae_result["country"], "AE")
+        self.assertEqual(gb_result["country"], "GB")
+        self.assertEqual(us_result["country"], "US")
+        self.assertNotEqual(us_result["country"], "IN")
+
+    def test_parenthesized_and_labeled_prefixes(self) -> None:
+        result = normalize_international_phone("(+91) 7010435975")
+        self.assertTrue(result["is_valid"], result)
+        self.assertEqual(result["national_number"], "7010435975")
+        labeled = prepare_phone_input("Mobile: +91 7010435975")
+        self.assertTrue(labeled.startswith("+91"))
+
+    def test_incomplete_number_not_inferred(self) -> None:
+        self.assertIsNone(infer_unique_national_phone("12345"))
+
+    def test_ambiguous_national_not_guessed(self) -> None:
+        ambiguous = None
+        for iso in phonenumbers.SUPPORTED_REGIONS:
+            if iso in ("001", "ZZ"):
+                continue
+            e164 = _example_e164(iso)
+            if not e164:
+                continue
+            cc = _cc_digits(iso)
+            national = e164.replace("+", "")[len(cc) :]
+            if len(national) < 8:
+                continue
+            hits = []
+            for iso2 in phonenumbers.SUPPORTED_REGIONS:
+                if iso2 in ("001", "ZZ"):
+                    continue
+                try:
+                    parsed = phonenumbers.parse(national, iso2)
+                except phonenumbers.NumberParseException:
+                    continue
+                if not phonenumbers.is_valid_number(parsed):
+                    continue
+                if phonenumbers.region_code_for_number(parsed) != iso2:
+                    continue
+                if str(parsed.national_number) != national:
+                    continue
+                hits.append(iso2)
+                if len(hits) > 1:
+                    break
+            if len(hits) > 1:
+                ambiguous = national
+                break
+        if not ambiguous:
+            self.skipTest("No ambiguous national example in this metadata")
+        self.assertIsNone(infer_unique_national_phone(ambiguous))
 
 
 class TestAmbiguousAndInvalid(unittest.TestCase):

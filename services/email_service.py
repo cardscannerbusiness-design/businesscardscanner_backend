@@ -1122,10 +1122,11 @@ def extract_contact_name(contact: dict[str, Any]) -> str:
 
 
 def _greeting_name(recipient_name: str | None) -> str:
+    """Follow-up greeting uses the existing full name, not the first token."""
     name = str(recipient_name or "").strip()
     if not name:
         return "Valued Customer"
-    return name.split()[0] if name else "Valued Customer"
+    return name
 
 
 def _resolve_event_name(event_name: str | None = None, contact: dict[str, Any] | None = None) -> str:
@@ -1904,13 +1905,15 @@ async def schedule_email_for_contact(
     """
     Send a business thank-you email to the contact's primary email address.
 
-    Returns a result dict with attempted/sent/error fields.
+    Returns a result dict with attempted/sent/error/status fields.
     """
     role = sender_role or (str(user.get("role") or "") if user else None)
     skipped: dict[str, Any] = {
         "attempted": False,
         "sent": False,
         "queued": False,
+        "skipped": False,
+        "status": None,
         "error": None,
         "recipient_email": None,
         "cc_emails": [],
@@ -1922,16 +1925,21 @@ async def schedule_email_for_contact(
     if not _auto_send_enabled():
         logger.debug("Email auto-send disabled via EMAIL_AUTO_SEND_ON_SCAN.")
         skipped["error"] = "Email auto-send is disabled."
+        skipped["status"] = "disabled"
+        skipped["skipped"] = True
         return skipped
 
     if not on_zoho_sync and not online_mode:
         logger.info("Email auto-send skipped: offline mode (will send after database sync).")
         skipped["error"] = "Offline mode — email will send after the contact syncs to the database."
+        skipped["status"] = "offline"
+        skipped["skipped"] = True
         return skipped
 
     if not is_email_configured():
         logger.warning("Email auto-send skipped: SMTP/SES is not configured.")
         skipped["error"] = _EMAIL_NOT_CONFIGURED
+        skipped["status"] = "failed"
         return skipped
 
     if contact_id and skip_if_already_sent:
@@ -1943,6 +1951,7 @@ async def schedule_email_for_contact(
             skipped["attempted"] = True
             skipped["sent"] = True
             skipped["skipped"] = True
+            skipped["status"] = "already_sent"
             skipped["error"] = "already sent"
             skipped["extracted_email"] = extract_primary_email(existing) or None
             return skipped
@@ -1952,12 +1961,14 @@ async def schedule_email_for_contact(
     if not extracted:
         logger.info("Email auto-send skipped: no primary email on scanned contact.")
         skipped["error"] = "No primary email address found on the contact."
+        skipped["status"] = "failed"
         return skipped
 
     is_valid, validated_or_error = validate_email_address(extracted)
     if not is_valid:
         logger.info("Email auto-send skipped: %s", validated_or_error)
         skipped["error"] = validated_or_error
+        skipped["status"] = "failed"
         return skipped
 
     contact_name = extract_contact_name(contact)
@@ -1983,6 +1994,8 @@ async def schedule_email_for_contact(
 
     if not _should_send_to_email(recipient, bypass_dedupe=is_test_recipient_mode()):
         skipped["error"] = "Duplicate email send skipped for this address."
+        skipped["status"] = "duplicate"
+        skipped["skipped"] = True
         return skipped
 
     try:
@@ -2010,6 +2023,8 @@ async def schedule_email_for_contact(
                 "attempted": True,
                 "sent": True,
                 "queued": False,
+                "skipped": False,
+                "status": "sent",
                 "error": None,
                 "recipient_email": delivery["recipient_email"],
                 "cc_emails": delivery.get("cc_emails") or cc_list,
@@ -2028,6 +2043,8 @@ async def schedule_email_for_contact(
             "attempted": True,
             "sent": False,
             "queued": False,
+            "skipped": False,
+            "status": "failed",
             "error": error_message,
             "recipient_email": recipient,
             "cc_emails": delivery.get("cc_emails") or cc_list,
@@ -2047,6 +2064,8 @@ async def schedule_email_for_contact(
             "attempted": True,
             "sent": False,
             "queued": False,
+            "skipped": False,
+            "status": "failed",
             "error": error_message,
             "recipient_email": recipient,
             "cc_emails": cc_list,
